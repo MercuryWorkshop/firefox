@@ -1164,7 +1164,7 @@ nsresult nsXREDirProvider::GetUserDataDirectoryHome(nsIFile** aFile,
   const char* homeDir = PR_GetEnv("HOME");
   if (!homeDir || !*homeDir) return NS_ERROR_FAILURE;
 
-#  ifdef ANDROID /* We want (ProfD == ProfLD) on Android. */
+#  if defined(ANDROID) || defined(MOZ_WIDGET_HEADLESS) /* (ProfD == ProfLD). */
   MOZ_TRY(NS_NewNativeLocalFile(nsDependentCString(homeDir),
                                 getter_AddRefs(localDir)));
 #  else

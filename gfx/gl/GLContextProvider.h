@@ -70,6 +70,13 @@ namespace gl {
 #  endif
 #endif
 
+#if defined(__EMSCRIPTEN__)
+#  define GL_CONTEXT_PROVIDER_NAME GLContextProviderEmscripten
+#  include "GLContextProviderImpl.h"
+#  undef GL_CONTEXT_PROVIDER_NAME
+#  define GL_CONTEXT_PROVIDER_DEFAULT GLContextProviderEmscripten
+#endif
+
 #ifndef GL_CONTEXT_PROVIDER_DEFAULT
 #  define GL_CONTEXT_PROVIDER_DEFAULT GLContextProviderEGL
 #endif

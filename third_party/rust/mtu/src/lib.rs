@@ -114,7 +114,8 @@ const fn aligned_by(size: usize, align: usize) -> usize {
     target_os = "ios",
     target_os = "tvos",
     target_os = "visionos",
-    target_os = "redox"
+    target_os = "redox",
+    target_os = "emscripten"
 ))]
 pub fn interface_and_mtu_impl(remote: IpAddr) -> Result<(String, usize)> {
     return Err(default_err());

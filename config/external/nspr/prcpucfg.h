@@ -21,6 +21,9 @@
 #  include "md/_openbsd.cfg"
 #elif defined(__linux__)
 #  include "md/_linux.cfg"
+#elif defined(__EMSCRIPTEN__)
+/* emscripten is Linux-like; _linux.cfg has a __wasm32__ data-model branch. */
+#  include "md/_linux.cfg"
 #elif defined(__sun__)
 #  include "md/_solaris.cfg"
 #else

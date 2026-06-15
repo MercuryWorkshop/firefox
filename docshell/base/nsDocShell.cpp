@@ -7500,6 +7500,13 @@ nsresult nsDocShell::PerformRetargeting(nsDocShellLoadState* aLoadState) {
     rv = NS_CheckContentLoadPolicy(aLoadState->URI(), secCheckLoadInfo,
                                    &shouldLoad);
 
+    fprintf(stderr,
+            "### DocShellCP rv=0x%08x shouldLoad=%d type=%d blockReason=%d\n",
+            (unsigned)rv, shouldLoad,
+            (int)secCheckLoadInfo->GetExternalContentPolicyType(),
+            [&] { uint32_t r = 0; secCheckLoadInfo->GetRequestBlockingReason(&r);
+                  return (int)r; }());
+
     if (NS_FAILED(rv) || NS_CP_REJECTED(shouldLoad)) {
       if (NS_SUCCEEDED(rv)) {
         if (shouldLoad == nsIContentPolicy::REJECT_TYPE) {

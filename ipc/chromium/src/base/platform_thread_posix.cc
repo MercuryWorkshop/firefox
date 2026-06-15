@@ -58,6 +58,9 @@ PlatformThreadId PlatformThread::CurrentId() {
   return lwp_gettid();
 #elif defined(XP_FREEBSD)
   return pthread_getthreadid_np();
+#elif defined(__EMSCRIPTEN__)
+  // Single-threaded wasm: no kernel TID; pthread_self() is a stable identifier.
+  return (PlatformThreadId)(intptr_t)(pthread_self());
 #endif
 }
 

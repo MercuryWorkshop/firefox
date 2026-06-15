@@ -11,7 +11,7 @@ use crate::parallel::STYLE_THREAD_STACK_SIZE_KB;
 use crate::shared_lock::SharedRwLock;
 use crate::thread_state;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard};
-#[cfg(all(unix, not(target_arch = "wasm32")))]
+#[cfg(all(unix, any(not(target_arch = "wasm32"), target_os = "emscripten")))]
 use std::os::unix::thread::{JoinHandleExt, RawPthread};
 #[cfg(windows)]
 use std::os::windows::{io::AsRawHandle, prelude::RawHandle};
@@ -19,7 +19,7 @@ use std::{io, sync::LazyLock, thread};
 use thin_vec::ThinVec;
 
 /// Platform-specific handle to a thread.
-#[cfg(all(unix, not(target_arch = "wasm32")))]
+#[cfg(all(unix, any(not(target_arch = "wasm32"), target_os = "emscripten")))]
 pub type PlatformThreadHandle = RawPthread;
 /// Platform-specific handle to a thread.
 #[cfg(windows)]
@@ -28,7 +28,10 @@ pub type PlatformThreadHandle = RawHandle;
 /// A noop thread join handle for wasm
 /// The usize field is a dummy field to make this type non-zero sized so as not to confuse FFI
 #[cfg(all(target_arch = "wasm32", not(feature = "gecko")))]
-pub struct DummyThreadHandle;
+#[repr(C)]
+pub struct DummyThreadHandle {
+    _x: usize,
+}
 #[cfg(all(target_arch = "wasm32", not(feature = "gecko")))]
 impl DummyThreadHandle {
     /// A noop thread join method for wasm
@@ -139,14 +142,14 @@ impl StyleThreadPool {
         LazyLock::force(&STYLE_THREAD_POOL);
 
         for join_handle in STYLE_THREAD_JOIN_HANDLES.lock().iter() {
-            #[cfg(all(unix, not(target_arch = "wasm32")))]
+            #[cfg(all(unix, any(not(target_arch = "wasm32"), target_os = "emscripten")))]
             let handle = join_handle.as_pthread_t();
             #[cfg(windows)]
             let handle = join_handle.as_raw_handle();
             #[cfg(all(target_arch = "wasm32", not(feature = "gecko")))]
             let handle = {
                 let _ = join_handle;
-                DummyThreadHandle
+                DummyThreadHandle { _x: 0 }
             };
 
             handles.push(handle);

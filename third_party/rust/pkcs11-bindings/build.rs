@@ -27,6 +27,7 @@ fn main() {
     let bindings = Builder::default()
         .header("wrapper.h")
         .allowlist_function("C_GetFunctionList")
+        .allowlist_type("CK_.*")
         .allowlist_type("CK_RSA_PKCS_PSS_PARAMS")
         .allowlist_type("CK_OBJECT_CLASS")
         .allowlist_type("CK_KEY_TYPE")

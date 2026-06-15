@@ -311,6 +311,7 @@ nsresult Service::initialize() {
   MOZ_ASSERT(NS_IsMainThread(), "Must be initialized on the main thread");
 
   int rc = AutoSQLiteLifetime::getInitResult();
+  printf("### StorageSvc::initialize getInitResult rc=%d sqlite=%s\n", rc, sqlite3_libversion()); fflush(stdout);
   if (rc != SQLITE_OK) {
     return convertResultCode(rc);
   }
@@ -336,11 +337,13 @@ nsresult Service::initialize() {
    */
 
   rc = mBaseSqliteVFS.Init(basevfs::ConstructVFS(false));
+  printf("### StorageSvc::initialize baseVFS rc=%d (find unix vfs=%p)\n", rc, (void*)sqlite3_vfs_find("unix")); fflush(stdout);
   if (rc != SQLITE_OK) {
     return convertResultCode(rc);
   }
 
   rc = mBaseExclSqliteVFS.Init(basevfs::ConstructVFS(true));
+  printf("### StorageSvc::initialize baseExclVFS rc=%d\n", rc); fflush(stdout);
   if (rc != SQLITE_OK) {
     return convertResultCode(rc);
   }

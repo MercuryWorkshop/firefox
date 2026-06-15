@@ -39,7 +39,7 @@ class UnscaledFontFreeType : public UnscaledFont {
 
   RefPtr<SharedFTFace> InitFace();
 
-#ifdef MOZ_WIDGET_ANDROID
+#if defined(MOZ_WIDGET_ANDROID) || defined(MOZ_WIDGET_HEADLESS)
   static already_AddRefed<UnscaledFont> CreateFromFontDescriptor(
       const uint8_t* aData, uint32_t aDataLength, uint32_t aIndex);
 

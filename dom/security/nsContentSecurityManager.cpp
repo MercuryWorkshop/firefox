@@ -1452,19 +1452,25 @@ nsresult nsContentSecurityManager::doContentSecurityCheck(
     DebugDoContentSecurityCheck(aChannel, loadInfo);
   }
 
-  MOZ_TRY(CheckAllowLoadInSystemPrivilegedContext(aChannel));
+#define CSMLOG(label, expr)        \
+  do {                             \
+    nsresult _r = (expr);          \
+    if (NS_FAILED(_r)) return _r;  \
+  } while (0)
 
-  MOZ_TRY(CheckAllowLoadInPrivilegedAboutContext(aChannel));
+  CSMLOG("SystemPrivileged", CheckAllowLoadInSystemPrivilegedContext(aChannel));
+
+  CSMLOG("PrivilegedAbout", CheckAllowLoadInPrivilegedAboutContext(aChannel));
 
   // We want to also check redirected requests to ensure
   // the target maintains the proper javascript file extensions.
-  MOZ_TRY(CheckAllowExtensionProtocolScriptLoad(aChannel));
+  CSMLOG("ExtScriptLoad", CheckAllowExtensionProtocolScriptLoad(aChannel));
 
-  MOZ_TRY(CheckChannelHasProtocolSecurityFlag(aChannel));
+  CSMLOG("ProtoSecFlag", CheckChannelHasProtocolSecurityFlag(aChannel));
 
-  MOZ_TRY(CheckAllowLoadByTriggeringRemoteType(aChannel));
+  CSMLOG("TriggeringRemoteType", CheckAllowLoadByTriggeringRemoteType(aChannel));
 
-  MOZ_TRY(CheckForIncoherentResultPrincipal(aChannel));
+  CSMLOG("IncoherentResult", CheckForIncoherentResultPrincipal(aChannel));
 
   // if dealing with a redirected channel then we have already installed
   // streamlistener and redirect proxies and so we are done.
@@ -1474,19 +1480,20 @@ nsresult nsContentSecurityManager::doContentSecurityCheck(
 
   // make sure that only one of the five security flags is set in the loadinfo
   // e.g. do not require same origin and allow cross origin at the same time
-  MOZ_TRY(ValidateSecurityFlags(loadInfo));
+  CSMLOG("ValidateSecurityFlags", ValidateSecurityFlags(loadInfo));
 
   if (loadInfo->GetSecurityMode() ==
       nsILoadInfo::SEC_REQUIRE_CORS_INHERITS_SEC_CONTEXT) {
-    MOZ_TRY(DoCORSChecks(aChannel, loadInfo, aInAndOutListener));
+    CSMLOG("DoCORSChecks", DoCORSChecks(aChannel, loadInfo, aInAndOutListener));
   }
 
-  MOZ_TRY(CheckChannel(aChannel));
+  CSMLOG("CheckChannel", CheckChannel(aChannel));
 
   // Perform all ContentPolicy checks (MixedContent, CSP, ...)
-  MOZ_TRY(DoContentSecurityChecks(aChannel, loadInfo));
+  CSMLOG("DoContentSecurityChecks", DoContentSecurityChecks(aChannel, loadInfo));
 
-  MOZ_TRY(CheckAllowFileProtocolScriptLoad(aChannel));
+  CSMLOG("FileScriptLoad", CheckAllowFileProtocolScriptLoad(aChannel));
+#undef CSMLOG
 
   // now lets set the initialSecurityFlag for subsequent calls
   loadInfo->SetInitialSecurityCheckDone(true);

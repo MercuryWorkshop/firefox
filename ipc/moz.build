@@ -3,12 +3,17 @@
 # file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 DIRS += [
-    "app",
     "chromium",
     "glue",
     "ipdl",
     "testshell",
 ]
+
+# ipc/app builds plugin-container, the e10s child-process executable. We run
+# single-process, and under wasm it fails to link against libxul.so (benign
+# duplicate symbols vs libpure_virtual.a / NSPR). Not needed for the engine.
+if CONFIG["OS_TARGET"] != "EMSCRIPTEN":
+    DIRS += ["app"]
 
 if CONFIG["OS_ARCH"] == "WINNT":
     DIRS += ["mscom"]

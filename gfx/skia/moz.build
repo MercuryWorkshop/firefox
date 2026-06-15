@@ -563,7 +563,7 @@ if CONFIG['MOZ_WIDGET_TOOLKIT'] in ('cocoa', 'uikit'):
     SOURCES += [
         'skia/src/ports/SkTypeface_mac_ct.cpp',
     ]
-if CONFIG['MOZ_WIDGET_TOOLKIT'] == 'gtk':
+if CONFIG['MOZ_WIDGET_TOOLKIT'] in ('gtk', 'headless'):
     UNIFIED_SOURCES += [
         'skia/src/ports/SkLog_stdio.cpp',
         'skia/src/ports/SkOSFile_posix.cpp',
@@ -655,7 +655,7 @@ LOCAL_INCLUDES += [
     "/gfx/harfbuzz/src",
 ]
 
-if CONFIG['MOZ_WIDGET_TOOLKIT'] in ('gtk', 'android'):
+if CONFIG['MOZ_WIDGET_TOOLKIT'] in ('gtk', 'android', 'headless'):
     LOCAL_INCLUDES += [
         "/gfx/cairo/cairo/src",
     ]

@@ -236,6 +236,21 @@ WindowRenderer* HeadlessWidget::GetWindowRenderer() {
   return nsIWidget::GetWindowRenderer();
 }
 
+#if defined(__EMSCRIPTEN__)
+bool HeadlessWidget::ShouldUseOffMainThreadCompositing() {
+  // In the single-canvas wasm embedding there is exactly one GL/WebRender
+  // surface (the page <canvas>). A popup is a separate top-level widget; if it
+  // got its own compositor it would present to that same canvas and fight the
+  // main window's compositor (the popup flickers in at the GL origin). Keep
+  // popup widgets on the fallback renderer so they never present; the embedder
+  // composites the visible popups onto a 2D overlay canvas stacked on top.
+  if (mWindowType == WindowType::Popup) {
+    return false;
+  }
+  return nsIWidget::ShouldUseOffMainThreadCompositing();
+}
+#endif
+
 void HeadlessWidget::SetCompositorWidgetDelegate(
     CompositorWidgetDelegate* delegate) {
   if (delegate) {

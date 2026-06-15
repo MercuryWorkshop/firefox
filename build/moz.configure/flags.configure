@@ -456,7 +456,7 @@ def moz_fix_link_paths(target, build_env):
         return []
     if target.kernel == "SunOS":
         return [f"-L{dist}/bin"]
-    if target.os == "WASI":
+    if target.os in ("WASI", "EMSCRIPTEN"):
         return []
 
     return flags
@@ -539,7 +539,11 @@ set_config("EXPAND_LIBS_LIST_STYLE", expand_libs_list_style)
 # ---------------------------------
 @depends(building_with_gnu_compatible_cc, target)
 def moz_program_ldflags(building_with_gnu_compatible_cc, target):
-    if building_with_gnu_compatible_cc and target.kernel not in ("Darwin", "WASI"):
+    if building_with_gnu_compatible_cc and target.kernel not in (
+        "Darwin",
+        "WASI",
+        "EMSCRIPTEN",
+    ):
         return ["-pie"]
 
 
@@ -733,7 +737,10 @@ add_sse2_flag_if_needed(os_cflags)
 add_sse2_flag_if_needed(os_cxxflags)
 
 
-@depends(compilation_flags, when=depends(target.os)(lambda os: os == "WASI"))
+@depends(
+    compilation_flags,
+    when=depends(target.os)(lambda os: os in ("WASI", "EMSCRIPTEN")),
+)
 def add_thread_model_single(compilation_flags):
     compilation_flags.cxxflags.extend(["-mthread-model", "single"])
 

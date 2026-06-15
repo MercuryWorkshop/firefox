@@ -113,9 +113,10 @@ static StaticRefPtr<Theme> gRDMInstance;
 
 }  // namespace
 
-#ifdef ANDROID
+#if defined(ANDROID) || defined(MOZ_WIDGET_HEADLESS)
 already_AddRefed<Theme> do_CreateNativeThemeDoNotUseDirectly() {
-  // Android doesn't have a native theme.
+  // Android and headless (e.g. the wasm embedding) have no native theme; use
+  // the non-native in-content theme for form controls.
   return do_AddRef(new Theme(Theme::ScrollbarStyle()));
 }
 #endif
@@ -1502,6 +1503,8 @@ UniquePtr<ScrollbarDrawing> Theme::ScrollbarStyle() {
 #elif MOZ_WIDGET_GTK
   return MakeUnique<ScrollbarDrawingGTK>();
 #elif ANDROID
+  return MakeUnique<ScrollbarDrawingAndroid>();
+#elif defined(MOZ_WIDGET_HEADLESS)
   return MakeUnique<ScrollbarDrawingAndroid>();
 #else
 #  error "Unknown platform, need scrollbar implementation."

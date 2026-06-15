@@ -32,6 +32,14 @@ bool HasPlatformSupport();
 
 bool HasSupport(JSContext* cx);
 
+#if defined(__EMSCRIPTEN__)
+// wasm32-emscripten host-passthrough: there is no in-process wasm compiler
+// (the JIT is disabled), so guest WebAssembly is routed to the host browser's
+// WebAssembly engine. When true, the WebAssembly object is exposed and its
+// operations are bridged to the host instead of compiled in-process.
+bool UseHostPassthrough();
+#endif
+
 // Predicates for compiler availability.
 //
 // These three predicates together select zero or one baseline compiler and zero

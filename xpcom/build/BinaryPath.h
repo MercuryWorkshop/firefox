@@ -271,6 +271,13 @@ class BinaryPath {
     return NS_ERROR_FAILURE;
   }
 
+#elif defined(__EMSCRIPTEN__)
+  // wasm has no real executable path; return a stable synthetic path. Anything
+  // that derives resource dirs from this must be served via the virtual FS.
+  static nsresult Get(char aResult[MAXPATHLEN]) {
+    strcpy(aResult, "/firefox");
+    return NS_OK;
+  }
 #else
 #  error Oops, you need platform-specific code here
 #endif

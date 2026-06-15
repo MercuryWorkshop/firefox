@@ -15,8 +15,14 @@
 
 #include "nsXULAppAPI.h"
 #include <dirent.h>
-#include <android/log.h>
-#define ALOG(args...) __android_log_print(ANDROID_LOG_INFO, "Gecko", ##args)
+#if defined(MOZ_WIDGET_ANDROID)
+#  include <android/log.h>
+#  define ALOG(args...) __android_log_print(ANDROID_LOG_INFO, "Gecko", ##args)
+#else
+#  define ALOG(...) \
+    do {            \
+    } while (0)
+#endif
 
 #include "ft2build.h"
 #include FT_FREETYPE_H
@@ -1246,6 +1252,11 @@ void gfxFT2FontList::FindFontsInOmnijar(FontNameCache* aCache) {
       "res/fonts/*.ttf$",
   };
   RefPtr<nsZipArchive> reader = Omnijar::GetReader(Omnijar::Type::GRE);
+  // In a flat (unpackaged) build there is no GRE omnijar, so there are no
+  // bundled fonts to enumerate here; the font directory is scanned separately.
+  if (!reader) {
+    return;
+  }
   for (unsigned i = 0; i < std::size(sJarSearchPaths); i++) {
     nsZipFind* find;
     if (NS_SUCCEEDED(reader->FindInit(sJarSearchPaths[i], &find))) {
@@ -1593,11 +1604,10 @@ void gfxFT2FontList::FindFonts() {
     }
   }
 
-  if (!useSystemFontAPI)
-#endif
-  {
+  if (!useSystemFontAPI) {
     FindFontsInDir(androidFontsRoot, mFontNameCache.get());
   }
+#endif
 
   // Look for fonts stored in omnijar, unless we're on a low-memory
   // device where we don't want to spend the RAM to decompress them.

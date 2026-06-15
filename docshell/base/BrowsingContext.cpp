@@ -965,7 +965,12 @@ void BrowsingContext::Attach(bool aFromIPC, ContentParent* aOriginProcess) {
   // function.
   if (!aFromIPC) {
     if (const char* failure = BrowsingContextCoherencyChecks(aOriginProcess)) {
-      MOZ_CRASH_UNSAFE_PRINTF("Incoherent BrowsingContext: %s", failure);
+      // Was MOZ_CRASH_UNSAFE_PRINTF (only compiled in EARLY_BETA_OR_EARLIER /
+      // diagnostic builds; release Firefox omits this block entirely). A
+      // single-process windowless embedding attaches subframe BrowsingContexts
+      // in ways these multi-process coherency checks flag, so warn instead of
+      // crashing the engine.
+      NS_WARNING(failure);
     }
   }
 #endif
@@ -1643,6 +1648,21 @@ RefPtr<SessionStorageManager> BrowsingContext::GetSessionStorageManager() {
 bool BrowsingContext::CrossOriginIsolated() {
   MOZ_ASSERT(NS_IsMainThread());
 
+#if defined(__EMSCRIPTEN__)
+  // Single-process windowless embedder: there are no content processes, so the
+  // upstream "am I in the dedicated webCOOP+COEP content process?" check
+  // (XRE_IsContentProcess() + the remote-type prefix) can never be satisfied,
+  // and cross-origin isolation would always report false -- even for a document
+  // that is genuinely COOP+COEP isolated (breaking SharedArrayBuffer and
+  // self.crossOriginIsolated). The combined opener policy (which encodes both
+  // COOP:same-origin and COEP:require-corp) is still computed in-process, so key
+  // isolation off it directly. Non-isolated documents still report false.
+  return StaticPrefs::
+             dom_postMessage_sharedArrayBuffer_withCOOP_COEP_AtStartup() &&
+         Top()->GetOpenerPolicy() ==
+             nsILoadInfo::
+                 OPENER_POLICY_SAME_ORIGIN_EMBEDDER_POLICY_REQUIRE_CORP;
+#else
   return StaticPrefs::
              dom_postMessage_sharedArrayBuffer_withCOOP_COEP_AtStartup() &&
          Top()->GetOpenerPolicy() ==
@@ -1651,6 +1671,7 @@ bool BrowsingContext::CrossOriginIsolated() {
          XRE_IsContentProcess() &&
          StringBeginsWith(ContentChild::GetSingleton()->GetRemoteType(),
                           WITH_COOP_COEP_REMOTE_TYPE_PREFIX);
+#endif
 }
 
 void BrowsingContext::SetTriggeringAndInheritPrincipals(
@@ -3740,13 +3761,29 @@ bool BrowsingContext::CanSet(FieldIndex<IDX_OpenerPolicy>,
   // A potentially cross-origin isolated BC can't change opener policy, nor can
   // a BC become potentially cross-origin isolated. An unchanged policy is
   // always OK.
-  return GetOpenerPolicy() == aPolicy ||
-         (GetOpenerPolicy() !=
-              nsILoadInfo::
-                  OPENER_POLICY_SAME_ORIGIN_EMBEDDER_POLICY_REQUIRE_CORP &&
-          aPolicy !=
-              nsILoadInfo::
-                  OPENER_POLICY_SAME_ORIGIN_EMBEDDER_POLICY_REQUIRE_CORP);
+  if (GetOpenerPolicy() == aPolicy ||
+      (GetOpenerPolicy() !=
+           nsILoadInfo::OPENER_POLICY_SAME_ORIGIN_EMBEDDER_POLICY_REQUIRE_CORP &&
+       aPolicy !=
+           nsILoadInfo::
+               OPENER_POLICY_SAME_ORIGIN_EMBEDDER_POLICY_REQUIRE_CORP)) {
+    return true;
+  }
+
+  // The check above forbids transitioning an existing BC into/out of the
+  // potentially-cross-origin-isolated policy, because in a multi-process browser
+  // that would be done via a BrowsingContext/process switch (a fresh BC born with
+  // the policy), not by mutating one shared with other documents/openers/popups.
+  // A lone top-level content BC with no opener and no group siblings shares its
+  // isolation with nothing, so adopting a policy in place is equivalent to loading
+  // into a freshly-created BC of that policy. This is the case for a windowless
+  // embedding (single process, no e10s switch) loading a COOP+COEP document.
+  if (IsTopContent() && GetOpenerId() == 0 && Group() &&
+      Group()->Toplevels().Length() <= 1) {
+    return true;
+  }
+
+  return false;
 }
 
 auto BrowsingContext::CanSet(FieldIndex<IDX_AllowContentRetargeting>,

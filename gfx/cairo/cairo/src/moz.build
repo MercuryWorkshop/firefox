@@ -13,7 +13,7 @@ EXPORTS.cairo += [
     'pixman-rename.h',
 ]
 
-if CONFIG['MOZ_WIDGET_TOOLKIT'] not in ('cocoa', 'uikit'):
+if CONFIG['MOZ_WIDGET_TOOLKIT'] not in ('cocoa', 'uikit', 'headless'):
     EXPORTS.cairo += [
         'cairo-pdf.h',
     ]

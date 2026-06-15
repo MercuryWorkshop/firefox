@@ -74,6 +74,8 @@
 #define _PR_SI_ARCHITECTURE "xtensa"
 #elif defined(__loongarch64)
 #define _PR_SI_ARCHITECTURE "loongarch64"
+#elif defined(__wasm32__)
+#define _PR_SI_ARCHITECTURE "wasm32"
 #else
 #error "Unknown CPU architecture"
 #endif
@@ -95,7 +97,10 @@
  */
 #define HAVE_DLL
 #define USE_DLFCN
-#if defined(ANDROID)
+#if defined(ANDROID) || defined(__EMSCRIPTEN__)
+// emscripten has no dlopen; NSPR's _PR_InitLinker must not dlopen(0) for the
+// main-program handle (it would abort). Everything is statically linked, so the
+// null executable loadmap is fine.
 #define NO_DLOPEN_NULL
 #endif
 

@@ -17,6 +17,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <cstdlib>
 
 namespace mozilla::gfx {
 
@@ -37,6 +38,30 @@ bool UnscaledFontFreeType::GetFontFileData(FontFileDataOutput aDataCallback,
       return false;
     }
     uint32_t length = buf.st_size;
+#if defined(__EMSCRIPTEN__)
+    // emscripten's mmap(MAP_PRIVATE, fd) does NOT read file contents (it returns
+    // zeroed anonymous memory), so the font data would be all zeros and fail OTS
+    // sanitization. Read the file into a buffer instead.
+    uint8_t* fontData = reinterpret_cast<uint8_t*>(malloc(length));
+    if (!fontData) {
+      close(fd);
+      return false;
+    }
+    size_t got = 0;
+    while (got < length) {
+      ssize_t r = read(fd, fontData + got, length - got);
+      if (r <= 0) break;
+      got += size_t(r);
+    }
+    close(fd);
+    if (got != length) {
+      free(fontData);
+      return false;
+    }
+    aDataCallback(fontData, length, mIndex, aBaton);
+    free(fontData);
+    return true;
+#else
     uint8_t* fontData = reinterpret_cast<uint8_t*>(
         mmap(nullptr, length, PROT_READ, MAP_PRIVATE, fd, 0));
     close(fd);
@@ -46,6 +71,7 @@ bool UnscaledFontFreeType::GetFontFileData(FontFileDataOutput aDataCallback,
     aDataCallback(fontData, length, mIndex, aBaton);
     munmap(fontData, length);
     return true;
+#endif
   }
 
   bool success = false;
@@ -66,6 +92,13 @@ bool UnscaledFontFreeType::GetFontFileData(FontFileDataOutput aDataCallback,
 
 bool UnscaledFontFreeType::GetFontDescriptor(FontDescriptorOutput aCb,
                                              void* aBaton) {
+#if defined(__EMSCRIPTEN__)
+  // wasm: WebRender's Rust glyph rasterizer would FT_New_Face(path) from a rayon
+  // worker, which (a) crashes in add_font and (b) needs file I/O on a worker that
+  // can't reliably touch MEMFS. Return false so the caller falls back to
+  // GetFontFileData (raw bytes -> FT_New_Memory_Face, in-memory, thread-safe).
+  return false;
+#else
   if (mFile.empty()) {
     return false;
   }
@@ -73,6 +106,7 @@ bool UnscaledFontFreeType::GetFontDescriptor(FontDescriptorOutput aCb,
   aCb(reinterpret_cast<const uint8_t*>(mFile.data()), mFile.size(), mIndex,
       aBaton);
   return true;
+#endif
 }
 
 RefPtr<SharedFTFace> UnscaledFontFreeType::InitFace() {
@@ -177,7 +211,7 @@ void UnscaledFontFreeType::ApplyVariationsToFace(
   }
 }
 
-#ifdef MOZ_WIDGET_ANDROID
+#if defined(MOZ_WIDGET_ANDROID) || defined(MOZ_WIDGET_HEADLESS)
 
 already_AddRefed<ScaledFont> UnscaledFontFreeType::CreateScaledFont(
     Float aGlyphSize, const uint8_t* aInstanceData,

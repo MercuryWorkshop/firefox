@@ -496,8 +496,14 @@ class ThreadRegistrationLockedRWFromAnyThread
   void StartJSSampling(uint32_t aJSFlags) {
     // This function runs on-thread or off-thread.
 
-    MOZ_RELEASE_ASSERT(mJSSampling == INACTIVE ||
-                       mJSSampling == INACTIVE_REQUESTED);
+    // Idempotent: if JS sampling is already (being) started, do nothing. The
+    // original code MOZ_RELEASE_ASSERTed the state machine, but this embedding's
+    // worker-thread JS-context lifecycle can drive these out of the expected
+    // order. The profiler is non-essential here, so tolerate it instead of
+    // crashing the shared wasm instance.
+    if (mJSSampling == ACTIVE || mJSSampling == ACTIVE_REQUESTED) {
+      return;
+    }
     mJSSampling = ACTIVE_REQUESTED;
     mJSFlags = aJSFlags;
   }
@@ -507,8 +513,10 @@ class ThreadRegistrationLockedRWFromAnyThread
   void StopJSSampling() {
     // This function runs on-thread or off-thread.
 
-    MOZ_RELEASE_ASSERT(mJSSampling == ACTIVE ||
-                       mJSSampling == ACTIVE_REQUESTED);
+    // Idempotent (see StartJSSampling): tolerate a stop with no matching start.
+    if (mJSSampling == INACTIVE || mJSSampling == INACTIVE_REQUESTED) {
+      return;
+    }
     mJSSampling = INACTIVE_REQUESTED;
   }
 

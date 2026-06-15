@@ -6,12 +6,17 @@
 #define mozilla_widget_HeadlessLookAndFeel_h
 
 #include "nsXPLookAndFeel.h"
-#include "nsLookAndFeel.h"
+#if !defined(MOZ_WIDGET_HEADLESS)
+// On a headless-only toolkit, "nsLookAndFeel.h" is a thin alias for this very
+// class (see widget/headless/nsLookAndFeel.h); including it here would be
+// circular. The hardcoded HeadlessLookAndFeel below doesn't need it.
+#  include "nsLookAndFeel.h"
+#endif
 
 namespace mozilla {
 namespace widget {
 
-#if defined(MOZ_WIDGET_GTK)
+#if defined(MOZ_WIDGET_GTK) || defined(MOZ_WIDGET_HEADLESS)
 
 // Our nsLookAndFeel for Gtk relies on APIs that aren't available in headless
 // mode, so for processes that are unable to connect to a display server, we use

@@ -4,6 +4,9 @@
 
 #include "HeadlessLookAndFeel.h"
 #include "nsStyleConsts.h"
+// NativeGetFont fills a gfxFontStyle; the headless toolkit doesn't pull in its
+// full definition transitively (a real toolkit's headers would), so include it.
+#include "gfxFont.h"
 
 namespace mozilla::widget {
 

@@ -346,7 +346,7 @@ if toolkit in {"gtk", "cocoa", "windows"}:
         "nsBaseColorPicker.cpp",
     ]
 
-if toolkit in ("gtk", "windows", "cocoa", "uikit", "android"):
+if toolkit in ("gtk", "windows", "cocoa", "uikit", "android", "headless"):
     UNIFIED_SOURCES += [
         "nsNativeTheme.cpp",
     ]

@@ -2861,6 +2861,7 @@ dependencies = [
  "mozilla-central-workspace-hack",
  "stylo_tests",
  "swgl",
+ "uniffi_core 0.31.0",
 ]
 
 [[package]]
@@ -8338,7 +8339,7 @@ dependencies = [
  "clap",
  "uniffi_bindgen",
  "uniffi_build",
- "uniffi_core",
+ "uniffi_core 0.31.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "uniffi_macros",
  "uniffi_pipeline",
 ]
@@ -8447,6 +8448,16 @@ dependencies = [
  "anyhow",
  "camino",
  "uniffi_bindgen",
+]
+
+[[package]]
+name = "uniffi_core"
+version = "0.31.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "once_cell",
+ "static_assertions",
 ]
 
 [[package]]

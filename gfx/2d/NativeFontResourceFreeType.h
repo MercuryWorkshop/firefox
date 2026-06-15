@@ -19,7 +19,7 @@ class NativeFontResourceFreeType
  public:
   MOZ_DECLARE_REFCOUNTED_VIRTUAL_TYPENAME(NativeFontResourceFreeType, override)
 
-#ifdef MOZ_WIDGET_ANDROID
+#if defined(MOZ_WIDGET_ANDROID) || defined(MOZ_WIDGET_HEADLESS)
   static already_AddRefed<NativeFontResourceFreeType> Create(
       const uint8_t* aFontData, uint32_t aDataLength,
       FT_Library aFTLibrary = nullptr);

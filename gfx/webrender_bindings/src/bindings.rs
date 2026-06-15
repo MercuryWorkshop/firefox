@@ -1137,9 +1137,8 @@ pub extern "C" fn wr_thread_pool_new(low_priority: bool) -> *mut WrThreadPool {
 
     let use_thread_local_arena = static_prefs::pref!("gfx.webrender.worker-thread-local-arena");
 
-    let worker = rayon::ThreadPoolBuilder::new()
+    let builder = rayon::ThreadPoolBuilder::new()
         .thread_name(move |idx| format!("WRWorker{}#{}", priority_tag, idx))
-        .num_threads(num_threads)
         .start_handler(move |idx| {
             if use_thread_local_arena {
                 unsafe {
@@ -1152,8 +1151,11 @@ pub extern "C" fn wr_thread_pool_new(low_priority: bool) -> *mut WrThreadPool {
         })
         .exit_handler(|_idx| {
             gecko_profiler::unregister_thread();
-        })
-        .build();
+        });
+    // With build-std (+atomics) Rust threads work on emscripten, so spawn the
+    // real worker pool like every other platform.
+    let builder = builder.num_threads(num_threads);
+    let worker = builder.build();
 
     let workers = Arc::new(worker.unwrap());
 

@@ -1683,7 +1683,11 @@ impl Device {
                 // see https://www.g-truc.net/post-0734.html
                 gl::GlType::Gl => gl_version >= [3, 3] ||
                     supports_extension(&extensions, "GL_ARB_texture_swizzle"),
-                gl::GlType::Gles => true,
+                // GLES 3.0 has GL_TEXTURE_SWIZZLE_*, but WebGL2 (emscripten)
+                // deliberately omits it, so the swizzle would silently no-op and
+                // leave BGRA image data with R/B swapped. Report no swizzle so the
+                // BGRA upload path is used instead.
+                gl::GlType::Gles => !cfg!(target_os = "emscripten"),
             };
 
         let (color_formats, bgra_formats, bgra_pixel_type, bgra8_sampling_swizzle, texture_storage_usage) = match gl.get_type() {
@@ -2447,7 +2451,23 @@ impl Device {
             DrawTarget::Default { rect, .. } => {
                 (self.default_draw_fbo, rect, false)
             }
-            DrawTarget::Texture { dimensions, fbo_id, with_depth, .. } => {
+            DrawTarget::Texture { dimensions, fbo_id, with_depth, id, target: tex_target, .. } => {
+                // emscripten/strict-WebGL: a texture bound to a sampler slot AND
+                // attached to the active framebuffer is a feedback loop -- WebGL
+                // raises GL_INVALID_OPERATION on the draw (skipping it -> black
+                // boxes) even when the shader doesn't actually sample it. WebRender
+                // recycles render-target textures across passes, so a target can
+                // still be sampler-bound from a previous pass. Unbind it here.
+                if cfg!(target_os = "emscripten") {
+                    for slot in 0..self.bound_textures.len() {
+                        if self.bound_textures[slot] == id {
+                            self.gl.active_texture(gl::TEXTURE0 + slot as gl::GLuint);
+                            self.gl.bind_texture(tex_target, 0);
+                            self.gl.active_texture(gl::TEXTURE0);
+                            self.bound_textures[slot] = 0;
+                        }
+                    }
+                }
                 let rect = FramebufferIntRect::from_size(
                     device_size_as_framebuffer_size(dimensions),
                 );

@@ -76,7 +76,7 @@ constexpr int CountOf() {
 
 template <size_t N>
 constexpr std::array<std::string_view, N> SplitNames(const char* raw_names) {
-  std::array<std::string_view, N> result;
+  std::array<std::string_view, N> result{};
   std::string_view names(raw_names);
 
   // Remove '(' and ')'.

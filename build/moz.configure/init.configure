@@ -529,6 +529,8 @@ def split_triplet(triplet, allow_wasi=False):
         canonical_os = canonical_kernel = "SunOS"
     elif os.startswith("wasi") and allow_wasi:
         canonical_os = canonical_kernel = "WASI"
+    elif os.startswith("emscripten") and allow_wasi:
+        canonical_os = canonical_kernel = "EMSCRIPTEN"
     else:
         raise ValueError("Unknown OS: %s" % os)
 
@@ -756,7 +758,9 @@ def real_target(value, host, shell, project, application):
             pass
 
     try:
-        return split_triplet(config_sub(shell, target), allow_wasi=(project == "js"))
+        # Allow wasm/wasi/emscripten triples for any project (not just js) so the
+        # full engine can target browser wasm. Upstream only allows it for js.
+        return split_triplet(config_sub(shell, target), allow_wasi=True)
     except ValueError as e:
         die(e)
 
@@ -874,6 +878,12 @@ def target_is_darwin(target):
 
 
 set_define("XP_DARWIN", target_is_darwin)
+
+
+@depends(target)
+def target_is_emscripten(target):
+    if target.os == "EMSCRIPTEN":
+        return True
 
 
 @depends(target)

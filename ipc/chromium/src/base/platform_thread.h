@@ -32,6 +32,9 @@ typedef lwpid_t PlatformThreadId;
 #  elif defined(XP_DARWIN)
 #    include <mach/mach.h>
 typedef mach_port_t PlatformThreadId;
+#  elif defined(__EMSCRIPTEN__)
+#    include <unistd.h>
+typedef pid_t PlatformThreadId;
 #  endif
 #endif
 

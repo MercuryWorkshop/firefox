@@ -73,6 +73,12 @@ else:
 # This disables building some NSS tools.
 gyp_vars["mozilla_client"] = 1
 
+# certutil/pk12util are standalone NSS command-line tools we don't need for the
+# engine. Under wasm they also fail to link (wasm-ld rejects the duplicate
+# symbols between each tool's own objects and the shared NSS libs they link).
+# Skip them entirely for the emscripten build.
+gyp_vars["build_nss_cmds"] = 0 if CONFIG["OS_TARGET"] == "EMSCRIPTEN" else 1
+
 # This builds NSS tools in COMM applications that Firefox doesn't build.
 if CONFIG["MOZ_BUILD_APP"].startswith("comm/"):
     gyp_vars["comm_client"] = 1

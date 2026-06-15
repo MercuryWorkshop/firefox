@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+#include <cstdio>
 #include "nsDebug.h"
 #include "AutoSQLiteLifetime.h"
 #include "sqlite3.h"
@@ -135,15 +136,26 @@ void AutoSQLiteLifetime::Init() {
   sResult = SQLITE_OK;
 #endif
 
-  if (sResult == SQLITE_OK) {
-    // TODO (bug 1191405): do not preallocate the connections caches until we
-    // have figured the impact on our consumers and memory.
-    ::sqlite3_config(SQLITE_CONFIG_PAGECACHE, NULL, 0, 0);
+  printf("### ASL: config(MALLOC) rc=%d threadsafe=%d\n", sResult,
+         ::sqlite3_threadsafe());
+  fflush(stdout);
+  // In this single-module wasm build, mozStorage and NSS softoken share ONE
+  // statically-linked sqlite. If NSS initialized/configured sqlite first (e.g.
+  // during NS_InitXPCOM), these sqlite3_config()/initialize() calls return
+  // SQLITE_MISUSE. The library is still usable, so accept it -- otherwise the
+  // storage service fails to construct and every DB open null-derefs.
+  if (sResult == SQLITE_MISUSE) {
+    sResult = SQLITE_OK;
+  }
 
-    // Explicitly initialize sqlite3.  Although this is implicitly called by
-    // various sqlite3 functions (and the sqlite3_open calls in our case),
-    // the documentation suggests calling this directly.  So we do.
+  if (sResult == SQLITE_OK) {
+    int pcrc = ::sqlite3_config(SQLITE_CONFIG_PAGECACHE, NULL, 0, 0);
     sResult = ::sqlite3_initialize();
+    printf("### ASL: config(PAGECACHE) rc=%d initialize rc=%d\n", pcrc, sResult);
+    fflush(stdout);
+    if (sResult == SQLITE_MISUSE) {
+      sResult = SQLITE_OK;
+    }
   }
 }
 

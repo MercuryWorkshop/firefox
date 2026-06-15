@@ -84,6 +84,8 @@
 #  include "DMABufFormats.h"
 #elif defined(ANDROID)
 #  include "gfxAndroidPlatform.h"
+#elif defined(MOZ_WIDGET_HEADLESS)
+#  include "gfxPlatformHeadless.h"
 #endif
 #if defined(MOZ_WIDGET_ANDROID)
 #  include "mozilla/java/HardwareCodecCapabilityUtilsWrappers.h"
@@ -793,6 +795,8 @@ bool gfxPlatform::HasVariationFontSupport() {
     sHasVariationFontSupport = gfxPlatformGtk::CheckVariationFontSupport();
 #elif defined(ANDROID)
     sHasVariationFontSupport = gfxAndroidPlatform::CheckVariationFontSupport();
+#elif defined(MOZ_WIDGET_HEADLESS)
+    sHasVariationFontSupport = gfxPlatformHeadless::CheckVariationFontSupport();
 #else
 #  error "No gfxPlatform implementation available"
 #endif
@@ -918,6 +922,8 @@ void gfxPlatform::Init() {
   gPlatform = new gfxPlatformGtk;
 #elif defined(ANDROID)
   gPlatform = new gfxAndroidPlatform;
+#elif defined(MOZ_WIDGET_HEADLESS)
+  gPlatform = new gfxPlatformHeadless;
 #else
 #  error "No gfxPlatform implementation available"
 #endif
@@ -2574,11 +2580,18 @@ void gfxPlatform::InitCompositorAccelerationPrefs() {
                          "Acceleration blocked by safe-mode",
                          "FEATURE_FAILURE_COMP_SAFEMODE"_ns);
   }
+#ifndef __EMSCRIPTEN__
+  // On emscripten "headless" only means the widget toolkit has no native
+  // window (we run MOZ_HEADLESS=1 to get a HeadlessWidget); it does NOT mean
+  // there is no GPU. GLContextProviderEmscripten backs the compositor with a
+  // real WebGL2 context, so keep HW_COMPOSITING (and thus WebRender) available
+  // instead of falling back to software WebRender.
   if (IsHeadless()) {
     feature.ForceDisable(FeatureStatus::Blocked,
                          "Acceleration blocked by headless mode",
                          "FEATURE_FAILURE_COMP_HEADLESSMODE"_ns);
   }
+#endif
 }
 
 /*static*/

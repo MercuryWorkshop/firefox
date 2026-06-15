@@ -45,6 +45,11 @@ extern_ty! {
 }
 
 s! {
+    pub struct in6_pktinfo {
+        pub ipi6_addr: crate::in6_addr,
+        pub ipi6_ifindex: c_int,
+    }
+
     pub struct glob_t {
         pub gl_pathc: size_t,
         pub gl_pathv: *mut *mut c_char,

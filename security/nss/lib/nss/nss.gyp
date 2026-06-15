@@ -28,7 +28,11 @@
         'nss_static',
         '<(DEPTH)/lib/certhigh/certhigh.gyp:certhi',
         '<(DEPTH)/lib/cryptohi/cryptohi.gyp:cryptohi',
-        '<(DEPTH)/lib/pk11wrap/pk11wrap.gyp:pk11wrap',
+        # emscripten/wasm has no dlopen, so softoken cannot be loaded as a
+        # separate PKCS#11 module. Use the static softoken chain (pk11wrap_static
+        # -> softokn_static -> freebl_static, all NSS_STATIC_SOFTOKEN) so
+        # NSC_GetInterface is linked directly and NSS_NoDB_Init works.
+        '<(DEPTH)/lib/pk11wrap/pk11wrap.gyp:pk11wrap_static',
         '<(DEPTH)/lib/certdb/certdb.gyp:certdb',
         '<(DEPTH)/lib/pki/pki.gyp:nsspki',
         '<(DEPTH)/lib/dev/dev.gyp:nssdev',

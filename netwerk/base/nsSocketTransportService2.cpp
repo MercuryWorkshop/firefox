@@ -36,6 +36,26 @@
 #  include "private/pprio.h"
 #endif
 
+#if defined(__EMSCRIPTEN__)
+#  include <emscripten/threading.h>
+#  include <stdint.h>
+// emscripten has no working PollableEvent (pipe2 is unsupported), so the socket
+// thread's poll() cannot be woken via a self-pipe. The worker-side poll() shim
+// (embed-xul/wisp-syscalls.js) instead sleeps in Atomics.wait on a shared futex
+// word provided by the embedder (wisp_wakeword). Bump + wake it wherever Necko
+// would have signalled the PollableEvent, so a cross-thread Dispatch wakes the
+// poll loop immediately instead of waiting out its fallback slice. Weak: degrades
+// to the fallback slice if the embedder doesn't provide the word.
+extern "C" __attribute__((weak)) int32_t* wisp_wakeword();
+static inline void WispWakeSocketPoll() {
+  if (wisp_wakeword) {
+    int32_t* w = wisp_wakeword();
+    __atomic_fetch_add(w, 1, __ATOMIC_SEQ_CST);
+    emscripten_futex_wake(w, INT32_MAX);
+  }
+}
+#endif
+
 namespace mozilla {
 namespace net {
 
@@ -890,6 +910,9 @@ nsSocketTransportService::Shutdown(bool aXpcomShutdown) {
     if (mPollableEvent) {
       mPollableEvent->Signal();
     }
+#if defined(__EMSCRIPTEN__)
+    ::WispWakeSocketPoll();
+#endif
   }
 
   // If we're shutting down due to going offline (rather than due to XPCOM
@@ -964,6 +987,9 @@ nsSocketTransportService::SetOffline(bool offline) {
   if (mPollableEvent) {
     mPollableEvent->Signal();
   }
+#if defined(__EMSCRIPTEN__)
+  ::WispWakeSocketPoll();
+#endif
 
   return NS_OK;
 }
@@ -1094,6 +1120,9 @@ nsSocketTransportService::OnDispatchedEvent() {
   if (mPollableEvent) {
     mPollableEvent->Signal();
   }
+#if defined(__EMSCRIPTEN__)
+  ::WispWakeSocketPoll();
+#endif
   return NS_OK;
 }
 

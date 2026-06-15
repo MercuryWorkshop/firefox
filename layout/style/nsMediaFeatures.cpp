@@ -265,6 +265,10 @@ bool Gecko_MediaFeatures_MatchesPlatform(StylePlatform aPlatform) {
 #elif defined(XP_IOS)
     case StylePlatform::Ios:
       return true;
+#elif defined(MOZ_WIDGET_HEADLESS)
+    // Headless (the wasm engine build) reports as Linux for -moz-platform.
+    case StylePlatform::Linux:
+      return true;
 #else
 #  error "Unknown platform?"
 #endif

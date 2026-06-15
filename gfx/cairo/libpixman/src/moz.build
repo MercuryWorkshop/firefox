@@ -52,6 +52,11 @@ LOCAL_INCLUDES += [
 if CONFIG['MOZ_USE_PTHREADS']:
     DEFINES['HAVE_PTHREADS'] = True
 
+# Single-threaded wasm: pixman has no TLS mechanism for emscripten, and we don't
+# need thread-safety. Acknowledge per pixman-compiler.h.
+if CONFIG['OS_TARGET'] == 'EMSCRIPTEN':
+    DEFINES['PIXMAN_NO_TLS'] = True
+
 DEFINES['PACKAGE'] = 'mozpixman'
 
 if CONFIG['INTEL_ARCHITECTURE']:

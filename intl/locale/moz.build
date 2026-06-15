@@ -18,6 +18,8 @@ elif toolkit == "gtk":
     DIRS += ["gtk"]
 elif toolkit == "android":
     DIRS += ["android"]
+elif toolkit == "headless":
+    DIRS += ["headless"]
 
 XPIDL_SOURCES += [
     "mozILocaleService.idl",

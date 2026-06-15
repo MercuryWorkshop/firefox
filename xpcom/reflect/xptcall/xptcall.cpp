@@ -25,6 +25,11 @@ nsXPTCStubBase::AddRef() { return mOuter->AddRef(); }
 NS_IMETHODIMP_(MozExternalRefCountType)
 nsXPTCStubBase::Release() { return mOuter->Release(); }
 
+// On wasm (emscripten) these three entry points are provided by
+// xptcstubs_wasm.cpp, which builds a synthetic addFunction()-based vtable
+// instead of relying on nsXPTCStubBase's compiled vtable (the latter can't work
+// under wasm's call_indirect signature checks).
+#ifndef __EMSCRIPTEN__
 EXPORT_XPCOM_API(nsresult)
 NS_GetXPTCallStub(REFNSIID aIID, nsIXPTCProxy* aOuter,
                   nsISomeInterface** aResult) {
@@ -52,3 +57,4 @@ NS_SizeOfIncludingThisXPTCallStub(const nsISomeInterface* aStub,
   // anything, so just measure the size of the object itself.
   return aMallocSizeOf(aStub);
 }
+#endif  // !__EMSCRIPTEN__

@@ -2699,8 +2699,8 @@ def security_hardening_cflags(
     ldflags = []
     trivial_auto_var_init = []
 
-    # WASI compiler doesn't support security hardening cflags
-    if target.os == "WASI":
+    # WASI/emscripten compilers don't support security hardening cflags
+    if target.os in ("WASI", "EMSCRIPTEN"):
         return
 
     # ----------------------------------------------------------
@@ -3432,6 +3432,11 @@ def make_shared_library(target, compiler):
     output = ["-o", "$@"]
 
     if target.kernel == "Darwin":
+        soname = []
+    elif target.os == "EMSCRIPTEN":
+        # wasm-ld doesn't accept the Solaris-style `-h` soname flag, and our
+        # intermediate libs are partial (--relocatable) links where a soname is
+        # meaningless anyway.
         soname = []
     elif target.os == "NetBSD":
         soname = ["-Wl,-soname,$(DSO_SONAME)"]

@@ -119,6 +119,7 @@
     'disable_arm32_neon%': 0,
     'mozilla_client%': 0,
     'comm_client%': 0,
+    'build_nss_cmds%': 1,
     'moz_fold_libs%': 0,
     'moz_folded_library_name%': '',
     'sanitizer_flags%': 0,

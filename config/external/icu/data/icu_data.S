@@ -18,7 +18,7 @@
 #elif defined(__APPLE__)
 .data
 .const
-#elif defined(__wasi__)
+#elif defined(__wasi__) || defined(__EMSCRIPTEN__)
 .section .rodata,"",@
 #else
 .section .rodata
@@ -26,6 +26,6 @@
 .balign 16
 ICU_DATA_SYMBOL:
 .incbin ICU_DATA_FILE
-#ifdef __wasi__
+#if defined(__wasi__) || defined(__EMSCRIPTEN__)
 .size ICU_DATA_SYMBOL, . - ICU_DATA_SYMBOL
 #endif

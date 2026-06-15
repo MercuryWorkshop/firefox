@@ -161,7 +161,12 @@ set_config("MOZ_CONFIGURE_OPTIONS", all_configure_options)
 
 @depends(target)
 def fold_libs(target):
-    return target.os in ("WINNT", "OSX", "iOS", "Android")
+    # EMSCRIPTEN: fold NSPR/NSS into libxul so the wasm build produces a single
+    # relocatable object (no separate libnspr4/plc4/plds4/libnss .so's). Those
+    # separate objects collide on shared symbols (libVersionPoint, etc.) when
+    # statically linked into one wasm module, and wasm-ld has no
+    # --allow-multiple-definition. Folding is also what Android does.
+    return target.os in ("WINNT", "OSX", "iOS", "Android", "EMSCRIPTEN")
 
 
 set_config("MOZ_FOLD_LIBS", fold_libs)
@@ -529,6 +534,10 @@ def toolkit_choices(target):
         return ("cairo-uikit",)
     elif target.os == "Android":
         return ("cairo-android",)
+    elif target.os == "EMSCRIPTEN":
+        # No native widget toolkit in wasm; use the offscreen headless backend
+        # (widget/headless) as the sole widget toolkit.
+        return ("cairo-headless",)
     else:
         # cairo-gtk3 - X11 backend with optional Wayland backend (auto detected)
         # cairo-gtk3-wayland - Wayland backend with optional X11 backend (auto detected)
@@ -784,7 +793,14 @@ def freetype2_combined_info(fontconfig_info, freetype2_info):
     )
 
 
-set_define("MOZ_HAVE_FREETYPE2", depends_if(freetype2_info)(lambda _: True))
+@depends(freetype2_info, target)
+def have_freetype2(freetype2_info, target):
+    # emscripten provides FreeType via its port (-sUSE_FREETYPE).
+    if freetype2_info or target.os == "EMSCRIPTEN":
+        return True
+
+
+set_define("MOZ_HAVE_FREETYPE2", have_freetype2)
 
 
 # Apple platform decoder support
@@ -1309,6 +1325,11 @@ set_config("MOZ_SYSTEM_WEBP", depends(when=system_webp)(lambda: True))
 def tree_freetype(target):
     if target.os == "Android":
         return True
+    # emscripten's bundled FreeType port is ancient (2.6.0) and missing many
+    # APIs Gecko's font code needs (FT_Done_MM_Var, variable fonts, COLRv1...).
+    # Build the modern in-tree FreeType instead.
+    if target.os == "EMSCRIPTEN":
+        return True
 
 
 set_define("MOZ_TREE_FREETYPE", tree_freetype)
@@ -1335,7 +1356,12 @@ set_config("FT2_LIBS", ft2_info.libs)
 def enable_cairo_ft(target, tree_freetype, freetype2_info):
     # Avoid defining MOZ_ENABLE_CAIRO_FT on Windows platforms because
     # "cairo-ft-font.c" includes <dlfcn.h>, which only exists on posix platforms
-    return freetype2_info or (tree_freetype and target.os != "WINNT")
+    # emscripten provides FreeType via its port (-sUSE_FREETYPE).
+    return (
+        freetype2_info
+        or (tree_freetype and target.os != "WINNT")
+        or target.os == "EMSCRIPTEN"
+    )
 
 
 set_config("MOZ_ENABLE_CAIRO_FT", True, when=enable_cairo_ft)

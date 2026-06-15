@@ -16,7 +16,16 @@ namespace sh
 
 namespace
 {
+#if defined(__EMSCRIPTEN__)
+// Canvas passthrough: the backend GL here is the host browser's WebGL, which
+// (unlike a native GL driver) reserves identifiers starting with "webgl_" and
+// rejects them at compile time. Use a non-reserved prefix so our translated
+// content shaders compile on the host WebGL context. WebRender's own shaders
+// don't go through this translator, so the compositor is unaffected.
+constexpr const ImmutableString kHashedNamePrefix("mzwgl_");
+#else
 constexpr const ImmutableString kHashedNamePrefix("webgl_");
+#endif
 
 ImmutableString HashName(const ImmutableString &name, ShHashFunction64 hashFunction)
 {

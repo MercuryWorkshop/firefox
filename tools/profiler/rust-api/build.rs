@@ -77,6 +77,7 @@ fn generate_bindings() {
     let bindings = builder
         .header(add_include("GeckoProfiler.h"))
         .header(add_include("ProfilerBindings.h"))
+        .allowlist_file(".*ProfilerBindings.h")
         .allowlist_function("gecko_profiler_.*")
         .allowlist_var("mozilla::profiler::detail::RacyFeatures::sActiveAndFeatures")
         .allowlist_type("mozilla::profiler::detail::RacyFeatures")

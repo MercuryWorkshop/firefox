@@ -1915,6 +1915,41 @@ static bool GetBytecodeBufferOrSource(JSContext* cx, Handle<JSObject*> obj,
   return true;
 }
 
+#if defined(__EMSCRIPTEN__)
+// Host-passthrough wasm: bridge guest WebAssembly to the host engine (the JIT is
+// disabled here, so there is no in-process compiler). These resolve to the
+// wasm-host-bridge.js js-library at link time; wasmhost_invoke_import is defined
+// in this file and exported. Helpers are defined below, near WebAssembly_instantiate.
+extern "C" {
+int wasmhost_compile(const void* bytes, int len);
+int wasmhost_import_count(int handle);
+int wasmhost_import_kind(int handle, int index);
+int wasmhost_import_module(int handle, int index, char* buf, int buflen);
+int wasmhost_import_name(int handle, int index, char* buf, int buflen);
+int wasmhost_instantiate(int handle, const int* callbackIds, int importCount);
+int wasmhost_export_count(int handle);
+int wasmhost_export_kind(int handle, int index);
+int wasmhost_export_name(int handle, int index, char* buf, int buflen);
+int wasmhost_export_register_mem(int handle, int index);
+int wasmhost_mem_new(int initialPages, int maxPages, int shared);
+int wasmhost_table_new(int initial, int maxN, int isExternref);
+int wasmhost_global_new(double val, int kind, int mut);
+int wasmhost_mem_bytelength(int objId);
+int wasmhost_mem_is_shared(int objId);
+void wasmhost_obj_set_mirror(int objId, void* ptr, int len);
+double wasmhost_call(int handle, int index, const double* args, int argc);
+}
+static int HostCompileBytes(JSContext* cx, HandleObject bytesObj);
+static JSObject* HostMakeModuleObject(JSContext* cx, int handle);
+static int HostModuleHandle(JSContext* cx, HandleObject obj);
+static bool HostBindAndInstantiate(JSContext* cx, int handle,
+                                   HandleObject importObj);
+static JSObject* HostBuildInstanceObject(JSContext* cx, int handle);
+static int HostObjId(JSContext* cx, HandleObject obj);
+static JSObject* HostMakeMemoryWrapper(JSContext* cx, int objId, bool shared);
+static JSObject* HostMakeObjIdWrapper(JSContext* cx, int objId);
+#endif
+
 /* static */
 bool WasmModuleObject::construct(JSContext* cx, unsigned argc, Value* vp) {
   CallArgs callArgs = CallArgsFromVp(argc, vp);
@@ -1924,6 +1959,30 @@ bool WasmModuleObject::construct(JSContext* cx, unsigned argc, Value* vp) {
   if (!ThrowIfNotConstructing(cx, callArgs, "Module")) {
     return false;
   }
+
+#if defined(__EMSCRIPTEN__)
+  if (wasm::UseHostPassthrough()) {
+    if (!callArgs.requireAtLeast(cx, "WebAssembly.Module", 1)) {
+      return false;
+    }
+    if (!callArgs.get(0).isObject()) {
+      JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr,
+                               JSMSG_WASM_BAD_BUF_MOD_ARG);
+      return false;
+    }
+    RootedObject bytesObj(cx, &callArgs.get(0).toObject());
+    int handle = HostCompileBytes(cx, bytesObj);
+    RootedObject moduleObj(cx);
+    if (handle >= 0) {
+      moduleObj = HostMakeModuleObject(cx, handle);
+    }
+    if (!moduleObj) {
+      return false;
+    }
+    callArgs.rval().setObject(*moduleObj);
+    return true;
+  }
+#endif
 
   JS::RootedVector<JSString*> parameterStrings(cx);
   JS::RootedVector<Value> parameterArgs(cx);
@@ -2441,6 +2500,39 @@ bool WasmInstanceObject::construct(JSContext* cx, unsigned argc, Value* vp) {
     return false;
   }
 
+#if defined(__EMSCRIPTEN__)
+  if (wasm::UseHostPassthrough()) {
+    if (!args.requireAtLeast(cx, "WebAssembly.Instance", 1)) {
+      return false;
+    }
+    if (!args.get(0).isObject()) {
+      JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr,
+                               JSMSG_WASM_BAD_MOD_ARG);
+      return false;
+    }
+    RootedObject modObj(cx, &args.get(0).toObject());
+    int handle = HostModuleHandle(cx, modObj);
+    if (handle < 0) {
+      JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr,
+                               JSMSG_WASM_BAD_MOD_ARG);
+      return false;
+    }
+    RootedObject importObj(cx);
+    if (!GetImportArg(cx, args.get(1), &importObj)) {
+      return false;
+    }
+    if (!HostBindAndInstantiate(cx, handle, importObj)) {
+      return false;
+    }
+    RootedObject instanceObj(cx, HostBuildInstanceObject(cx, handle));
+    if (!instanceObj) {
+      return false;
+    }
+    args.rval().setObject(*instanceObj);
+    return true;
+  }
+#endif
+
   if (!args.requireAtLeast(cx, "WebAssembly.Instance", 1)) {
     return false;
   }
@@ -2651,6 +2743,46 @@ bool WasmMemoryObject::construct(JSContext* cx, unsigned argc, Value* vp) {
   if (!ThrowIfNotConstructing(cx, args, "Memory")) {
     return false;
   }
+
+#if defined(__EMSCRIPTEN__)
+  if (wasm::UseHostPassthrough()) {
+    if (!args.requireAtLeast(cx, "WebAssembly.Memory", 1) ||
+        !args.get(0).isObject()) {
+      JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr,
+                               JSMSG_WASM_BAD_DESC_ARG, "memory");
+      return false;
+    }
+    RootedObject desc(cx, &args[0].toObject());
+    RootedValue v(cx);
+    int32_t initial = 0;
+    int32_t maximum = -1;
+    if (!JS_GetProperty(cx, desc, "initial", &v) || !ToInt32(cx, v, &initial)) {
+      return false;
+    }
+    if (!JS_GetProperty(cx, desc, "maximum", &v)) {
+      return false;
+    }
+    if (!v.isUndefined() && !ToInt32(cx, v, &maximum)) {
+      return false;
+    }
+    if (!JS_GetProperty(cx, desc, "shared", &v)) {
+      return false;
+    }
+    bool shared = ToBoolean(v);
+    int objId = wasmhost_mem_new(initial, maximum, shared ? 1 : 0);
+    RootedObject memWrap(cx);
+    if (objId >= 0) {
+      memWrap = HostMakeMemoryWrapper(cx, objId, shared);
+    }
+    if (!memWrap) {
+      JS_ReportErrorASCII(
+          cx, "WebAssembly host passthrough: memory creation failed");
+      return false;
+    }
+    args.rval().setObject(*memWrap);
+    return true;
+  }
+#endif
 
   if (!args.requireAtLeast(cx, "WebAssembly.Memory", 1)) {
     return false;
@@ -3343,6 +3475,49 @@ bool WasmTableObject::construct(JSContext* cx, unsigned argc, Value* vp) {
     return false;
   }
 
+#if defined(__EMSCRIPTEN__)
+  if (wasm::UseHostPassthrough()) {
+    if (!args.requireAtLeast(cx, "WebAssembly.Table", 1) ||
+        !args.get(0).isObject()) {
+      JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr,
+                               JSMSG_WASM_BAD_DESC_ARG, "table");
+      return false;
+    }
+    RootedObject desc(cx, &args[0].toObject());
+    RootedValue v(cx);
+    int32_t initial = 0;
+    int32_t maximum = -1;
+    if (!JS_GetProperty(cx, desc, "initial", &v) || !ToInt32(cx, v, &initial)) {
+      return false;
+    }
+    if (!JS_GetProperty(cx, desc, "maximum", &v)) {
+      return false;
+    }
+    if (!v.isUndefined() && !ToInt32(cx, v, &maximum)) {
+      return false;
+    }
+    bool externref = false;
+    if (JS_GetProperty(cx, desc, "element", &v) && v.isString()) {
+      bool m = false;
+      if (JS_StringEqualsLiteral(cx, v.toString(), "externref", &m)) {
+        externref = m;
+      }
+    }
+    int objId = wasmhost_table_new(initial, maximum, externref ? 1 : 0);
+    RootedObject w(cx);
+    if (objId >= 0) {
+      w = HostMakeObjIdWrapper(cx, objId);
+    }
+    if (!w) {
+      JS_ReportErrorASCII(
+          cx, "WebAssembly host passthrough: table creation failed");
+      return false;
+    }
+    args.rval().setObject(*w);
+    return true;
+  }
+#endif
+
   if (!args.requireAtLeast(cx, "WebAssembly.Table", 1)) {
     return false;
   }
@@ -3761,6 +3936,51 @@ bool WasmGlobalObject::construct(JSContext* cx, unsigned argc, Value* vp) {
   if (!ThrowIfNotConstructing(cx, args, "Global")) {
     return false;
   }
+
+#if defined(__EMSCRIPTEN__)
+  if (wasm::UseHostPassthrough()) {
+    if (!args.requireAtLeast(cx, "WebAssembly.Global", 1) ||
+        !args.get(0).isObject()) {
+      JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr,
+                               JSMSG_WASM_BAD_DESC_ARG, "global");
+      return false;
+    }
+    RootedObject desc(cx, &args[0].toObject());
+    RootedValue v(cx);
+    int kind = 3;  // f64 default
+    if (JS_GetProperty(cx, desc, "value", &v) && v.isString()) {
+      RootedString s(cx, v.toString());
+      bool m = false;
+      if (JS_StringEqualsLiteral(cx, s, "i32", &m) && m) {
+        kind = 0;
+      } else if (JS_StringEqualsLiteral(cx, s, "i64", &m) && m) {
+        kind = 1;
+      } else if (JS_StringEqualsLiteral(cx, s, "f32", &m) && m) {
+        kind = 2;
+      }
+    }
+    if (!JS_GetProperty(cx, desc, "mutable", &v)) {
+      return false;
+    }
+    bool mut = ToBoolean(v);
+    double initVal = 0;
+    if (args.length() >= 2 && !ToNumber(cx, args.get(1), &initVal)) {
+      return false;
+    }
+    int objId = wasmhost_global_new(initVal, kind, mut ? 1 : 0);
+    RootedObject w(cx);
+    if (objId >= 0) {
+      w = HostMakeObjIdWrapper(cx, objId);
+    }
+    if (!w) {
+      JS_ReportErrorASCII(
+          cx, "WebAssembly host passthrough: global creation failed");
+      return false;
+    }
+    args.rval().setObject(*w);
+    return true;
+  }
+#endif
 
   if (!args.requireAtLeast(cx, "WebAssembly.Global", 1)) {
     return false;
@@ -5045,6 +5265,35 @@ static bool WebAssembly_compile(JSContext* cx, unsigned argc, Value* vp) {
 
   CallArgs callArgs = CallArgsFromVp(argc, vp);
 
+#if defined(__EMSCRIPTEN__)
+  if (wasm::UseHostPassthrough()) {
+    if (!callArgs.requireAtLeast(cx, "WebAssembly.compile", 1)) {
+      return RejectWithPendingException(cx, promise, callArgs);
+    }
+    RootedValue arg0(cx, callArgs.get(0));
+    if (!arg0.isObject()) {
+      JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr,
+                               JSMSG_WASM_BAD_BUF_MOD_ARG);
+      return RejectWithPendingException(cx, promise, callArgs);
+    }
+    RootedObject bytesObj(cx, &arg0.toObject());
+    int handle = HostCompileBytes(cx, bytesObj);
+    RootedObject moduleObj(cx);
+    if (handle >= 0) {
+      moduleObj = HostMakeModuleObject(cx, handle);
+    }
+    if (!moduleObj) {
+      return RejectWithPendingException(cx, promise, callArgs);
+    }
+    RootedValue result(cx, ObjectValue(*moduleObj));
+    if (!PromiseObject::resolve(cx, promise, result)) {
+      return RejectWithPendingException(cx, promise, callArgs);
+    }
+    callArgs.rval().setObject(*promise);
+    return true;
+  }
+#endif
+
   JS::RootedVector<JSString*> parameterStrings(cx);
   JS::RootedVector<Value> parameterArgs(cx);
   bool canCompileStrings = false;
@@ -5122,6 +5371,561 @@ static bool GetInstantiateArgs(JSContext* cx, const CallArgs& callArgs,
   return true;
 }
 
+#if defined(__EMSCRIPTEN__)
+#  include <emscripten.h>
+#  include "js/ArrayBuffer.h"        // JS::NewArrayBufferWithUserOwnedContents
+#  include "js/SharedArrayBuffer.h"  // JS::NewSharedArrayBuffer
+#  include "js/CallAndConstruct.h"   // JS_CallFunctionValue
+// -- Host-passthrough wasm (wasm32-emscripten) ------------------------------
+// There is no in-process wasm compiler (the JIT is disabled), so guest
+// WebAssembly is compiled+instantiated on the HOST browser's WebAssembly engine
+// via the wasm-host-bridge.js js-library; its exports are bridged back as native
+// functions, its (function) imports are bridged out to guest callbacks, and its
+// linear memory is mirrored into a guest buffer (see HostMakeMemoryWrapper). The
+// extern "C" declarations live near WasmModuleObject::construct (used earlier).
+
+// Guest JS functions supplied as wasm imports, kept alive and indexed by id so
+// the host engine can call them back via wasmhost_invoke_import. Leaked for the
+// process lifetime (an instance may be called at any later time).
+static JS::PersistentRootedObject* gImportCallbacks = nullptr;
+static uint32_t gImportCallbackCount = 0;
+
+static int RegisterImportCallback(JSContext* cx, HandleValue fn) {
+  if (!gImportCallbacks) {
+    RootedObject obj(cx, JS_NewPlainObject(cx));
+    if (!obj) {
+      return -1;
+    }
+    gImportCallbacks = new JS::PersistentRootedObject(cx, obj);
+  }
+  RootedObject obj(cx, *gImportCallbacks);
+  uint32_t id = gImportCallbackCount++;
+  RootedValue v(cx, fn);
+  if (!JS_SetElement(cx, obj, id, v)) {
+    return -1;
+  }
+  return int(id);
+}
+
+// Called by a host import shim while the host wasm runs (reentrant: nested in a
+// guest export call or in instantiation). Invokes guest import callback `id`
+// with `argc` numeric args read from guest memory; returns its result as a
+// double. i64/BigInt and reference types are not handled.
+extern "C" EMSCRIPTEN_KEEPALIVE double wasmhost_invoke_import(
+    int id, const double* args, int argc) {
+  JSContext* cx = js::TlsContext.get();
+  if (!cx || !gImportCallbacks) {
+    return 0;
+  }
+  double local[64];
+  int n = argc > 64 ? 64 : argc;
+  for (int i = 0; i < n; i++) {
+    local[i] = args[i];
+  }
+
+  RootedObject obj(cx, *gImportCallbacks);
+  RootedValue fnVal(cx);
+  if (!JS_GetElement(cx, obj, uint32_t(id), &fnVal) || !IsCallable(fnVal)) {
+    return 0;
+  }
+  JS::RootedValueVector argv(cx);
+  for (int i = 0; i < n; i++) {
+    if (!argv.append(NumberValue(local[i]))) {
+      return 0;
+    }
+  }
+  RootedValue rval(cx);
+  if (!JS_CallFunctionValue(cx, nullptr, fnVal, JS::HandleValueArray(argv),
+                            &rval)) {
+    // The guest callback threw; we cannot propagate across the host wasm frame,
+    // so swallow it (best-effort) and return 0.
+    if (cx->isExceptionPending()) {
+      JS_ClearPendingException(cx);
+    }
+    return 0;
+  }
+  double d = 0;
+  if (rval.isNumber()) {
+    d = rval.toNumber();
+  } else if (!rval.isUndefined()) {
+    (void)ToNumber(cx, rval, &d);
+  }
+  return d;
+}
+
+// Native backing for a bridged wasm export function. Extended slot 0 holds the
+// host instance handle, slot 1 the export index. Numeric args/results
+// round-trip through double (i32/f32/f64); i64/BigInt and reference types are
+// not yet handled.
+static bool WasmHostExportCall(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  JSFunction& callee = args.callee().as<JSFunction>();
+  int handle = callee.getExtendedSlot(0).toInt32();
+  int index = callee.getExtendedSlot(1).toInt32();
+
+  double buf[64];
+  unsigned n = args.length() > 64 ? 64 : args.length();
+  for (unsigned i = 0; i < n; i++) {
+    double d;
+    if (!ToNumber(cx, args[i], &d)) {
+      return false;
+    }
+    buf[i] = d;
+  }
+  double r = wasmhost_call(handle, index, buf, int(n));
+  args.rval().setNumber(r);
+  return true;
+}
+
+// Bridge function imports for an already-compiled `handle`: find each import in
+// `importObj`, register it -> a callback id (-1 otherwise), then build the host
+// instance. Returns false (+ reports) on failure.
+static bool HostBindAndInstantiate(JSContext* cx, int handle,
+                                   HandleObject importObj) {
+  int importCount = wasmhost_import_count(handle);
+  int* callbackIds =
+      js_pod_malloc<int>(size_t(importCount > 0 ? importCount : 1));
+  if (!callbackIds) {
+    ReportOutOfMemory(cx);
+    return false;
+  }
+  for (int i = 0; i < importCount; i++) {
+    callbackIds[i] = -1;
+    int kind = wasmhost_import_kind(handle, i);
+    char modbuf[256];
+    char namebuf[256];
+    wasmhost_import_module(handle, i, modbuf, sizeof(modbuf));
+    wasmhost_import_name(handle, i, namebuf, sizeof(namebuf));
+    if (!importObj) {
+      continue;
+    }
+    RootedValue modVal(cx);
+    if (!JS_GetProperty(cx, importObj, modbuf, &modVal) || !modVal.isObject()) {
+      continue;
+    }
+    RootedObject modObj(cx, &modVal.toObject());
+    RootedValue val(cx);
+    if (!JS_GetProperty(cx, modObj, namebuf, &val)) {
+      continue;
+    }
+    if (kind == 0) {  // function -> guest callback id
+      if (IsCallable(val)) {
+        callbackIds[i] = RegisterImportCallback(cx, val);
+      }
+    } else if (val.isObject()) {  // memory/table/global -> host object id
+      RootedObject valObj(cx, &val.toObject());
+      callbackIds[i] = HostObjId(cx, valObj);
+    }
+  }
+
+  int rc = wasmhost_instantiate(handle, callbackIds, importCount);
+  js_free(callbackIds);
+  if (rc != 0) {
+    JS_ReportErrorASCII(cx,
+                        "WebAssembly host passthrough: instantiation failed");
+    return false;
+  }
+  return true;
+}
+
+// Build an `{ exports }` instance object for an instantiated `handle`. Export
+// functions are bridged; other export kinds (memory/table/global) are null.
+static JSObject* HostBuildInstanceObject(JSContext* cx, int handle) {
+  RootedObject exportsObj(cx, JS_NewPlainObject(cx));
+  if (!exportsObj) {
+    return nullptr;
+  }
+  int count = wasmhost_export_count(handle);
+  for (int i = 0; i < count; i++) {
+    char namebuf[256];
+    int nameLen = wasmhost_export_name(handle, i, namebuf, sizeof(namebuf));
+    Rooted<JSAtom*> nameAtom(cx, Atomize(cx, namebuf, size_t(nameLen)));
+    if (!nameAtom) {
+      return nullptr;
+    }
+    RootedValue exportVal(cx);
+    int ekind = wasmhost_export_kind(handle, i);
+    if (ekind == 0) {  // function
+      Rooted<JSFunction*> fn(
+          cx, NewNativeFunction(cx, WasmHostExportCall, 0, nameAtom,
+                                gc::AllocKind::FUNCTION_EXTENDED));
+      if (!fn) {
+        return nullptr;
+      }
+      fn->setExtendedSlot(0, Int32Value(handle));
+      fn->setExtendedSlot(1, Int32Value(i));
+      exportVal.setObject(*fn);
+    } else if (ekind == 2) {  // memory: register + build a mirrored wrapper
+      int objId = wasmhost_export_register_mem(handle, i);
+      if (objId >= 0) {
+        RootedObject memWrap(
+            cx, HostMakeMemoryWrapper(cx, objId,
+                                      wasmhost_mem_is_shared(objId) != 0));
+        if (!memWrap) {
+          return nullptr;
+        }
+        exportVal.setObject(*memWrap);
+      } else {
+        exportVal.setNull();
+      }
+    } else {
+      exportVal.setNull();
+    }
+    if (!JS_DefineProperty(cx, exportsObj, namebuf, exportVal,
+                           JSPROP_ENUMERATE)) {
+      return nullptr;
+    }
+  }
+  RootedObject instanceObj(cx, JS_NewPlainObject(cx));
+  if (!instanceObj) {
+    return nullptr;
+  }
+  RootedValue val(cx, ObjectValue(*exportsObj));
+  if (!JS_DefineProperty(cx, instanceObj, "exports", val, JSPROP_ENUMERATE)) {
+    return nullptr;
+  }
+  return instanceObj;
+}
+
+// An opaque "module" object that just carries the host compile `handle` (a
+// non-enumerable property). Not a real WasmModuleObject -- instanceof fails.
+static const char* const kHostModuleHandleProp = "__wasmHostHandle";
+
+static JSObject* HostMakeModuleObject(JSContext* cx, int handle) {
+  RootedObject moduleObj(cx, JS_NewPlainObject(cx));
+  if (!moduleObj) {
+    return nullptr;
+  }
+  RootedValue h(cx, Int32Value(handle));
+  if (!JS_DefineProperty(cx, moduleObj, kHostModuleHandleProp, h, 0)) {
+    return nullptr;
+  }
+  return moduleObj;
+}
+
+static int HostModuleHandle(JSContext* cx, HandleObject obj) {
+  RootedValue v(cx);
+  if (!JS_GetProperty(cx, obj, kHostModuleHandleProp, &v) || !v.isInt32()) {
+    return -1;
+  }
+  return v.toInt32();
+}
+
+// Guest wrappers for host Memory/Table/Global objects carry the host registry
+// id in a non-enumerable property.
+static const char* const kHostObjIdProp = "__wasmHostObjId";
+
+static int HostObjId(JSContext* cx, HandleObject obj) {
+  RootedValue v(cx);
+  if (!JS_GetProperty(cx, obj, kHostObjIdProp, &v) || !v.isInt32()) {
+    return -1;
+  }
+  return v.toInt32();
+}
+
+// Build a guest WebAssembly.Memory-like wrapper for an existing host memory
+// `objId`: a "mirror" ArrayBuffer over a js_malloc'd, user-owned (stable, never
+// GC-moved) region that content's HEAPU8 views. The mirror is kept in sync with
+// the host memory around export/import calls (see whSyncMem in the js-library).
+static JSObject* HostMakeMemoryWrapper(JSContext* cx, int objId, bool shared) {
+  size_t len = size_t(wasmhost_mem_bytelength(objId));
+  if (len == 0) {
+    len = 1;
+  }
+  RootedObject ab(cx);
+  uint8_t* mirror = nullptr;
+  if (shared) {
+    // Shared memory: content checks `buffer instanceof SharedArrayBuffer`
+    // (emscripten pthreads), so the mirror must be a real SAB. Its data is
+    // engine-owned and non-movable, so the pointer is stable for syncing.
+    ab = JS::NewSharedArrayBuffer(cx, len);
+    if (!ab) {
+      JS_ReportErrorASCII(
+          cx, "WebAssembly host passthrough: shared memory unavailable");
+      return nullptr;
+    }
+    JS::AutoCheckCannotGC nogc;
+    bool isSharedMem = false;
+    mirror = JS::GetSharedArrayBufferData(ab, &isSharedMem, nogc);
+  } else {
+    mirror = js_pod_calloc<uint8_t>(len);
+    if (!mirror) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+    ab = JS::NewArrayBufferWithUserOwnedContents(cx, len, mirror);
+    if (!ab) {
+      js_free(mirror);
+      return nullptr;
+    }
+  }
+  if (!mirror) {
+    return nullptr;
+  }
+  wasmhost_obj_set_mirror(objId, mirror, int(len));
+
+  RootedObject wrapper(cx, JS_NewPlainObject(cx));
+  if (!wrapper) {
+    return nullptr;
+  }
+  RootedValue idv(cx, Int32Value(objId));
+  if (!JS_DefineProperty(cx, wrapper, kHostObjIdProp, idv, 0)) {
+    return nullptr;
+  }
+  RootedValue abv(cx, ObjectValue(*ab));
+  if (!JS_DefineProperty(cx, wrapper, "buffer", abv, JSPROP_ENUMERATE)) {
+    return nullptr;
+  }
+  return wrapper;
+}
+
+// Minimal guest wrapper carrying just the host obj id (table/global): enough to
+// bind them as imports; JS-side element/value access is not bridged yet.
+static JSObject* HostMakeObjIdWrapper(JSContext* cx, int objId) {
+  RootedObject wrapper(cx, JS_NewPlainObject(cx));
+  if (!wrapper) {
+    return nullptr;
+  }
+  RootedValue idv(cx, Int32Value(objId));
+  if (!JS_DefineProperty(cx, wrapper, kHostObjIdProp, idv, 0)) {
+    return nullptr;
+  }
+  return wrapper;
+}
+
+// Compile `bytesObj` (a BufferSource) on the host; returns a handle or -1 (+
+// reports an error).
+static int HostCompileBytes(JSContext* cx, HandleObject bytesObj) {
+  JSObject* unwrapped = CheckedUnwrapStatic(bytesObj);
+  SharedMem<uint8_t*> dataPointer;
+  size_t byteLength;
+  bool isShared;
+  if (!unwrapped ||
+      !IsBufferSource(cx, unwrapped, /*allowShared*/ true,
+                      /*allowResizable*/ true, &dataPointer, &byteLength,
+                      &isShared)) {
+    JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr,
+                             JSMSG_WASM_BAD_BUF_MOD_ARG);
+    return -1;
+  }
+  int handle = wasmhost_compile(dataPointer.unwrap(), int(byteLength));
+  if (handle < 0) {
+    JS_ReportErrorASCII(cx, "WebAssembly host passthrough: compile failed");
+    return -1;
+  }
+  return handle;
+}
+
+// instantiate()'s first arg is either a BufferSource (-> { module, instance }) or
+// a host module object (-> instance). Bridges imports from `importObj`.
+static bool HostPassthroughInstantiate(JSContext* cx, HandleObject firstArg,
+                                       HandleObject importObj,
+                                       MutableHandleValue out) {
+  int handle = HostModuleHandle(cx, firstArg);
+  bool wasModule = handle >= 0;
+  if (!wasModule) {
+    handle = HostCompileBytes(cx, firstArg);
+    if (handle < 0) {
+      return false;
+    }
+  }
+  if (!HostBindAndInstantiate(cx, handle, importObj)) {
+    return false;
+  }
+
+  RootedObject instanceObj(cx, HostBuildInstanceObject(cx, handle));
+  if (!instanceObj) {
+    return false;
+  }
+  if (wasModule) {
+    out.setObject(*instanceObj);
+    return true;
+  }
+  RootedObject moduleObj(cx, HostMakeModuleObject(cx, handle));
+  RootedObject resultObj(cx, JS_NewPlainObject(cx));
+  if (!moduleObj || !resultObj) {
+    return false;
+  }
+  RootedValue val(cx, ObjectValue(*moduleObj));
+  if (!JS_DefineProperty(cx, resultObj, "module", val, JSPROP_ENUMERATE)) {
+    return false;
+  }
+  val.setObject(*instanceObj);
+  if (!JS_DefineProperty(cx, resultObj, "instance", val, JSPROP_ENUMERATE)) {
+    return false;
+  }
+  out.setObject(*resultObj);
+  return true;
+}
+
+// -- Streaming (compileStreaming / instantiateStreaming) --------------------
+// Resolve the Response promise, call response.arrayBuffer(), then compile (and
+// optionally instantiate) the bytes on the host. State crosses the async steps
+// in a plain closure object: { promise, importObj, instantiate }.
+static bool HostStream_OnBytes(JSContext* cx, unsigned argc, Value* vp);
+static bool HostStream_OnResponse(JSContext* cx, unsigned argc, Value* vp);
+static bool HostStream_OnReject(JSContext* cx, unsigned argc, Value* vp);
+
+static JSObject* HostStreamClosure(HandleObject callee) {
+  return &callee->as<JSFunction>().getExtendedSlot(0).toObject();
+}
+
+static bool HostStream_OnReject(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  RootedObject callee(cx, &args.callee());
+  RootedObject closure(cx, HostStreamClosure(callee));
+  RootedValue promiseVal(cx);
+  if (!JS_GetProperty(cx, closure, "promise", &promiseVal)) {
+    return false;
+  }
+  RootedObject promiseObj(cx, &promiseVal.toObject());
+  RootedValue reason(cx, args.get(0));
+  JS::RejectPromise(cx, promiseObj, reason);
+  args.rval().setUndefined();
+  return true;
+}
+
+static bool HostStream_OnResponse(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  RootedObject callee(cx, &args.callee());
+  RootedObject closure(cx, HostStreamClosure(callee));
+  RootedValue promiseVal(cx);
+  if (!JS_GetProperty(cx, closure, "promise", &promiseVal)) {
+    return false;
+  }
+  RootedObject promiseObj(cx, &promiseVal.toObject());
+
+  RootedValue resp(cx, args.get(0));
+  if (!resp.isObject()) {
+    JS::RejectPromise(cx, promiseObj, resp);
+    args.rval().setUndefined();
+    return true;
+  }
+  RootedObject respObj(cx, &resp.toObject());
+  RootedValue abPromise(cx);
+  if (!JS_CallFunctionName(cx, respObj, "arrayBuffer",
+                           JS::HandleValueArray::empty(), &abPromise)) {
+    RootedValue exn(cx, UndefinedValue());
+    if (JS_GetPendingException(cx, &exn)) {
+      JS_ClearPendingException(cx);
+    }
+    JS::RejectPromise(cx, promiseObj, exn);
+    args.rval().setUndefined();
+    return true;
+  }
+
+  RootedFunction onBytes(
+      cx, NewNativeFunction(cx, HostStream_OnBytes, 1, nullptr,
+                            gc::AllocKind::FUNCTION_EXTENDED, GenericObject));
+  RootedFunction onRej(
+      cx, NewNativeFunction(cx, HostStream_OnReject, 1, nullptr,
+                            gc::AllocKind::FUNCTION_EXTENDED, GenericObject));
+  if (!onBytes || !onRej) {
+    return false;
+  }
+  onBytes->setExtendedSlot(0, ObjectValue(*closure));
+  onRej->setExtendedSlot(0, ObjectValue(*closure));
+  RootedObject abResolve(cx, PromiseObject::unforgeableResolve(cx, abPromise));
+  if (!abResolve || !JS::AddPromiseReactions(cx, abResolve, onBytes, onRej)) {
+    return false;
+  }
+  args.rval().setUndefined();
+  return true;
+}
+
+static bool HostStream_OnBytes(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  RootedObject callee(cx, &args.callee());
+  RootedObject closure(cx, HostStreamClosure(callee));
+  RootedValue promiseVal(cx);
+  RootedValue importVal(cx);
+  RootedValue instVal(cx);
+  if (!JS_GetProperty(cx, closure, "promise", &promiseVal) ||
+      !JS_GetProperty(cx, closure, "importObj", &importVal) ||
+      !JS_GetProperty(cx, closure, "instantiate", &instVal)) {
+    return false;
+  }
+  RootedObject promiseObj(cx, &promiseVal.toObject());
+
+  RootedValue bytesVal(cx, args.get(0));
+  if (!bytesVal.isObject()) {
+    JS::RejectPromise(cx, promiseObj, bytesVal);
+    args.rval().setUndefined();
+    return true;
+  }
+  RootedObject bytesObj(cx, &bytesVal.toObject());
+
+  RootedValue result(cx);
+  bool ok;
+  if (instVal.toBoolean()) {
+    RootedObject importObj(
+        cx, importVal.isObject() ? &importVal.toObject() : nullptr);
+    ok = HostPassthroughInstantiate(cx, bytesObj, importObj, &result);
+  } else {
+    int handle = HostCompileBytes(cx, bytesObj);
+    ok = handle >= 0;
+    if (ok) {
+      RootedObject m(cx, HostMakeModuleObject(cx, handle));
+      ok = m != nullptr;
+      if (ok) {
+        result.setObject(*m);
+      }
+    }
+  }
+  if (!ok) {
+    RootedValue exn(cx, UndefinedValue());
+    if (JS_GetPendingException(cx, &exn)) {
+      JS_ClearPendingException(cx);
+    }
+    JS::RejectPromise(cx, promiseObj, exn);
+    args.rval().setUndefined();
+    return true;
+  }
+  JS::ResolvePromise(cx, promiseObj, result);
+  args.rval().setUndefined();
+  return true;
+}
+
+static bool HostStreamingInstantiate(JSContext* cx, HandleValue responsePromise,
+                                     HandleObject importObj, bool instantiate,
+                                     Handle<PromiseObject*> resultPromise) {
+  RootedObject closure(cx, JS_NewPlainObject(cx));
+  if (!closure) {
+    return false;
+  }
+  RootedValue v(cx, ObjectValue(*resultPromise));
+  if (!JS_DefineProperty(cx, closure, "promise", v, 0)) {
+    return false;
+  }
+  v = importObj ? ObjectValue(*importObj) : NullValue();
+  if (!JS_DefineProperty(cx, closure, "importObj", v, 0)) {
+    return false;
+  }
+  v.setBoolean(instantiate);
+  if (!JS_DefineProperty(cx, closure, "instantiate", v, 0)) {
+    return false;
+  }
+
+  RootedFunction onResp(
+      cx, NewNativeFunction(cx, HostStream_OnResponse, 1, nullptr,
+                            gc::AllocKind::FUNCTION_EXTENDED, GenericObject));
+  RootedFunction onRej(
+      cx, NewNativeFunction(cx, HostStream_OnReject, 1, nullptr,
+                            gc::AllocKind::FUNCTION_EXTENDED, GenericObject));
+  if (!onResp || !onRej) {
+    return false;
+  }
+  onResp->setExtendedSlot(0, ObjectValue(*closure));
+  onRej->setExtendedSlot(0, ObjectValue(*closure));
+  RootedObject resolve(cx,
+                       PromiseObject::unforgeableResolve(cx, responsePromise));
+  if (!resolve) {
+    return false;
+  }
+  return JS::AddPromiseReactions(cx, resolve, onResp, onRej);
+}
+#endif  // __EMSCRIPTEN__
+
 static bool WebAssembly_instantiate(JSContext* cx, unsigned argc, Value* vp) {
   if (!EnsurePromiseSupport(cx)) {
     return false;
@@ -5143,6 +5947,20 @@ static bool WebAssembly_instantiate(JSContext* cx, unsigned argc, Value* vp) {
                           &featureOptions)) {
     return RejectWithPendingException(cx, promise, callArgs);
   }
+
+#if defined(__EMSCRIPTEN__)
+  if (wasm::UseHostPassthrough()) {
+    RootedValue result(cx);
+    if (!HostPassthroughInstantiate(cx, firstArg, importObj, &result)) {
+      return RejectWithPendingException(cx, promise, callArgs);
+    }
+    if (!PromiseObject::resolve(cx, promise, result)) {
+      return RejectWithPendingException(cx, promise, callArgs);
+    }
+    callArgs.rval().setObject(*promise);
+    return true;
+  }
+#endif
 
   Rooted<WasmModuleObject*> moduleObj(
       cx, firstArg->maybeUnwrapIf<WasmModuleObject>());
@@ -5813,6 +6631,16 @@ static bool WebAssembly_compileStreaming(JSContext* cx, unsigned argc,
 
   Rooted<Value> responsePromise(cx, callArgs.get(0));
   Rooted<Value> featureOptions(cx, callArgs.get(1));
+#if defined(__EMSCRIPTEN__)
+  if (wasm::UseHostPassthrough()) {
+    if (!HostStreamingInstantiate(cx, responsePromise, nullptr,
+                                  /*instantiate*/ false, resultPromise)) {
+      return RejectWithPendingException(cx, resultPromise, callArgs);
+    }
+    callArgs.rval().setObject(*resultPromise);
+    return true;
+  }
+#endif
   if (!ResolveResponse(cx, responsePromise, featureOptions, resultPromise)) {
     return RejectWithPendingException(cx, resultPromise, callArgs);
   }
@@ -5862,6 +6690,16 @@ static bool WebAssembly_instantiateStreaming(JSContext* cx, unsigned argc,
   }
   Rooted<Value> responsePromise(cx, ObjectValue(*firstArg.get()));
 
+#if defined(__EMSCRIPTEN__)
+  if (wasm::UseHostPassthrough()) {
+    if (!HostStreamingInstantiate(cx, responsePromise, importObj,
+                                  /*instantiate*/ true, resultPromise)) {
+      return RejectWithPendingException(cx, resultPromise, callArgs);
+    }
+    callArgs.rval().setObject(*resultPromise);
+    return true;
+  }
+#endif
   if (!ResolveResponse(cx, responsePromise, featureOptions, resultPromise, true,
                        importObj)) {
     return RejectWithPendingException(cx, resultPromise, callArgs);

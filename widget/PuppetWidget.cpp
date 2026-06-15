@@ -510,6 +510,21 @@ bool PuppetWidget::GetEditCommands(NativeKeyBindingsType aType,
 WindowRenderer* PuppetWidget::GetWindowRenderer() {
   if (!mWindowRenderer) {
     if (XRE_IsParentProcess()) {
+#if defined(__EMSCRIPTEN__)
+      // Single-process wasm build: the windowless browser's PuppetWidget is the
+      // only top-level paint target. Create an IN-PROCESS WebRender compositor
+      // (GPU process is disabled, so CreateCompositorSession picks the in-process
+      // path) so we composite on the GPU and present directly to the page
+      // <canvas>, instead of the software fallback renderer. The in-process
+      // session provides its own CompositorBridgeChild, so the concern below
+      // (no CompositorBridgeChild) does not apply here.
+      if (ShouldUseOffMainThreadCompositing()) {
+        CreateCompositor();
+        if (mWindowRenderer) {
+          return mWindowRenderer;
+        }
+      }
+#endif
       // On the parent process there is no CompositorBridgeChild which confuses
       // some layers code, so we use basic layers instead. Note that we create
       mWindowRenderer = CreateFallbackRenderer();

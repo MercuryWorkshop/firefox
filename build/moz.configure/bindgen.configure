@@ -337,6 +337,14 @@ def basic_bindgen_cflags(
     if target.os == "Android":
         args += android_cflags
 
+    if target.os == "EMSCRIPTEN":
+        # bindgen uses libclang directly; without an explicit target it parses
+        # with the host triple, so __EMSCRIPTEN__/__wasm__ aren't defined and
+        # headers take the wrong (non-wasm) branches, silently dropping extern
+        # "C" declarations. Force the wasm/emscripten target so the parse
+        # matches the emscripten sysroot.
+        args += ["--target=wasm32-unknown-emscripten", "-fvisibility=default"]
+
     args += {
         "WINNT": [
             "-DWIN32=1",

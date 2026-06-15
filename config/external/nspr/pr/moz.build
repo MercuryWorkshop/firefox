@@ -75,6 +75,14 @@ elif CONFIG["OS_TARGET"] == "SunOS":
         # macros (ENTRY/SET_SIZE); without preprocessing it won't build.
         ASFLAGS += ["-x", "assembler-with-cpp"]
         SOURCES += ["/nsprpub/pr/src/md/unix/os_SunOS_sparcv9.s"]
+elif CONFIG["OS_TARGET"] == "EMSCRIPTEN":
+    # emscripten presents a Linux-like POSIX environment. Single-threaded wasm,
+    # so no thread-context-switch assembly; use the generic unix md source.
+    DEFINES["LINUX"] = True
+    DEFINES["HAVE_FCNTL_FILE_LOCKING"] = True
+    DEFINES["HAVE_POINTER_LOCALTIME_R"] = True
+    DEFINES["_GNU_SOURCE"] = True
+    SOURCES += ["/nsprpub/pr/src/md/unix/linux.c"]
 elif CONFIG["OS_TARGET"] == "WINNT":
     OS_LIBS += [
         "advapi32",

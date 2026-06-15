@@ -126,8 +126,20 @@ struct DispatchGuardInner {
 
 impl DispatchGuard {
     pub fn launch(&self, task: impl FnOnce() + Send + 'static) -> Result<(), DispatchError> {
-        let task = Command::Task(Box::new(task));
-        self.send(task)
+        // emscripten: single-threaded Rust std can't spawn the dispatcher worker
+        // thread. We can't run tasks inline either -- preinit tasks call
+        // with_glean() which would panic before the global Glean is initialized.
+        // Telemetry isn't used in this embedding, so drop tasks unrun.
+        #[cfg(target_os = "emscripten")]
+        {
+            let _ = task;
+            Ok(())
+        }
+        #[cfg(not(target_os = "emscripten"))]
+        {
+            let task = Command::Task(Box::new(task));
+            self.send(task)
+        }
     }
 
     pub fn shutdown(&mut self) -> Result<(), DispatchError> {
@@ -156,27 +168,44 @@ impl DispatchGuard {
     }
 
     fn block_on_queue(&self) {
-        let (tx, rx) = crossbeam_channel::bounded(0);
+        // emscripten: tasks run synchronously in launch(), so the queue is always
+        // empty here and there is no worker thread to wait on.
+        #[cfg(target_os = "emscripten")]
+        {
+            return;
+        }
+        #[cfg(not(target_os = "emscripten"))]
+        {
+            let (tx, rx) = crossbeam_channel::bounded(0);
 
-        // We explicitly don't use `self.launch` here.
-        // We always put this task on the unbounded queue.
-        // The pre-init queue might be full before its flushed, in which case this would panic.
-        // Blocking on the queue can only work if it is eventually flushed anyway.
+            // We explicitly don't use `self.launch` here.
+            // We always put this task on the unbounded queue.
+            // The pre-init queue might be full before its flushed, in which case this would panic.
+            // Blocking on the queue can only work if it is eventually flushed anyway.
 
-        let task = Command::Task(Box::new(move || {
-            tx.send(())
-                .expect("(worker) Can't send message on single-use channel");
-        }));
-        self.sender
-            .send(task)
-            .expect("Failed to launch the blocking task");
+            let task = Command::Task(Box::new(move || {
+                tx.send(())
+                    .expect("(worker) Can't send message on single-use channel");
+            }));
+            self.sender
+                .send(task)
+                .expect("Failed to launch the blocking task");
 
-        rx.recv()
-            .expect("Failed to receive message on single-use channel");
+            rx.recv()
+                .expect("Failed to receive message on single-use channel");
+        }
     }
 
     /// Block on the task queue emptying, with a timeout.
     fn block_on_queue_timeout(&self, timeout: Duration) -> Result<(), RecvTimeoutError> {
+        // emscripten: synchronous dispatch, queue is always empty (see launch()).
+        #[cfg(target_os = "emscripten")]
+        {
+            let _ = timeout;
+            return Ok(());
+        }
+        #[cfg(not(target_os = "emscripten"))]
+        {
         let (tx, rx) = crossbeam_channel::bounded(0);
 
         // We explicitly don't use `self.launch` here.
@@ -195,6 +224,7 @@ impl DispatchGuard {
             .expect("Failed to launch the blocking task");
 
         rx.recv_timeout(timeout)
+        }
     }
 
     fn kill(&mut self) -> Result<(), DispatchError> {
@@ -222,20 +252,25 @@ impl DispatchGuard {
             return Err(DispatchError::AlreadyFlushed);
         }
 
-        // Unblock the worker thread exactly once.
-        self.block_sender.send(Blocked::Continue)?;
+        // emscripten: there is no worker thread (tasks ran synchronously in
+        // launch()), so skip the unblock/swap handshake that would deadlock.
+        #[cfg(not(target_os = "emscripten"))]
+        {
+            // Unblock the worker thread exactly once.
+            self.block_sender.send(Blocked::Continue)?;
 
-        // Single-use channel to communicate with the worker thread.
-        let (swap_sender, swap_receiver) = bounded(0);
+            // Single-use channel to communicate with the worker thread.
+            let (swap_sender, swap_receiver) = bounded(0);
 
-        // Send final command and block until it is sent.
-        self.preinit_sender
-            .send(Command::Swap(swap_sender))
-            .map_err(|_| DispatchError::SendError)?;
+            // Send final command and block until it is sent.
+            self.preinit_sender
+                .send(Command::Swap(swap_sender))
+                .map_err(|_| DispatchError::SendError)?;
 
-        // Now wait for the worker thread to do the swap and inform us.
-        // This blocks until all tasks in the preinit buffer have been processed.
-        swap_receiver.recv()?;
+            // Now wait for the worker thread to do the swap and inform us.
+            // This blocks until all tasks in the preinit buffer have been processed.
+            swap_receiver.recv()?;
+        }
 
         // We're not queueing anymore.
         global::QUEUE_TASKS.store(false, Ordering::SeqCst);
@@ -278,7 +313,17 @@ impl Dispatcher {
         let queue_preinit = AtomicBool::new(true);
         let overflow_count = AtomicUsize::new(0);
 
-        let worker = crate::thread::spawn("glean.dispatcher", move || {
+        // emscripten: single-threaded Rust std can't spawn this worker (it aborts
+        // with "current thread handle already set"); tasks run synchronously in
+        // launch() instead, so skip the worker thread entirely.
+        #[cfg(target_os = "emscripten")]
+        let worker = {
+            drop((block_receiver, preinit_receiver, unbounded_receiver));
+            None
+        };
+
+        #[cfg(not(target_os = "emscripten"))]
+        let worker = Some(crate::thread::spawn("glean.dispatcher", move || {
             match block_receiver.recv() {
                 Err(_) => {
                     // The other side was disconnected.
@@ -333,7 +378,7 @@ impl Dispatcher {
                 }
             }
         })
-        .expect("Failed to spawn Glean's dispatcher thread");
+        .expect("Failed to spawn Glean's dispatcher thread"));
 
         let inner = Arc::new(DispatchGuardInner {
             queue_preinit,
@@ -347,7 +392,7 @@ impl Dispatcher {
 
         Dispatcher {
             guard,
-            worker: Some(worker),
+            worker,
         }
     }
 

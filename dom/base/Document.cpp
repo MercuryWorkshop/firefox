@@ -3455,13 +3455,17 @@ static void CheckIsBadPolicy(nsILoadInfo::CrossOriginOpenerPolicy aPolicy,
                                                          contentType)) &&
                  contentType.EqualsLiteral(APPLICATION_PDF);
 
-  MOZ_DIAGNOSTIC_ASSERT(!isViewSource,
-                        "Bug 1834864: Assert due to view-source.");
-  MOZ_DIAGNOSTIC_ASSERT(!isPDFJS, "Bug 1834864: Assert due to  pdfjs.");
-  MOZ_DIAGNOSTIC_ASSERT(aPolicy == requireCORP,
-                        "Assert due to clearing REQUIRE_CORP.");
-  MOZ_DIAGNOSTIC_ASSERT(aContext->GetOpenerPolicy() == requireCORP,
-                        "Assert due to setting REQUIRE_CORP.");
+  // These were MOZ_DIAGNOSTIC_ASSERT (fatal in EARLY_BETA_OR_EARLIER builds), but
+  // a real COOP+COEP (require-corp) load into a fresh windowless browser is a
+  // legitimate UNSAFE_NONE -> require-corp transition here and must not crash the
+  // engine. Keep them as non-fatal warnings (release Firefox compiles these out).
+  NS_WARNING_ASSERTION(!isViewSource,
+                       "Bug 1834864: warn due to view-source.");
+  NS_WARNING_ASSERTION(!isPDFJS, "Bug 1834864: warn due to pdfjs.");
+  NS_WARNING_ASSERTION(aPolicy == requireCORP,
+                       "warn due to clearing REQUIRE_CORP.");
+  NS_WARNING_ASSERTION(aContext->GetOpenerPolicy() == requireCORP,
+                       "warn due to setting REQUIRE_CORP.");
 #endif  // defined(EARLY_BETA_OR_EARLIER)
 }
 

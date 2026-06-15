@@ -14,7 +14,7 @@ namespace gl {
 
 class GLContext;
 
-enum class GLContextType { Unknown, WGL, CGL, GLX, EGL, EAGL };
+enum class GLContextType { Unknown, WGL, CGL, GLX, EGL, EAGL, Emscripten };
 
 enum class OriginPos : uint8_t { TopLeft, BottomLeft };
 

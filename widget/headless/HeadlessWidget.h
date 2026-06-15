@@ -85,6 +85,10 @@ class HeadlessWidget final : public nsIWidget {
 
   WindowRenderer* GetWindowRenderer() override;
 
+#if defined(__EMSCRIPTEN__)
+  bool ShouldUseOffMainThreadCompositing() override;
+#endif
+
   void SetCompositorWidgetDelegate(CompositorWidgetDelegate* delegate) override;
 
   [[nodiscard]] nsresult AttachNativeKeyEvent(

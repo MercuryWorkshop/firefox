@@ -100,7 +100,7 @@
 #include "nsSocketTransportService2.h"
 #include "nsViewSourceHandler.h"
 #include "nsJARURI.h"
-#ifndef XP_IOS
+#if !defined(XP_IOS) && !defined(MOZ_WIDGET_HEADLESS)
 #  include "nsIconURI.h"
 #endif
 #include "nsAboutProtocolHandler.h"
@@ -2030,7 +2030,7 @@ nsresult NS_NewURI(nsIURI** aURI, const nsACString& aSpec,
         .Finalize(aURI);
   }
 
-#ifndef XP_IOS
+#if !defined(XP_IOS) && !defined(MOZ_WIDGET_HEADLESS)
   if (scheme.EqualsLiteral("moz-icon")) {
     return NS_MutateURI(new nsMozIconURI::Mutator())
         .SetSpec(aSpec)

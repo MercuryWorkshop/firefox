@@ -6,5 +6,9 @@ with Files("**"):
     BUG_COMPONENT = ("Core", "XPConnect")
 
 DIRS += ["public", "idl", "wrappers", "loader", "src"]
-DIRS += ["shell"]
+# js/xpconnect/shell builds xpcshell (a JS dev/test shell); not needed for the
+# engine, and under wasm it fails to link against libxul.so (benign duplicate
+# symbols vs libpure_virtual.a / NSPR).
+if CONFIG["OS_TARGET"] != "EMSCRIPTEN":
+    DIRS += ["shell"]
 TEST_DIRS += ["tests"]

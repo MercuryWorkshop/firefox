@@ -2397,6 +2397,8 @@ Maybe<std::string> WebGLContext::GetString(const GLenum pname) const {
           return Some("egl"_ns);
         case gl::GLContextType::EAGL:
           return Some("eagl"_ns);
+        case gl::GLContextType::Emscripten:
+          return Some("emscripten"_ns);
       }
       return Some("unknown"_ns);
     }

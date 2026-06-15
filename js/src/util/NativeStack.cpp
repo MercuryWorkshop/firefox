@@ -10,6 +10,8 @@
 #  include "util/WindowsWrapper.h"
 #elif defined(__wasi__)
 // Nothing
+#elif defined(__EMSCRIPTEN__)
+#  include <emscripten/stack.h>
 #elif defined(XP_DARWIN) || defined(DARWIN) || defined(XP_UNIX)
 #  include <pthread.h>
 #  if defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__DragonFly__)
@@ -123,6 +125,16 @@ static void* const NativeStackBase = __builtin_frame_address(0);
 void* js::GetNativeStackBaseImpl() {
   MOZ_ASSERT(JS_STACK_GROWTH_DIRECTION < 0);
   return NativeStackBase;
+}
+
+#elif defined(__EMSCRIPTEN__)
+
+// emscripten lays out the C stack growing down from a fixed base, exposed via
+// emscripten_stack_get_base(). The single-threaded build has no pthreads, so
+// the pthread-based discovery below cannot be used.
+void* js::GetNativeStackBaseImpl() {
+  static_assert(JS_STACK_GROWTH_DIRECTION < 0);
+  return reinterpret_cast<void*>(emscripten_stack_get_base());
 }
 
 #else  // __wasi__

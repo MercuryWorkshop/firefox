@@ -2,6 +2,14 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
+if CONFIG["OS_ARCH"] == "EMSCRIPTEN":
+    # wasm has no register-based xptcall ABI; these are trapping/logging stubs
+    # (see the .cpp files). Real impl deferred until proven necessary.
+    SOURCES += [
+        "xptcinvoke_wasm.cpp",
+        "xptcstubs_wasm.cpp",
+    ]
+
 if CONFIG["OS_ARCH"] == "Darwin":
     SOURCES += [
         "xptcinvoke_darwin.cpp",

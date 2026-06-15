@@ -9792,6 +9792,11 @@ static void GetSpoofedSystemFontForRFP(LookAndFeel::FontID aFontID,
   // UI font-size.
   aName = u"sans-serif"_ns;
   aStyle.size = 15;
+#elif defined(MOZ_WIDGET_HEADLESS)
+  // Headless (e.g. the wasm engine build) has no native system UI font; use a
+  // generic sans-serif, matching the Linux fallback.
+  aName = u"sans-serif"_ns;
+  aStyle.size = 15;
 #else
 #  error "Unknown platform"
 #endif

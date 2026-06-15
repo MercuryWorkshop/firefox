@@ -41,7 +41,9 @@ cargo_crate_type_flag := $(if $(findstring megazord,$(RUST_LIBRARY_FILE)),--crat
 # within a tree, the Rust dependencies have been vendored in so Cargo won't
 # touch the lock file.
 ifndef JS_STANDALONE
-cargo_build_flags += --frozen
+# Was --frozen; relaxed to --offline so wasm-target dependency/feature edits can
+# update Cargo.lock from the vendored sources (no network).
+cargo_build_flags += --offline
 endif
 
 cargo_build_flags += --manifest-path $(CARGO_FILE)
@@ -76,6 +78,25 @@ cargo_build_flags += $(filter -j1,$(MAKEFLAGS))
 ifdef MOZ_TSAN
 cargo_build_flags += -Zbuild-std=std,panic_abort
 RUSTFLAGS += -Zsanitizer=thread
+endif
+
+# Emscripten + threads NOTE: the prebuilt wasm32-unknown-emscripten std is
+# single-threaded (no atomics) -> its thread-locals/atomics are shared statics,
+# which is unsafe under our -pthread (shared memory) build (data races + the std
+# "current thread handle already set during thread spawn" abort when a Rust
+# thread spawns). The correct fix is build-std with +atomics, BUT that requires
+# vendoring std's own deps at exact versions (cfg-if 1.0.4, libc 0.2.178,
+# hashbrown 0.16.1, compiler_builtins, unwinding, ... ~13 crates) which differ
+# from gecko's vendored versions -> a separate vendoring effort. For now we keep
+# the single-threaded std and avoid spawning Rust threads at runtime (sequential
+# stylo via layout.css.stylo-threads=1). Re-enable when std deps are vendored:
+#   cargo_build_flags += -Zbuild-std=std,panic_abort
+#   export RUSTC_BOOTSTRAP := 1
+#   RUSTFLAGS += -Ctarget-feature=+atomics,+bulk-memory,+mutable-globals
+ifneq (,$(findstring emscripten,$(RUST_TARGET)))
+cargo_build_flags += -Zbuild-std=std,panic_abort
+export RUSTC_BOOTSTRAP := 1
+RUSTFLAGS += -Ctarget-feature=+atomics,+bulk-memory,+mutable-globals
 endif
 
 rustflags_sancov =

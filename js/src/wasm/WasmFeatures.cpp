@@ -274,7 +274,18 @@ bool wasm::HasPlatformSupport() {
   return BaselinePlatformSupport() || IonPlatformSupport();
 }
 
+#if defined(__EMSCRIPTEN__)
+bool wasm::UseHostPassthrough() { return true; }
+#endif
+
 bool wasm::HasSupport(JSContext* cx) {
+#if defined(__EMSCRIPTEN__)
+  // No in-process wasm compiler on wasm32-emscripten; WebAssembly is routed to
+  // the host engine, so it is available regardless of platform/compiler support.
+  if (UseHostPassthrough()) {
+    return true;
+  }
+#endif
   // If the general wasm pref is on, it's on for everything.
   bool prefEnabled = cx->options().wasm();
   // If the general pref is off, check trusted principals.

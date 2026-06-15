@@ -7470,7 +7470,11 @@ void profiler_register_page(uint64_t aTabID, uint64_t aInnerWindowID,
             aTabID, aInnerWindowID, aUrl.get(), aEmbedderInnerWindowID,
             aIsPrivateBrowsing ? "true" : "false");
 
-  MOZ_RELEASE_ASSERT(CorePS::Exists());
+  // If the profiler was never initialized (e.g. a minimal embedding that skips
+  // XRE startup), there's nothing to register. Matches profiler_unregister_page.
+  if (!CorePS::Exists()) {
+    return;
+  }
 
   PSAutoLock lock;
 
@@ -7839,7 +7843,9 @@ double profiler_time() {
 
 bool profiler_capture_backtrace_into(ProfileChunkedBuffer& aChunkedBuffer,
                                      StackCaptureOptions aCaptureOptions) {
-  MOZ_RELEASE_ASSERT(CorePS::Exists());
+  if (!CorePS::Exists()) {
+    return false;
+  }
 
   if (!profiler_is_active() ||
       aCaptureOptions == StackCaptureOptions::NoStack ||
@@ -7915,7 +7921,11 @@ bool profiler_backtrace_into_buffer(ProfileChunkedBuffer& aChunkedBuffer,
 }
 
 UniquePtr<ProfileChunkedBuffer> profiler_capture_backtrace() {
-  MOZ_RELEASE_ASSERT(CorePS::Exists());
+  // Profiler may be uninitialized in a minimal embedding (no XRE startup); a
+  // backtrace is optional, so just return none.
+  if (!CorePS::Exists()) {
+    return nullptr;
+  }
   AUTO_PROFILER_LABEL_HOT("profiler_capture_backtrace", PROFILER);
 
   // Quick is-active and feature check before allocating a buffer.
@@ -8003,7 +8013,13 @@ void profiler_set_js_context(CycleCollectedJSContext* aCx) {
 }
 
 void profiler_clear_js_context() {
-  MOZ_RELEASE_ASSERT(CorePS::Exists());
+  // This embedding tears down worker JS contexts in states the profiler's
+  // per-thread bookkeeping doesn't expect (the profiler is non-essential here).
+  // Bail if the profiler core isn't live rather than crashing the shared wasm
+  // instance on the worker thread.
+  if (!CorePS::Exists()) {
+    return;
+  }
 
   ThreadRegistration::WithOnThreadRef(
       [](ThreadRegistration::OnThreadRef aOnThreadRef) {

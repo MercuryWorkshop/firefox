@@ -422,6 +422,11 @@
 #elif defined(__GNUC__) && !defined(__clang__)
 // GCC doesn't support constinit aggregate initialization of absl::Cord.
 #define PROTOBUF_CONSTINIT
+#elif defined(__EMSCRIPTEN__)
+// emscripten's libc++ std::string default ctor is not constant-initializable
+// (it takes a heap-allocating path), so `constinit GlobalEmptyString{}` fails.
+// Suppress constinit; a normal global constructor is used instead.
+#define PROTOBUF_CONSTINIT
 #elif defined(__cpp_constinit)
 #define PROTOBUF_CONSTINIT constinit
 #define PROTOBUF_CONSTINIT_DEFAULT_INSTANCES

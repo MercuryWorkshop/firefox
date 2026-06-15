@@ -33,7 +33,7 @@
 #  include "UnscaledFontFreeType.h"
 #endif
 
-#ifdef MOZ_WIDGET_ANDROID
+#if defined(MOZ_WIDGET_ANDROID) || defined(MOZ_WIDGET_HEADLESS)
 #  include "ScaledFontFreeType.h"
 #  include "NativeFontResourceFreeType.h"
 #  include "UnscaledFontFreeType.h"
@@ -421,7 +421,7 @@ already_AddRefed<NativeFontResource> Factory::CreateNativeFontResource(
     case FontType::FONTCONFIG:
       return NativeFontResourceFontconfig::Create(
           aData, aSize, static_cast<FT_Library>(aFontContext));
-#elif defined(MOZ_WIDGET_ANDROID)
+#elif defined(MOZ_WIDGET_ANDROID) || defined(MOZ_WIDGET_HEADLESS)
     case FontType::FREETYPE:
       return NativeFontResourceFreeType::Create(
           aData, aSize, static_cast<FT_Library>(aFontContext));
@@ -452,7 +452,7 @@ already_AddRefed<UnscaledFont> Factory::CreateUnscaledFontFromFontDescriptor(
     case FontType::FONTCONFIG:
       return UnscaledFontFontconfig::CreateFromFontDescriptor(
           aData, aDataLength, aIndex);
-#elif defined(MOZ_WIDGET_ANDROID)
+#elif defined(MOZ_WIDGET_ANDROID) || defined(MOZ_WIDGET_HEADLESS)
     case FontType::FREETYPE:
       return UnscaledFontFreeType::CreateFromFontDescriptor(aData, aDataLength,
                                                             aIndex);
@@ -482,7 +482,7 @@ already_AddRefed<ScaledFont> Factory::CreateScaledFontForFontconfigFont(
 }
 #endif
 
-#ifdef MOZ_WIDGET_ANDROID
+#if defined(MOZ_WIDGET_ANDROID) || defined(MOZ_WIDGET_HEADLESS)
 already_AddRefed<ScaledFont> Factory::CreateScaledFontForFreeTypeFont(
     const RefPtr<UnscaledFont>& aUnscaledFont, Float aSize,
     RefPtr<SharedFTFace> aFace, bool aApplySyntheticBold) {

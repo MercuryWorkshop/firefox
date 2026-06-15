@@ -122,6 +122,15 @@ if (AppConstants.HAVE_SHELL_SERVICE) {
     { id: "browser.shell.checkDefaultBrowser", type: "bool" },
     { id: "pref.general.disable_button.default_browser", type: "bool" },
   ]);
+} else {
+  // Without a shell service the default-browser UI is hidden (via
+  // DefaultBrowserHelper.canCheck), but the "alwaysCheckDefault" Setting below is
+  // registered unconditionally and references this pref; register it so addSetting
+  // doesn't throw PreferenceNotAddedError, which would abort this script and leave
+  // gMainPane undefined (so the General pane never builds).
+  Preferences.addAll([
+    { id: "browser.shell.checkDefaultBrowser", type: "bool" },
+  ]);
 }
 
 Preferences.addSetting({

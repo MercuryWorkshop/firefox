@@ -125,6 +125,15 @@ if CONFIG["TARGET_KERNEL"] == "Linux":
         DEFINES["ANDROID"] = True
         DEFINES["_POSIX_MONOTONIC_CLOCK"] = 0
 
+# emscripten's TARGET_KERNEL matches none of the above, so no time_*.cc gets
+# built and base::Time/TimeTicks::Now are undefined. time_posix.cc uses
+# gettimeofday + clock_gettime(CLOCK_MONOTONIC) (the mach path is XP_DARWIN-only),
+# both available under emscripten.
+if CONFIG["OS_TARGET"] == "EMSCRIPTEN":
+    SOURCES += [
+        "src/base/time_posix.cc",
+    ]
+
 if CONFIG["TARGET_KERNEL"] == "SunOS":
     SOURCES += [
         "src/base/process_util_linux.cc",

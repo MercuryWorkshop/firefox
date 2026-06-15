@@ -1008,10 +1008,14 @@ CookiePersistentStorage::OpenDBResult CookiePersistentStorage::TryInitDB(
     NS_ENSURE_SUCCESS(rv, RESULT_FAILURE);
   }
 
+  printf("### TID: enter, mStorageService=%p\n", (void*)mStorageService.get()); fflush(stdout);
   // This block provides scope for the Telemetry AutoTimer
   {
+    printf("### TID: before glean Measure\n"); fflush(stdout);
     auto timer = glean::network_cookies::sqlite_open_readahead.Measure();
+    printf("### TID: before ReadAheadFile\n"); fflush(stdout);
     ReadAheadFile(mCookieFile);
+    printf("### TID: before OpenUnsharedDatabase\n"); fflush(stdout);
 
     // open a connection to the cookie database, and only cache our connection
     // and statements upon success. The connection is opened unshared to
@@ -1019,6 +1023,7 @@ CookiePersistentStorage::OpenDBResult CookiePersistentStorage::TryInitDB(
     rv = mStorageService->OpenUnsharedDatabase(
         mCookieFile, mozIStorageService::CONNECTION_DEFAULT,
         getter_AddRefs(mSyncConn));
+    printf("### TID: OpenUnsharedDatabase rv=0x%08x\n", (unsigned)rv); fflush(stdout);
     if (NS_FAILED(rv)) {
       const char* errorName = mozilla::GetStaticErrorName(rv);
       glean::network_cookies::open_error

@@ -7693,7 +7693,7 @@
   value: false
   mirror: always
 
-#if defined(MOZ_WIDGET_GTK) || defined(MOZ_WIDGET_ANDROID)
+#if defined(MOZ_WIDGET_GTK) || defined(MOZ_WIDGET_ANDROID) || defined(MOZ_WIDGET_HEADLESS)
   # -1 = disabled (no preblend, original behavior)
   #  0 = sRGB transfer
   # >0 = value/100.0 exponent

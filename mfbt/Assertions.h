@@ -282,6 +282,12 @@ static inline void MOZ_CrashSequence(void* aAddress, intptr_t aLine) {
       "st.d %1,%0,0;\n"  // Write the line number to the crashing address
       :                  // no output registers
       : "r"(aAddress), "r"(aLine));
+#  elif defined(__wasm__)
+  // wasm has no trapping store to a fixed address; address 0 is valid linear
+  // memory. Emit the `unreachable` opcode, which traps the module cleanly.
+  (void)aAddress;
+  (void)aLine;
+  __builtin_trap();
 #  else
 #    warning \
         "Unsupported architecture, replace the code below with assembly suitable to crash the process"

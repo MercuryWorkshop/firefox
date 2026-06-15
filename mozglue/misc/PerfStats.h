@@ -219,12 +219,26 @@ class PerfStats {
         TimeStamp::Now();
   }
 
+  // std::atomic<double>::fetch_add is a C++20 feature missing from the libc++
+  // shipped with emscripten 3.1.56; fall back to a portable CAS loop there.
+  static void AtomicAddDouble(std::atomic<double>& aTarget, double aValue) {
+#ifdef __EMSCRIPTEN__
+    double expected = aTarget.load(std::memory_order_relaxed);
+    while (!aTarget.compare_exchange_weak(expected, expected + aValue,
+                                          std::memory_order_relaxed,
+                                          std::memory_order_relaxed)) {
+    }
+#else
+    aTarget.fetch_add(aValue, std::memory_order_relaxed);
+#endif
+  }
+
   static void RecordMeasurementEndInternal(Metric aMetric) {
     PerfStats* singleton = GetSingleton();
     auto idx = static_cast<MetricMask>(aMetric);
-    singleton->mRecordedTimes[idx].fetch_add(
-        (TimeStamp::Now() - singleton->mRecordedStarts[idx]).ToMilliseconds(),
-        std::memory_order_relaxed);
+    AtomicAddDouble(
+        singleton->mRecordedTimes[idx],
+        (TimeStamp::Now() - singleton->mRecordedStarts[idx]).ToMilliseconds());
     ++singleton->mRecordedCounts[idx];
   }
 
@@ -232,8 +246,7 @@ class PerfStats {
                                         TimeDuration aDuration) {
     PerfStats* singleton = GetSingleton();
     auto idx = static_cast<MetricMask>(aMetric);
-    singleton->mRecordedTimes[idx].fetch_add(aDuration.ToMilliseconds(),
-                                             std::memory_order_relaxed);
+    AtomicAddDouble(singleton->mRecordedTimes[idx], aDuration.ToMilliseconds());
     ++singleton->mRecordedCounts[idx];
   }
 
@@ -241,8 +254,7 @@ class PerfStats {
                                                MetricCounter aIncrementAmount) {
     PerfStats* singleton = GetSingleton();
     auto idx = static_cast<MetricMask>(aMetric);
-    singleton->mRecordedTimes[idx].fetch_add(double(aIncrementAmount),
-                                             std::memory_order_relaxed);
+    AtomicAddDouble(singleton->mRecordedTimes[idx], double(aIncrementAmount));
     ++singleton->mRecordedCounts[idx];
   }
 

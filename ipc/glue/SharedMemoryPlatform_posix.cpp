@@ -37,7 +37,36 @@
 #include "prenv.h"
 #include "nsXULAppAPI.h"  // for XRE_IsParentProcess
 
+#if defined(__EMSCRIPTEN__)
+#  include "mozilla/StaticMutex.h"
+#  include <map>
+#  include <stdlib.h>
+#  include <string.h>
+#endif
+
 namespace mozilla::ipc::shared_memory {
+
+#if defined(__EMSCRIPTEN__)
+// emscripten has broken primitives for IPC shared memory:
+//   - mmap(fd, MAP_SHARED) does NOT map the object; it returns private zero-filled
+//     memory, so writes via one mapping are invisible to another.
+//   - fstat() fails on the shm/memfd fd, so we can't key by inode.
+// But read()/write()/pread()/pwrite() DO work on these fds (the FS is centralized
+// and the shm file is real, shared MEMFS storage), and the wasm heap is shared
+// across all pthreads via SharedArrayBuffer. So we make the shared object's DATA
+// live in a single heap buffer, and store that buffer's pointer in an 8-byte
+// HEADER at the start of the shm file. The data region itself lives only in the
+// heap buffer (the file's bytes are otherwise unused). The first Map of an object
+// allocates the buffer and writes its pointer into the file header; every other
+// Map (any fd, any pthread) reads the pointer back from the file and returns the
+// SAME buffer -> genuine live sharing, correct regardless of unmap ordering.
+struct EmShmHeader {
+  uint32_t magic;
+  uint32_t ptr;  // wasm32 pointer to the shared heap buffer
+};
+static constexpr uint32_t kEmShmMagic = 0x4d4f5a53;  // "MOZS"
+static StaticMutex sEmShmLock;
+#endif
 
 // memfd_create is a nonstandard interface for creating anonymous
 // shared memory accessible as a file descriptor but not tied to any
@@ -414,6 +443,34 @@ bool Platform::Freeze(FreezableHandle& aHandle) {
 
 Maybe<void*> Platform::Map(const HandleBase& aHandle, uint64_t aOffset,
                            size_t aSize, void* aFixedAddress, bool aReadOnly) {
+#if defined(__EMSCRIPTEN__)
+  // See the note at EmShmHeader: the shared object's data lives in one heap buffer
+  // whose pointer is stored in an 8-byte header at the start of the shm file.
+  int fd = aHandle.mHandle.get();
+  StaticMutexAutoLock lock(sEmShmLock);
+  EmShmHeader hdr = {0, 0};
+  ssize_t hgot = pread(fd, &hdr, sizeof(hdr), 0);
+  void* base = nullptr;
+  if (hgot == (ssize_t)sizeof(hdr) && hdr.magic == kEmShmMagic && hdr.ptr) {
+    base = reinterpret_cast<void*>(static_cast<uintptr_t>(hdr.ptr));
+  } else {
+    uint64_t total = aHandle.Size();
+    if (total < aOffset + aSize) {
+      total = aOffset + aSize;
+    }
+    base = calloc(1, total ? total : 1);
+    if (!base) {
+      return Nothing();
+    }
+    hdr.magic = kEmShmMagic;
+    hdr.ptr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(base));
+    if (pwrite(fd, &hdr, sizeof(hdr), 0) != (ssize_t)sizeof(hdr)) {
+      free(base);
+      return Nothing();
+    }
+  }
+  return Some(static_cast<void*>(static_cast<uint8_t*>(base) + aOffset));
+#else
   // Don't use MAP_FIXED when a fixed_address was specified, since that can
   // replace pages that are alread mapped at that address.
   void* mem =
@@ -433,9 +490,20 @@ Maybe<void*> Platform::Map(const HandleBase& aHandle, uint64_t aOffset,
   }
 
   return Some(mem);
+#endif
 }
 
-void Platform::Unmap(void* aMemory, size_t aSize) { munmap(aMemory, aSize); }
+void Platform::Unmap(void* aMemory, size_t aSize) {
+#if defined(__EMSCRIPTEN__)
+  // The data buffer is shared live across all mappings of the object (its pointer
+  // lives in the shm file header), so a single Unmap must not free it. Leave it
+  // alive for the object's lifetime. (Minor leak; WebRender recycles shmem.)
+  (void)aMemory;
+  (void)aSize;
+#else
+  munmap(aMemory, aSize);
+#endif
+}
 
 bool Platform::Protect(char* aAddr, size_t aSize, Access aAccess) {
   int flags = PROT_NONE;
@@ -446,6 +514,16 @@ bool Platform::Protect(char* aAddr, size_t aSize, Access aAccess) {
 }
 
 void* Platform::FindFreeAddressSpace(size_t aSize) {
+#if defined(__EMSCRIPTEN__)
+  // emscripten's mmap(PROT_NONE, MAP_ANONYMOUS) does NOT cheaply reserve address
+  // space like a real OS -- it allocates and zero-fills the whole region (here
+  // 2*512MiB = 1GiB for the UA sheet cache), a multi-hundred-ms memset plus a huge
+  // transient heap spike, every startup. This address is only a placement HINT for
+  // a subsequent Map(), and our single-process Platform::Map ignores fixed
+  // addresses anyway (heap-buffer-backed). Return null so the caller maps at any
+  // address with no wasted allocation.
+  return nullptr;
+#endif
 #ifndef __FreeBSD__
   constexpr int flags = MAP_ANONYMOUS | MAP_NORESERVE | MAP_PRIVATE;
 #else

@@ -15,6 +15,11 @@ mozilla-central-workspace-hack = { version = "0.1", features = ["gkrust"], optio
 mozglue-static = { path = "../../../mozglue/static/rust" }
 swgl = { path = "../../../gfx/wr/swgl" }
 
+# On single-threaded wasm, uniffi futures aren't Send; enable uniffi_core's
+# single-threaded mode (cargo unifies this feature across the graph).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+uniffi_core = { path = "../../../third_party/rust/uniffi_core", features = ["wasm-unstable-single-threaded"] }
+
 [dev-dependencies]
 stylo_tests = { path = "../../../servo/ports/geckolib/tests/" }
 

@@ -138,6 +138,11 @@ SOURCES += [
     "GLScreenBuffer.cpp",
 ]
 
+if CONFIG["OS_TARGET"] == "EMSCRIPTEN":
+    SOURCES += [
+        "GLContextProviderEmscripten.cpp",
+    ]
+
 TEST_DIRS += [
     "gtest",
 ]

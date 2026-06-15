@@ -1716,6 +1716,17 @@ static already_AddRefed<gl::GLContext> CreateGLContext(nsACString& aError) {
   }
 #elif XP_DARWIN
   gl = CreateGLContextCGL();
+#elif defined(__EMSCRIPTEN__)
+  // wasm/emscripten: GLContextProviderEmscripten creates a WebGL2 context backed
+  // by the page <canvas> (proxied to the main browser thread). Used by both the
+  // hardware-WebRender path and CompositorOGL/SWGL-over-GL.
+  gl = gl::GLContextProvider::CreateForCompositorWidget(
+      nullptr, /* aHardwareWebRender */ !gfx::gfxVars::UseSoftwareWebRender(),
+      /* aForceAccelerated */ true);
+  if (gl && !gl->MakeCurrent()) {
+    gfxCriticalNote << "Failed to make emscripten WebGL context current";
+    gl = nullptr;
+  }
 #endif
 
   wr::RenderThread::MaybeEnableGLDebugMessage(gl);

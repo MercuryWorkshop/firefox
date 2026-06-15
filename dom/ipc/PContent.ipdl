@@ -202,9 +202,9 @@ namespace dom {
 // SetXPCOMProcessAttributes passes an array of font data to the child,
 // but each platform needs different details so we have platform-specific
 // versions of the SystemFontListEntry type:
-#if defined(ANDROID)
-// Used on Android to pass the list of fonts on the device
-// to the child process
+#if defined(ANDROID) || defined(MOZ_WIDGET_HEADLESS)
+// Used on Android (and the headless FreeType font backend) to pass the list of
+// fonts on the device to the child process
 struct SystemFontListEntry {
     nsCString familyName;
     nsCString faceName;

@@ -99,6 +99,19 @@ if CONFIG["MOZ_WIDGET_TOOLKIT"] == "android":
     UNIFIED_SOURCES += [
         "AndroidSystemFontIterator.cpp",
     ]
+elif CONFIG["MOZ_WIDGET_TOOLKIT"] == "headless":
+    EXPORTS += [
+        "gfxFT2FontBase.h",
+        "gfxFT2Fonts.h",
+        "gfxPlatformHeadless.h",
+    ]
+    SOURCES += [
+        "gfxFT2FontBase.cpp",
+        "gfxFT2FontList.cpp",
+        "gfxFT2Fonts.cpp",
+        "gfxFT2Utils.cpp",
+        "gfxPlatformHeadless.cpp",
+    ]
 elif CONFIG["MOZ_WIDGET_TOOLKIT"] in ("cocoa", "uikit"):
     EXPORTS += [
         "gfxMacUtils.h",

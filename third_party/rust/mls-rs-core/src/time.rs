@@ -5,7 +5,7 @@
 use core::time::Duration;
 use mls_rs_codec::{MlsDecode, MlsEncode, MlsSize};
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))]
 use wasm_bindgen::prelude::*;
 
 /// Wasm-compatible representation of a timestamp.

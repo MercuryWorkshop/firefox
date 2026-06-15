@@ -35,7 +35,7 @@ already_AddRefed<T> NativeFontResourceFreeType::CreateInternal(
   return resource.forget();
 }
 
-#ifdef MOZ_WIDGET_ANDROID
+#if defined(MOZ_WIDGET_ANDROID) || defined(MOZ_WIDGET_HEADLESS)
 already_AddRefed<NativeFontResourceFreeType> NativeFontResourceFreeType::Create(
     const uint8_t* aFontData, uint32_t aDataLength, FT_Library aFTLibrary) {
   return CreateInternal<NativeFontResourceFreeType>(aFontData, aDataLength,

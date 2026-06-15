@@ -10,6 +10,9 @@ elif CONFIG['TARGET_KERNEL'] == 'SunOS':
     libevent_include_suffix = 'solaris'
 elif CONFIG['TARGET_OS'] == 'Android':
     libevent_include_suffix = 'android'
+elif CONFIG['TARGET_KERNEL'] == 'EMSCRIPTEN':
+    # wasm: linux-like but without epoll/eventfd/sendfile/timerfd; poll/select only.
+    libevent_include_suffix = 'emscripten'
 else:
     libevent_include_suffix = 'linux'
 

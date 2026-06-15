@@ -112,10 +112,14 @@
           'target_name': 'nss_cmds',
           'type': 'none',
           'dependencies': [
-            'cmd/certutil/certutil.gyp:certutil',
-            'cmd/pk12util/pk12util.gyp:pk12util',
           ],
           'conditions': [
+            [ 'build_nss_cmds==1', {
+              'dependencies': [
+                'cmd/certutil/certutil.gyp:certutil',
+                'cmd/pk12util/pk12util.gyp:pk12util',
+              ],
+            }],
             [ 'comm_client==1', {
               'dependencies': [
                 'cmd/smimetools/smimetools.gyp:cmsutil',

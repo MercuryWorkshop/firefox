@@ -95,6 +95,13 @@ def dependentlibs_mac_objdump(lib):
     return deps
 
 
+def dependentlibs_wasm(lib):
+    """Emscripten wasm modules (libxul.so etc.) carry no readelf-style NEEDED
+    list; their dependencies are resolved by emscripten's own dynamic loader (or
+    are statically linked). Return no recursive dependencies."""
+    return []
+
+
 def is_skiplisted(dep):
     # Skip the ICU data DLL because preloading it at startup
     # leads to startup performance problems because of its excessive
@@ -140,7 +147,10 @@ def dependentlibs(lib, libpaths, func):
 def gen_list(output, lib):
     libpaths = [os.path.join(substs["DIST"], "bin")]
     binary_type = get_type(lib)
-    if binary_type == ELF:
+    is_wasm = substs.get("OS_TARGET") == "EMSCRIPTEN"
+    if is_wasm:
+        func = dependentlibs_wasm
+    elif binary_type == ELF:
         func = dependentlibs_readelf
     elif binary_type == MACHO:
         func = dependentlibs_mac_objdump
@@ -151,7 +161,7 @@ def gen_list(output, lib):
 
     deps = dependentlibs(lib, libpaths, func)
     base_lib = mozpath.basename(lib)
-    if not deps:
+    if not deps and not is_wasm:
         raise RuntimeError(f"Couldn't find any dependencies of {base_lib}")
     deps[base_lib] = mozpath.join(libpaths[0], base_lib)
     output.write("\n".join(deps.keys()) + "\n")

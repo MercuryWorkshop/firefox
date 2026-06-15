@@ -34,7 +34,8 @@
 
 #include "nsRegionFwd.h"
 
-#if defined(MOZ_WIDGET_ANDROID) || defined(MOZ_WIDGET_GTK)
+#if defined(MOZ_WIDGET_ANDROID) || defined(MOZ_WIDGET_GTK) || \
+    defined(MOZ_WIDGET_HEADLESS)
 #  ifndef MOZ_ENABLE_FREETYPE
 #    define MOZ_ENABLE_FREETYPE
 #  endif
@@ -2239,7 +2240,7 @@ class GFX2D_API Factory {
       RefPtr<SharedFTFace> aFace, FcPattern* aPattern);
 #endif
 
-#ifdef MOZ_WIDGET_ANDROID
+#if defined(MOZ_WIDGET_ANDROID) || defined(MOZ_WIDGET_HEADLESS)
   static already_AddRefed<ScaledFont> CreateScaledFontForFreeTypeFont(
       const RefPtr<UnscaledFont>& aUnscaledFont, Float aSize,
       RefPtr<SharedFTFace> aFace, bool aApplySyntheticBold = false);

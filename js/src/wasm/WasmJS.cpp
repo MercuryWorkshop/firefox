@@ -20,6 +20,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <unordered_map>  // JS->wasm JIT script cache
+#include <vector>         // JS->wasm JIT basic-block analysis
 
 #include "jsapi.h"
 
@@ -47,6 +49,8 @@
 #include "vm/HelperThreadState.h"  // js::PromiseHelperTask
 #include "vm/Interpreter.h"
 #include "vm/JSFunction.h"
+#include "vm/JSScript.h"       // JSScript (JS->wasm JIT)
+#include "vm/BytecodeUtil.h"   // JSOp, GET_*, GetBytecodeLength (JS->wasm JIT)
 #include "vm/PlainObject.h"    // js::PlainObject
 #include "vm/PromiseObject.h"  // js::PromiseObject
 #include "vm/SharedArrayObject.h"
@@ -1939,6 +1943,433 @@ int wasmhost_mem_is_shared(int objId);
 void wasmhost_obj_set_mirror(int objId, void* ptr, int len);
 double wasmhost_call(int handle, int index, const double* args, int argc);
 }
+
+// ===========================================================================
+// Prototype JS -> WebAssembly JIT.
+//
+// SpiderMonkey's Baseline/Ion JITs emit native machine code, which can't run in
+// the wasm sandbox (hence --disable-jit here). This tier instead lowers a hot JS
+// function's bytecode to a small WebAssembly module, instantiates it on the HOST
+// engine via the wasmhost_* bridge above (a real native JIT), and calls it -- so
+// the whole function body runs as host-JITed wasm and the guest<->host boundary
+// is paid once per call. SpiderMonkey bytecode is a stack machine, like wasm, so
+// the lowering is close to 1:1. The prototype handles numeric functions (f64
+// args + result) with straight-line arithmetic; anything else (control flow,
+// objects, strings, calls, ...) makes compilation bail and the function keeps
+// running in the interpreter.
+// ===========================================================================
+namespace {
+
+struct WasmJitEntry {
+  enum class State : uint8_t { Cold, Failed, Compiled };
+  int handle = -1;     // wasmhost instance handle
+  uint32_t nargs = 0;  // formal arg count == wasm param count
+  uint32_t seen = 0;   // invocations observed before a compile attempt
+  State state = State::Cold;
+};
+
+using WasmJitMap = std::unordered_map<JSScript*, WasmJitEntry>;
+static WasmJitMap* gWasmJitMap = nullptr;
+
+static bool WJConst(Encoder& e, double v) {
+  return e.writeOp(Op::F64Const) && e.writeFixedF64(v);
+}
+
+// Emit one non-control-flow JS op as wasm (operand-stack 1:1; every JS arg/local
+// is an f64 wasm local). Returns false on an unsupported op. Control-flow ops
+// (jumps, returns) and comparisons are handled by WJEmitBodyCF.
+// f64 top-of-stack -> i32 with JS ToInt32 semantics (NaN/Inf -> 0/saturate, then
+// wrap to low 32 bits). i64.trunc_sat avoids the trap that i32.trunc_f64_s would
+// take on NaN/out-of-range.
+static bool WJToInt32(Encoder& e) {
+  return e.writeOp(MiscOp::I64TruncSatF64S) && e.writeOp(Op::I32WrapI64);
+}
+
+static bool WJEmitOp(Encoder& e, jsbytecode* pc, uint32_t nargs,
+                     uint32_t rvalLocal, uint32_t scratchLocal) {
+  switch (JSOp(*pc)) {
+    case JSOp::GetArg:
+      return e.writeOp(Op::LocalGet) && e.writeVarU32(GET_ARGNO(pc));
+    case JSOp::SetArg:
+      return e.writeOp(Op::LocalTee) && e.writeVarU32(GET_ARGNO(pc));
+    case JSOp::GetLocal:
+      return e.writeOp(Op::LocalGet) && e.writeVarU32(nargs + GET_LOCALNO(pc));
+    case JSOp::SetLocal:
+      return e.writeOp(Op::LocalTee) && e.writeVarU32(nargs + GET_LOCALNO(pc));
+    case JSOp::Zero:
+      return WJConst(e, 0.0);
+    case JSOp::One:
+      return WJConst(e, 1.0);
+    case JSOp::Int8:
+      return WJConst(e, double(GET_INT8(pc)));
+    case JSOp::Int32:
+      return WJConst(e, double(GET_INT32(pc)));
+    case JSOp::Uint16:
+      return WJConst(e, double(GET_UINT16(pc)));
+    case JSOp::Uint24:
+      return WJConst(e, double(GET_UINT24(pc)));
+    case JSOp::Double: {
+      double d;
+      memcpy(&d, pc + 1, sizeof(double));
+      return WJConst(e, d);
+    }
+    case JSOp::Add:
+      return e.writeOp(Op::F64Add);
+    case JSOp::Sub:
+      return e.writeOp(Op::F64Sub);
+    case JSOp::Mul:
+      return e.writeOp(Op::F64Mul);
+    case JSOp::Div:
+      return e.writeOp(Op::F64Div);
+    case JSOp::Neg:
+      return e.writeOp(Op::F64Neg);
+    case JSOp::BitOr:
+    case JSOp::BitAnd:
+    case JSOp::BitXor:
+    case JSOp::Lsh:
+    case JSOp::Rsh:
+    case JSOp::Ursh: {
+      // a,b on the f64 stack -> ToInt32 both -> i32 op -> back to f64.
+      Op iop;
+      bool unsignedResult = false;
+      switch (JSOp(*pc)) {
+        case JSOp::BitOr: iop = Op::I32Or; break;
+        case JSOp::BitAnd: iop = Op::I32And; break;
+        case JSOp::BitXor: iop = Op::I32Xor; break;
+        case JSOp::Lsh: iop = Op::I32Shl; break;
+        case JSOp::Rsh: iop = Op::I32ShrS; break;
+        default: iop = Op::I32ShrU; unsignedResult = true; break;  // Ursh
+      }
+      return e.writeOp(Op::LocalSet) && e.writeVarU32(scratchLocal) &&  // tmp=b
+             WJToInt32(e) &&                                           // ToInt32(a)
+             e.writeOp(Op::LocalGet) && e.writeVarU32(scratchLocal) &&  // push b
+             WJToInt32(e) &&                                           // ToInt32(b)
+             e.writeOp(iop) &&
+             e.writeOp(unsignedResult ? Op::F64ConvertI32U
+                                      : Op::F64ConvertI32S);
+    }
+    case JSOp::BitNot:
+      return WJToInt32(e) && e.writeOp(Op::I32Const) && e.writeVarS32(-1) &&
+             e.writeOp(Op::I32Xor) && e.writeOp(Op::F64ConvertI32S);
+    case JSOp::Inc:
+      return WJConst(e, 1.0) && e.writeOp(Op::F64Add);
+    case JSOp::Dec:
+      return WJConst(e, 1.0) && e.writeOp(Op::F64Sub);
+    case JSOp::Pos:
+    case JSOp::ToNumeric:
+      return true;  // identity on a number
+    case JSOp::Pop:
+      return e.writeOp(Op::Drop);
+    case JSOp::SetRval:
+      return e.writeOp(Op::LocalSet) && e.writeVarU32(rvalLocal);
+    case JSOp::GetRval:
+      return e.writeOp(Op::LocalGet) && e.writeVarU32(rvalLocal);
+    case JSOp::JumpTarget:
+    case JSOp::LoopHead:
+    case JSOp::Nop:
+    case JSOp::NopIsAssignOp:
+    case JSOp::NopDestructuring:
+      return true;  // markers / no-ops
+    default:
+      return false;
+  }
+}
+
+static bool WJIsCmp(JSOp op) {
+  return op == JSOp::Lt || op == JSOp::Le || op == JSOp::Gt || op == JSOp::Ge ||
+         op == JSOp::Eq || op == JSOp::Ne || op == JSOp::StrictEq ||
+         op == JSOp::StrictNe;
+}
+
+// Lower `script`'s bytecode (with control flow) into one wasm function body,
+// INCLUDING the local declarations and the closing `end`. Reducible JS control
+// flow is emitted as a relooper-style dispatcher: a `loop` whose body is a chain
+// of `if (pc == i)` blocks (one per basic block); each block runs its straight-
+// line ops, computes its successor into the i32 `pc` local, and `br`s back to the
+// loop (or `br`s to the outer `exit` block on return). Comparisons are only
+// emitted when immediately followed by a conditional branch (so the i32 result is
+// consumed there and the rest of the body stays pure-f64). Anything outside the
+// supported subset -> false (the caller leaves the function to the interpreter).
+// Malformed output is caught by the host's WebAssembly.Module validation.
+static bool WJEmitBodyCF(JSScript* script, Encoder& e, uint32_t nargs,
+                         uint32_t nfixed) {
+  jsbytecode* const start = script->code();
+  jsbytecode* const end = script->codeEnd();
+  const uint32_t len = uint32_t(end - start);
+  const uint32_t rvalLocal = nargs + nfixed;
+  const uint32_t scratchLocal = nargs + nfixed + 1;  // bitwise ToInt32 temp
+  const uint32_t pcLocal = nargs + nfixed + 2;
+  const uint8_t kF64 = uint8_t(TypeCode::F64);
+  const uint8_t kI32 = uint8_t(TypeCode::I32);
+  const uint8_t kVoid = 0x40;
+
+  // Pass 1: discover basic-block starts (offset 0, every jump target, and the
+  // offset after every branch/return).
+  std::vector<bool> isStart(len + 1, false);
+  isStart[0] = true;
+  for (jsbytecode* pc = start; pc < end;) {
+    JSOp op = JSOp(*pc);
+    uint32_t ol = GetBytecodeLength(pc);
+    uint32_t cur = uint32_t(pc - start);
+    if (IsJumpOpcode(op)) {
+      if (op == JSOp::And || op == JSOp::Or || op == JSOp::Coalesce) {
+        return false;  // short-circuit branches: unsupported
+      }
+      int64_t tgt = int64_t(cur) + GET_JUMP_OFFSET(pc);
+      if (tgt < 0 || tgt > len) return false;
+      isStart[tgt] = true;
+      if (cur + ol <= len) isStart[cur + ol] = true;
+    } else if (op == JSOp::Return || op == JSOp::RetRval) {
+      if (cur + ol <= len) isStart[cur + ol] = true;
+    }
+    pc += ol;
+  }
+
+  // Assign block ids in offset order.
+  std::vector<int32_t> ofId(len + 1, -1);
+  std::vector<uint32_t> blockOff;
+  for (uint32_t o = 0; o <= len; o++) {
+    if (isStart[o]) {
+      ofId[o] = int32_t(blockOff.size());
+      blockOff.push_back(o);
+    }
+  }
+  uint32_t K = uint32_t(blockOff.size());
+  if (K == 0 || K > 1024) return false;
+
+  // Locals: (nfixed JS locals + rval + bitwise scratch) f64, then 1 i32 `pc`.
+  if (!e.writeVarU32(2)) return false;
+  if (!e.writeVarU32(nfixed + 2) || !e.writeFixedU8(kF64)) return false;
+  if (!e.writeVarU32(1) || !e.writeFixedU8(kI32)) return false;
+
+  // block $exit { loop $loop { <dispatch> } }   (br depth 1 = loop, 2 = exit)
+  if (!e.writeOp(Op::Block) || !e.writeFixedU8(kVoid)) return false;
+  if (!e.writeOp(Op::Loop) || !e.writeFixedU8(kVoid)) return false;
+
+  for (uint32_t i = 0; i < K; i++) {
+    // if (pc == i) { ... block i ... }
+    if (!e.writeOp(Op::LocalGet) || !e.writeVarU32(pcLocal)) return false;
+    if (!e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(i))) return false;
+    if (!e.writeOp(Op::I32Eq)) return false;
+    if (!e.writeOp(Op::If) || !e.writeFixedU8(kVoid)) return false;
+
+    jsbytecode* pc = start + blockOff[i];
+    bool terminated = false;
+    while (pc < end && !terminated) {
+      JSOp op = JSOp(*pc);
+      uint32_t ol = GetBytecodeLength(pc);
+      uint32_t cur = uint32_t(pc - start);
+
+      if (IsJumpOpcode(op)) {
+        uint32_t fall = cur + ol;
+        int32_t tgtId = ofId[uint32_t(int64_t(cur) + GET_JUMP_OFFSET(pc))];
+        int32_t fallId = (fall <= len) ? ofId[fall] : -1;
+        if (op == JSOp::Goto) {
+          if (tgtId < 0) return false;
+          if (!e.writeOp(Op::I32Const) || !e.writeVarS32(tgtId)) return false;
+          if (!e.writeOp(Op::LocalSet) || !e.writeVarU32(pcLocal)) return false;
+          if (!e.writeOp(Op::Br) || !e.writeVarU32(1)) return false;
+        } else {  // JumpIfFalse / JumpIfTrue: i32 cond already on the stack
+          if (tgtId < 0 || fallId < 0) return false;
+          int32_t thenId = (op == JSOp::JumpIfTrue) ? tgtId : fallId;
+          int32_t elseId = (op == JSOp::JumpIfTrue) ? fallId : tgtId;
+          if (!e.writeOp(Op::If) || !e.writeFixedU8(kVoid)) return false;
+          if (!e.writeOp(Op::I32Const) || !e.writeVarS32(thenId)) return false;
+          if (!e.writeOp(Op::LocalSet) || !e.writeVarU32(pcLocal)) return false;
+          if (!e.writeOp(Op::Else)) return false;
+          if (!e.writeOp(Op::I32Const) || !e.writeVarS32(elseId)) return false;
+          if (!e.writeOp(Op::LocalSet) || !e.writeVarU32(pcLocal)) return false;
+          if (!e.writeOp(Op::End)) return false;
+          if (!e.writeOp(Op::Br) || !e.writeVarU32(1)) return false;
+        }
+        terminated = true;
+      } else if (op == JSOp::Return) {
+        if (!e.writeOp(Op::LocalSet) || !e.writeVarU32(rvalLocal)) return false;
+        if (!e.writeOp(Op::Br) || !e.writeVarU32(2)) return false;
+        terminated = true;
+      } else if (op == JSOp::RetRval) {
+        if (!e.writeOp(Op::Br) || !e.writeVarU32(2)) return false;
+        terminated = true;
+      } else if (WJIsCmp(op)) {
+        jsbytecode* nx = pc + ol;
+        if (nx >= end ||
+            (JSOp(*nx) != JSOp::JumpIfFalse && JSOp(*nx) != JSOp::JumpIfTrue)) {
+          return false;  // comparison result used as a value: unsupported
+        }
+        Op cop;
+        switch (op) {
+          case JSOp::Lt: cop = Op::F64Lt; break;
+          case JSOp::Gt: cop = Op::F64Gt; break;
+          case JSOp::Le: cop = Op::F64Le; break;
+          case JSOp::Ge: cop = Op::F64Ge; break;
+          case JSOp::Eq:
+          case JSOp::StrictEq: cop = Op::F64Eq; break;
+          default: cop = Op::F64Ne; break;  // Ne / StrictNe
+        }
+        if (!e.writeOp(cop)) return false;
+      } else {
+        if (!WJEmitOp(e, pc, nargs, rvalLocal, scratchLocal)) return false;
+        uint32_t nextOff = cur + ol;
+        if (nextOff <= len && isStart[nextOff] && nextOff != blockOff[i]) {
+          // fall through into the next basic block
+          int32_t nid = ofId[nextOff];
+          if (nid < 0) return false;
+          if (!e.writeOp(Op::I32Const) || !e.writeVarS32(nid)) return false;
+          if (!e.writeOp(Op::LocalSet) || !e.writeVarU32(pcLocal)) return false;
+          if (!e.writeOp(Op::Br) || !e.writeVarU32(1)) return false;
+          terminated = true;
+        }
+      }
+      pc += ol;
+    }
+    if (!terminated) {
+      if (!e.writeOp(Op::Br) || !e.writeVarU32(2)) return false;  // -> exit
+    }
+    if (!e.writeOp(Op::End)) return false;  // end if (pc == i)
+  }
+
+  if (!e.writeOp(Op::End)) return false;  // end loop
+  if (!e.writeOp(Op::End)) return false;  // end block $exit
+  if (!e.writeOp(Op::LocalGet) || !e.writeVarU32(rvalLocal)) return false;
+  return e.writeOp(Op::End);  // end function body
+}
+
+// Build a complete wasm module exporting a single function "f": (f64^nargs)->f64.
+static bool WJBuildModule(JSScript* script, uint32_t nargs, uint32_t nfixed,
+                          Bytes& out) {
+  Encoder e(out);
+  const uint8_t kF64 = uint8_t(TypeCode::F64);
+  if (!e.writeFixedU32(MagicNumber) ||
+      !e.writeFixedU32(EncodingVersionModule)) {
+    return false;
+  }
+  size_t s;
+  // Type section: one (f64^nargs) -> f64 signature.
+  if (!e.startSection(SectionId::Type, &s)) return false;
+  if (!e.writeVarU32(1) || !e.writeFixedU8(0x60) || !e.writeVarU32(nargs)) {
+    return false;
+  }
+  for (uint32_t i = 0; i < nargs; i++) {
+    if (!e.writeFixedU8(kF64)) return false;
+  }
+  if (!e.writeVarU32(1) || !e.writeFixedU8(kF64)) return false;
+  e.finishSection(s);
+  // Function section: one function of type 0.
+  if (!e.startSection(SectionId::Function, &s)) return false;
+  if (!e.writeVarU32(1) || !e.writeVarU32(0)) return false;
+  e.finishSection(s);
+  // Export section: export the function as "f".
+  if (!e.startSection(SectionId::Export, &s)) return false;
+  if (!e.writeVarU32(1) || !e.writeBytes("f", 1) || !e.writeFixedU8(0x00) ||
+      !e.writeVarU32(0)) {
+    return false;
+  }
+  e.finishSection(s);
+  // Code section: one body (WJEmitBodyCF writes the locals + ops + closing end).
+  if (!e.startSection(SectionId::Code, &s)) return false;
+  if (!e.writeVarU32(1)) return false;
+  size_t bodyOff;
+  if (!e.writePatchableVarU32(&bodyOff)) return false;
+  size_t bodyStart = e.currentOffset();
+  if (!WJEmitBodyCF(script, e, nargs, nfixed)) return false;
+  e.patchVarU32(bodyOff, uint32_t(e.currentOffset() - bodyStart));
+  e.finishSection(s);
+  return true;
+}
+
+static bool WJCompile(JSScript* script, WasmJitEntry& entry) {
+  JSFunction* fun = script->function();
+  if (!fun) return false;
+  uint32_t nargs = fun->nargs();
+  uint32_t nfixed = script->nfixed();
+  if (nargs > 32 || nfixed > 256) return false;
+  Bytes bytes;
+  if (!WJBuildModule(script, nargs, nfixed, bytes)) return false;
+  int handle = wasmhost_compile(bytes.begin(), int(bytes.length()));
+  if (handle < 0) return false;
+  if (wasmhost_instantiate(handle, nullptr, 0) != 0) return false;
+  entry.handle = handle;
+  entry.nargs = nargs;
+  entry.state = WasmJitEntry::State::Compiled;
+  return true;
+}
+
+// Direct-mapped cache so the per-call check on the PBL fast path is a couple of
+// loads (no hashmap probe) for already-classified scripts. Stores a pointer to
+// the map entry, which is stable across std::unordered_map rehashes.
+struct WJCacheSlot {
+  JSScript* script = nullptr;
+  WasmJitEntry* entry = nullptr;
+};
+static WJCacheSlot gWJCache[4096];
+
+static WasmJitEntry* WJEntryFor(JSScript* script) {
+  WJCacheSlot& c = gWJCache[(uintptr_t(script) >> 3) & 4095];
+  if (c.script == script) return c.entry;
+  if (!gWasmJitMap) {
+    gWasmJitMap = new (std::nothrow) WasmJitMap();
+    if (!gWasmJitMap) return nullptr;
+  }
+  WasmJitEntry& e = (*gWasmJitMap)[script];  // inserts a Cold entry if absent
+  c.script = script;
+  c.entry = &e;
+  return &e;
+}
+
+}  // namespace
+
+namespace js {
+namespace wasm {
+extern bool WasmJitObserveCall(JSScript* script);
+extern bool WasmJitRunCall(JSScript* script, const JS::Value* args,
+                           uint32_t argc, uint64_t* retBits);
+}  // namespace wasm
+}  // namespace js
+
+// Called on every scripted call from the PBL fast path. Counts invocations and,
+// once a script is hot, attempts to lower it to wasm. Returns true once the
+// script has a wasm version -- the caller then misses the fast path so the call
+// is routed through the IC, where WasmJitRunCall runs the wasm.
+bool js::wasm::WasmJitObserveCall(JSScript* script) {
+  // A/B toggle for benchmarking: GECKO_NOWASMJIT disables the JIT (checked once).
+  static int sEnabled = -1;
+  if (sEnabled < 0) sEnabled = getenv("GECKO_NOWASMJIT") ? 0 : 1;
+  if (!sEnabled) return false;
+  // The caller (interpreter call hook) only invokes this for scripts whose warmup
+  // counter is already past the threshold, so there is no per-call counting here:
+  // attempt the compile on first sight of a hot script.
+  WasmJitEntry* e = WJEntryFor(script);
+  if (!e) return false;
+  if (e->state == WasmJitEntry::State::Compiled) return true;
+  if (e->state == WasmJitEntry::State::Failed) return false;
+  if (!script->function() || script->isModule() || script->length() > 4096 ||
+      !WJCompile(script, *e)) {
+    e->state = WasmJitEntry::State::Failed;
+    return false;
+  }
+  return true;
+}
+
+// Called from a scripted-call site. If `script` has a wasm version and all formal
+// args are numbers, runs the wasm and writes the result's raw bits to `retBits`,
+// returning true. Otherwise returns false (the interpreter handles it). `argv[i]`
+// is formal arg i (callers pass the arg0 pointer, NOT a `this`-prefixed array).
+bool js::wasm::WasmJitRunCall(JSScript* script, const JS::Value* argv,
+                              uint32_t argc, uint64_t* retBits) {
+  WasmJitEntry* e = WJEntryFor(script);
+  if (!e || e->state != WasmJitEntry::State::Compiled) return false;
+  if (argc < e->nargs) return false;  // underflow -> let the interpreter pad
+  double buf[64];
+  for (uint32_t i = 0; i < e->nargs; i++) {
+    const JS::Value& v = argv[i];
+    if (!v.isNumber()) return false;  // type guard: deopt to the interpreter
+    buf[i] = v.toNumber();
+  }
+  double r = wasmhost_call(e->handle, 0, buf, int(e->nargs));
+  *retBits = JS::NumberValue(r).asRawBits();
+  return true;
+}
+
 static int HostCompileBytes(JSContext* cx, HandleObject bytesObj);
 static JSObject* HostMakeModuleObject(JSContext* cx, int handle);
 static int HostModuleHandle(JSContext* cx, HandleObject obj);

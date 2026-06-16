@@ -67,6 +67,20 @@
 #include "vm/JSScript-inl.h"
 #include "vm/PlainObject-inl.h"
 
+#if defined(__EMSCRIPTEN__)
+namespace js {
+namespace wasm {
+// JS->wasm JIT hooks (defined in wasm/WasmJS.cpp). ObserveCall counts calls and
+// compiles hot numeric functions, returning true once a wasm version exists (the
+// caller then misses the PBL fast path so the call goes through the IC). RunCall
+// runs that wasm version from the IC when the args are numbers.
+extern bool WasmJitObserveCall(JSScript* script);
+extern bool WasmJitRunCall(JSScript* script, const JS::Value* args,
+                           uint32_t argc, uint64_t* retBits);
+}  // namespace wasm
+}  // namespace js
+#endif
+
 namespace js {
 namespace pbl {
 
@@ -2406,22 +2420,33 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
                 MakeFrameDescriptorForJitCall(FrameType::BaselineStub, argc)));
 
             JSScript* script = callee->nonLazyScript();
-            jsbytecode* pc = script->code();
-            ImmutableScriptData* isd = script->immutableScriptData();
-            PBIResult result;
-            Value ret;
-            result = PortableBaselineInterpret<false, kHybridICsInterp>(
-                cx, ctx.state, ctx.stack, sp,
-                /* envChain = */ nullptr, &ret, pc, isd, nullptr, nullptr,
-                nullptr, PBIResult::Ok);
-            if (result != PBIResult::Ok) {
-              ctx.error = result;
-              return IC_ERROR_SENTINEL();
+#if defined(__EMSCRIPTEN__)
+            // JS->wasm JIT: if this callee was lowered to wasm and the args are
+            // numbers, run the host-JITed wasm instead of recursing into PBL.
+            uint64_t wbits;
+            if (!flags.isConstructing() &&
+                js::wasm::WasmJitRunCall(script, args + 1, argc, &wbits)) {
+              retValue = wbits;
+            } else
+#endif
+            {
+              jsbytecode* pc = script->code();
+              ImmutableScriptData* isd = script->immutableScriptData();
+              PBIResult result;
+              Value ret;
+              result = PortableBaselineInterpret<false, kHybridICsInterp>(
+                  cx, ctx.state, ctx.stack, sp,
+                  /* envChain = */ nullptr, &ret, pc, isd, nullptr, nullptr,
+                  nullptr, PBIResult::Ok);
+              if (result != PBIResult::Ok) {
+                ctx.error = result;
+                return IC_ERROR_SENTINEL();
+              }
+              if (flags.isConstructing() && !ret.isObject()) {
+                ret = args[0];
+              }
+              retValue = ret.asRawBits();
             }
-            if (flags.isConstructing() && !ret.isObject()) {
-              ret = args[0];
-            }
-            retValue = ret.asRawBits();
           }
         }
 
@@ -7794,6 +7819,17 @@ PBIResult PortableBaselineInterpret(
               TRACE_PRINTF("missed fastpath: not enough arguments\n");
               break;
             }
+
+#if defined(__EMSCRIPTEN__)
+            // JS->wasm JIT: count this call; once the callee is hot and has been
+            // lowered to wasm, miss the fast path so the call routes through the
+            // IC (CallScriptedFunction), where the host-JITed wasm version runs.
+            if (!constructing && calleeScript->getWarmUpCount() >= 10 &&
+                js::wasm::WasmJitObserveCall(calleeScript.get())) {
+              TRACE_PRINTF("missed fastpath: routed to wasm-jit via IC\n");
+              break;
+            }
+#endif
 
             // Fast-path: function, interpreted, has JitScript, same realm, no
             // argument underflow.

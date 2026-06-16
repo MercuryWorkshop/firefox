@@ -518,7 +518,17 @@ WindowRenderer* PuppetWidget::GetWindowRenderer() {
       // <canvas>, instead of the software fallback renderer. The in-process
       // session provides its own CompositorBridgeChild, so the concern below
       // (no CompositorBridgeChild) does not apply here.
-      if (ShouldUseOffMainThreadCompositing()) {
+      //
+      // Only do this in GPU mode (GECKO_GPU): the in-process compositor's parent
+      // side runs on the WebRender RenderThread, which is started only in GPU
+      // mode. Without it, CreateCompositor()'s WebRenderBridgeChild::
+      // SendEnsureConnected sync IPC never gets a reply and hangs the caller
+      // forever -- which is exactly what happens in the headless DOM-mirror and
+      // software-paint modes, where any refresh-driver paint (e.g. triggered by a
+      // content click handler) would otherwise deadlock the engine. Those modes
+      // paint explicitly (RenderDocument) or not at all, so the software fallback
+      // renderer (in-process, no IPC) is correct for them.
+      if (getenv("GECKO_GPU") && ShouldUseOffMainThreadCompositing()) {
         CreateCompositor();
         if (mWindowRenderer) {
           return mWindowRenderer;

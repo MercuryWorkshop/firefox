@@ -405,6 +405,16 @@ static void AssertExceptionResult(JSContext* cx) {
 #ifdef _MSC_VER
 #  pragma optimize("g", off)
 #endif
+#if defined(__EMSCRIPTEN__)
+namespace js {
+namespace wasm {
+extern bool WasmJitObserveCall(JSScript* script);
+extern bool WasmJitRunCall(JSScript* script, const JS::Value* argv,
+                           uint32_t argc, uint64_t* retBits);
+}  // namespace wasm
+}  // namespace js
+#endif
+
 bool js::RunScript(JSContext* cx, RunState& state) {
   AutoCheckRecursionLimit recursion(cx);
   if (!recursion.check(cx)) {
@@ -3251,6 +3261,31 @@ bool MOZ_NEVER_INLINE JS_HAZ_JSNATIVE_CALLER js::Interpret(JSContext* cx,
 
       JSFunction* maybeFun;
       bool isFunction = IsFunctionObject(args.calleev(), &maybeFun);
+
+#if defined(__EMSCRIPTEN__)
+      // JS->wasm JIT: count this call and, once the callee is hot + lowered to
+      // wasm and called with numeric args, run the host-JITed wasm directly (set
+      // the return value + advance past the call). Placed in the same scope as
+      // the slow-path dispatch below so the computed goto is legal. Falls through
+      // to the normal interpreter path otherwise.
+      if (isFunction && !construct && maybeFun->isInterpreted() &&
+          maybeFun->baseScript() && maybeFun->baseScript()->hasBytecode()) {
+        JSScript* wjScript = maybeFun->baseScript()->asJSScript();
+        // Warmup-gate: only hot scripts pay for the (cross-TU) observe/compile
+        // machinery -- the millions of cold/non-loop calls on a real page just do
+        // this cheap inline counter check and fall through.
+        if (wjScript->getWarmUpCount() >= 10 &&
+            js::wasm::WasmJitObserveCall(wjScript)) {
+          uint64_t wbits;
+          if (js::wasm::WasmJitRunCall(wjScript, args.array(), args.length(),
+                                       &wbits)) {
+            args.rval().set(Value::fromRawBits(wbits));
+            REGS.sp = args.spAfterCall();
+            ADVANCE_AND_DISPATCH(JSOpLength_Call);
+          }
+        }
+      }
+#endif
 
       // Use the slow path if the callee is not an interpreted function, if we
       // have to throw an exception, or if we might have to invoke the

@@ -2180,6 +2180,14 @@ impl Renderer {
     }
 
     fn check_gl_errors(&mut self) {
+        // On emscripten the compositor GL context is local to the Renderer worker (no
+        // proxy), so glGetError is a real GPU sync that stalls the pipeline. This OOM
+        // probe runs per texture-cache-update-list (frequent on texture-heavy pages),
+        // costing ~0.2 cores of glGetError. Skip it on wasm -- match the no-error-check
+        // posture; a true OOM still surfaces via context loss / allocation failure.
+        if cfg!(target_arch = "wasm32") {
+            return;
+        }
         let err = self.device.gl().get_error();
         if err == gl::OUT_OF_MEMORY {
             self.renderer_errors.push(RendererError::OutOfMemory);

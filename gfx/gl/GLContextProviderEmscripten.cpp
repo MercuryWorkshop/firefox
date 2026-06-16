@@ -131,6 +131,12 @@ class GLContextEmscripten final : public GLContext {
   // proxy tax. The result is read back (CPU, SurfaceFactory_Basic) for compositing.
   static RefPtr<GLContextEmscripten> CreateContent(
       const GLContextDesc& desc, nsACString* const out_failureId) {
+    // Honor the WebGL version the content asked for: WebGLContext sets PREFER_ES3 for
+    // WebGL2 (GLES3) and leaves it off for WebGL1 (GLES2). Forcing WebGL2 broke real
+    // WebGL1 content -- e.g. shaders that `#extension GL_EXT_frag_depth : require`,
+    // which is a WebGL1 extension but core (and so not an exposable extension) in
+    // WebGL2, so the require errors and the shader won't compile.
+    int wantWebgl2 = bool(desc.flags & CreateContextFlags::PREFER_ES3) ? 1 : 0;
     // NOTE: no top-level commas inside EM_ASM_INT -- the C preprocessor splits
     // macro args on commas (only parens protect them, not braces), so the attrs
     // object is built with assignments rather than a comma-separated literal.
@@ -139,7 +145,7 @@ class GLContextEmscripten final : public GLContext {
           try {
             var oc = new OffscreenCanvas(300, 150);
             var attrs = {};
-            attrs.majorVersion = 2;
+            attrs.majorVersion = $0 ? 2 : 1;
             attrs.minorVersion = 0;
             attrs.alpha = true;
             attrs.depth = true;
@@ -149,13 +155,13 @@ class GLContextEmscripten final : public GLContext {
             attrs.preserveDrawingBuffer = true;
             attrs.failIfMajorPerformanceCaveat = false;
             attrs.enableExtensionsByDefault = true;
-            var glctx = oc.getContext("webgl2", attrs);
+            var glctx = oc.getContext($0 ? "webgl2" : "webgl", attrs);
             if (!glctx) return 0;
             // Register with emscripten's GL on THIS thread (owns it -> local, not
             // proxied). GL.registerContext stamps the current pthread as owner.
             return GL.registerContext(glctx, attrs);
           } catch (e) { return 0; }
-        });
+        }, wantWebgl2);
     if (ctx <= 0) {
       if (out_failureId) {
         *out_failureId = "FEATURE_FAILURE_EMSCRIPTEN_OFFSCREENCANVAS"_ns;

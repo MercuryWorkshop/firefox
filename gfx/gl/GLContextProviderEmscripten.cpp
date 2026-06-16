@@ -81,8 +81,19 @@ class GLContextEmscripten final : public GLContext {
     // context, so without it the canvas stays black. Content contexts render to
     // their own framebuffer (read back for compositing), so they don't swap.
     attrs.explicitSwapControl = present ? EM_TRUE : EM_FALSE;
-    attrs.renderViaOffscreenBackBuffer = present ? EM_TRUE : EM_FALSE;
-    attrs.proxyContextToMainThread = EMSCRIPTEN_WEBGL_CONTEXT_PROXY_ALWAYS;
+    // No offscreen back buffer: when #screen is a real (transferred) OffscreenCanvas
+    // on this thread, WebRender renders directly to its default framebuffer and the
+    // implicit swap presents it to the visible canvas (commit_frame's back-buffer blit
+    // would target a redundant FBO that never reaches the OffscreenCanvas). If we
+    // instead fall back to proxying, emscripten proxies without the back buffer too
+    // (OffscreenCanvas support is built in).
+    attrs.renderViaOffscreenBackBuffer = EM_FALSE;
+    // PROXY_FALLBACK (not ALWAYS): if the page canvas (#screen) was transferred to
+    // THIS (Renderer) thread as an OffscreenCanvas (see RenderThread::Start + NSPR
+    // _pr_emscripten_next_canvas), create the context LOCAL here -- no per-GL-call
+    // proxy to the main thread. If it wasn't transferred (transfer raced, or a
+    // content/offscreen context), fall back to proxying so rendering still works.
+    attrs.proxyContextToMainThread = EMSCRIPTEN_WEBGL_CONTEXT_PROXY_FALLBACK;
 
     EMSCRIPTEN_WEBGL_CONTEXT_HANDLE ctx =
         emscripten_webgl_create_context(target, &attrs);
@@ -186,16 +197,65 @@ class GLContextEmscripten final : public GLContext {
   bool IsDoubleBuffered() const override { return true; }
 
   bool SwapBuffers() override {
-    // Compositor (offscreen back buffer): blit it to the default framebuffer;
-    // presentation happens when the owning thread yields. Content contexts have no
-    // explicit-swap back buffer (commit_frame would error), and present via
-    // read-back instead, so swapping is a no-op for them.
     if (!mPresent) return true;
-    return emscripten_webgl_commit_frame() == EMSCRIPTEN_RESULT_SUCCESS;
+    // The compositor context is LOCAL on this (Renderer) worker (its canvas is the
+    // OffscreenCanvas transferred from #screen), so WebRender's GL ran without the
+    // per-call proxy. But the WebGL "implicit swap" that would push the OffscreenCanvas
+    // to the visible placeholder never fires here: an emscripten pthread runs a blocking
+    // event loop and never yields to its JS event loop, and gl.commit() was removed from
+    // browsers. So we present EXPLICITLY: grab the frame as an ImageBitmap and post it to
+    // the main thread, where a bitmaprenderer canvas (#glout, overlaid on #screen)
+    // displays it. One zero-copy transfer per frame, no per-GL-call proxy, no readback.
+    if (!mPresentSetup) {
+      mPresentSetup = true;
+      MAIN_THREAD_EM_ASM(
+          {
+            var w = PThread.pthreads[$0];
+            if (!w) return;
+            var screen = document.querySelector('#screen');
+            var o = document.getElementById('glout');
+            if (!o) {
+              o = document.createElement('canvas');
+              o.id = 'glout';
+              o.width = screen.width;
+              o.height = screen.height;
+              // Overlay exactly on #screen (inside the position:relative #screenwrap)
+              // but transparent to input, so the harness's mouse/keyboard handlers on
+              // #screen still fire. #screen stays in the DOM (covered by #glout's
+              // opaque rendered content).
+              o.style.position = 'absolute';
+              o.style.border = 'none';
+              o.style.left = (screen.clientLeft || 0) + 'px';  // inside #screen's border
+              o.style.top = (screen.clientTop || 0) + 'px';
+              o.style.width = screen.width + 'px';   // overlay #screen's content box
+              o.style.height = screen.height + 'px';
+              o.style.pointerEvents = 'none';
+              (screen.parentNode || document.body).appendChild(o);
+            }
+            var bctx = o.getContext('bitmaprenderer');
+            w.addEventListener('message', function(e) {
+              if (e.data && e.data.__glpresent && e.data.bmp) {
+                try { bctx.transferFromImageBitmap(e.data.bmp); } catch (err) {}
+              }
+            });
+          },
+          (int)(uintptr_t)pthread_self());
+    }
+    EM_ASM({
+      var gl = GL.currentContext && GL.currentContext.GLctx;
+      if (gl && gl.canvas && gl.canvas.transferToImageBitmap) {
+        var bmp = gl.canvas.transferToImageBitmap();
+        var m = {};
+        m.__glpresent = 1;
+        m.bmp = bmp;
+        self.postMessage(m, [bmp]);
+      }
+    });
+    return true;
   }
 
   void GetWSIInfo(nsCString* const out) const override {
-    out->AppendLiteral("emscripten WebGL2 (proxied to main thread)");
+    out->AppendLiteral("emscripten WebGL2 (Renderer-thread OffscreenCanvas)");
   }
 
  private:
@@ -212,6 +272,7 @@ class GLContextEmscripten final : public GLContext {
 
   EMSCRIPTEN_WEBGL_CONTEXT_HANDLE mContext;
   bool mPresent;
+  bool mPresentSetup = false;  // one-time #glout bitmaprenderer + worker listener setup
 };
 
 // -- Provider statics --------------------------------------------------------

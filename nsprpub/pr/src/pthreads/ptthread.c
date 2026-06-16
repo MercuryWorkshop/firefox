@@ -284,6 +284,20 @@ static PRThread* pt_AttachThread(void) {
   return thred; /* may be NULL */
 } /* pt_AttachThread */
 
+#ifdef __EMSCRIPTEN__
+#  include <emscripten/threading.h>
+// gecko-wasm: GPU mode wants WebRender's "Renderer" pthread to OWN the page canvas
+// (#screen) as a transferred OffscreenCanvas, so its GL context is created LOCAL on
+// that worker (no per-call proxy to the main thread). emscripten only transfers a
+// canvas to a worker at thread creation (via the pthread attr), so gfx sets this
+// just before NS_NewNamedThread("Renderer"); the very next pthread we create
+// consumes it (synchronous, same thread -> reliably the Renderer thread).
+const char* _pr_emscripten_next_canvas = NULL;
+void PR_SetTransferredCanvasForNextThread(const char* aName) {
+  _pr_emscripten_next_canvas = aName;
+}
+#endif
+
 static PRThread* _PR_CreateThread(PRThreadType type, void (*start)(void* arg),
                                   void* arg, PRThreadPriority priority,
                                   PRThreadScope scope, PRThreadState state,
@@ -425,6 +439,13 @@ static PRThread* _PR_CreateThread(PRThreadType type, void (*start)(void* arg),
      * to pthread_create() because who knows what wacky things
      * pthread_create() may be doing to its argument.
      */
+#ifdef __EMSCRIPTEN__
+    if (_pr_emscripten_next_canvas) {
+      emscripten_pthread_attr_settransferredcanvases(&tattr,
+                                                     _pr_emscripten_next_canvas);
+      _pr_emscripten_next_canvas = NULL;  // consume once (next thread only)
+    }
+#endif
     rv = _PT_PTHREAD_CREATE(&id, tattr, _pt_root, thred);
 
     if (EPERM == rv) {

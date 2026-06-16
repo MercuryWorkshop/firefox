@@ -101,6 +101,13 @@ RenderThread::~RenderThread() {
 // static
 RenderThread* RenderThread::Get() { return sRenderThread; }
 
+#if defined(__EMSCRIPTEN__)
+// Defined in NSPR (ptthread.c): arrange for the next pthread we create to receive
+// the named DOM canvas as a transferred OffscreenCanvas. Used to give #screen to the
+// Renderer thread for local (unproxied) WebGL compositing.
+extern "C" void PR_SetTransferredCanvasForNextThread(const char*);
+#endif
+
 // static
 void RenderThread::Start(uint32_t aNamespace) {
   MOZ_ASSERT(NS_IsMainThread());
@@ -137,6 +144,15 @@ void RenderThread::Start(uint32_t aNamespace) {
   stackSize = std::max(stackSize, 4 * 1024 * 1024U);
 #endif
 
+#if defined(__EMSCRIPTEN__)
+  // gecko-wasm GPU mode: hand the page canvas (#screen) to the Renderer thread as a
+  // transferred OffscreenCanvas so GLContextProviderEmscripten creates its compositor
+  // context LOCAL on that worker (PROXY_FALLBACK finds it) instead of proxying every
+  // GL call to the main thread. Consumed by the very next pthread we create below.
+  if (getenv("GECKO_GPU")) {
+    PR_SetTransferredCanvasForNextThread("#screen");
+  }
+#endif
   RefPtr<nsIThread> thread;
   nsresult rv = NS_NewNamedThread(
       "Renderer", getter_AddRefs(thread),

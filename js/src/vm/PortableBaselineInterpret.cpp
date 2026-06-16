@@ -9352,7 +9352,14 @@ MethodStatus CanEnterPortableBaselineInterpreter(JSContext* cx,
       return MethodStatus::Method_CantCompile;
     }
   }
-  if (state.script()->getWarmUpCount() <=
+  // `<` not `<=` so a hot function tiers up to PBL one invocation sooner (marginal).
+  // NOTE (measured): do NOT chase the ~13% of JS self-time spent in js::Interpret by
+  // setting portableBaselineInterpreterWarmUpThreshold to 0 to force first-call PBL.
+  // That work is COLD / once-called code (e.g. a top-level loop body), and PBL is
+  // *slower* than the plain C++ interpreter for it (per-script JitScript + IC setup
+  // isn't amortized): forcing threshold 0 regressed a JS microbench 5321 -> 5956 ms.
+  // The default threshold (10) is correctly tuned; js::Interpret here is the fast tier.
+  if (state.script()->getWarmUpCount() <
       JitOptions.portableBaselineInterpreterWarmUpThreshold) {
     return MethodStatus::Method_Skipped;
   }

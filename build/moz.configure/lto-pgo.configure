@@ -418,6 +418,9 @@ def lto(
         ldflags.append("-mllvm:-import-instr-limit=10")
     elif target.kernel == "Darwin":
         ldflags.append("-Wl,-mllvm,-import-instr-limit=10")
+    elif target.os == "EMSCRIPTEN":
+        # wasm-ld rejects -plugin-opt=; pass the LTO tuning via -mllvm instead.
+        ldflags.append("-Wl,-mllvm,-import-instr-limit=10")
     elif c_compiler.type == "clang":
         ldflags.append("-Wl,-plugin-opt=-import-instr-limit=10")
 
@@ -431,6 +434,8 @@ def lto(
             if c_compiler.version >= "12.0.0":
                 ldflags.append("-mllvm:-import-hot-multiplier=30")
         elif target.kernel == "Darwin":
+            ldflags.append("-Wl,-mllvm,-import-hot-multiplier=30")
+        elif target.os == "EMSCRIPTEN":
             ldflags.append("-Wl,-mllvm,-import-hot-multiplier=30")
         else:
             if c_compiler.version < "13.0.0":

@@ -143,7 +143,14 @@ static ssize_t (*pt_aix_sendfile_fptr)() = NULL;
 #  endif   /* AIX */
 
 #  ifdef LINUX
-#    include <sys/sendfile.h>
+#    ifdef __EMSCRIPTEN__
+/* emscripten trims <sys/sendfile.h> from its musl sysroot but its libc still
+ * provides sendfile(); declare it ourselves. */
+#      include <sys/types.h>
+extern ssize_t sendfile(int, int, off_t*, size_t);
+#    else
+#      include <sys/sendfile.h>
+#    endif
 #  endif
 
 #  include "primpl.h"

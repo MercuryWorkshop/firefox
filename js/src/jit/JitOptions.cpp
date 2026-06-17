@@ -144,7 +144,7 @@ DefaultJitOptions::DefaultJitOptions() {
 
 #ifdef ENABLE_PORTABLE_BASELINE_INTERP_FORCE
   SET_DEFAULT(portableBaselineInterpreter, true);
-  SET_DEFAULT(portableBaselineInterpreterWarmUpThreshold, 0);
+  SET_DEFAULT(portableBaselineInterpreterWarmUpThreshold, 100);
 #endif
 
   // emitInterpreterEntryTrampoline and enableICFramePointers are used in
@@ -213,7 +213,7 @@ DefaultJitOptions::DefaultJitOptions() {
 #ifdef ENABLE_PORTABLE_BASELINE_INTERP
   // How many invocations are needed before functions enter the
   // Portable Baseline Interpreter.
-  SET_DEFAULT(portableBaselineInterpreterWarmUpThreshold, 10);
+  SET_DEFAULT(portableBaselineInterpreterWarmUpThreshold, 100);
 #endif
 
   // How many invocations or loop iterations are needed before functions

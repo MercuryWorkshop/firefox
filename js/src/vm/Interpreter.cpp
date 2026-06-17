@@ -409,8 +409,9 @@ static void AssertExceptionResult(JSContext* cx) {
 namespace js {
 namespace wasm {
 extern bool WasmJitObserveCall(JSScript* script);
-extern bool WasmJitRunCall(JSScript* script, const JS::Value* argv,
-                           uint32_t argc, uint64_t* retBits);
+extern int WasmJitRunCall(JSScript* script, uint64_t thisBits,
+                          const JS::Value* argv, uint32_t argc,
+                          uint64_t* retBits);
 }  // namespace wasm
 }  // namespace js
 #endif
@@ -3274,11 +3275,13 @@ bool MOZ_NEVER_INLINE JS_HAZ_JSNATIVE_CALLER js::Interpret(JSContext* cx,
         // Warmup-gate: only hot scripts pay for the (cross-TU) observe/compile
         // machinery -- the millions of cold/non-loop calls on a real page just do
         // this cheap inline counter check and fall through.
-        if (wjScript->getWarmUpCount() >= 10 &&
+        if (wjScript->getWarmUpCount() >= 100 &&
             js::wasm::WasmJitObserveCall(wjScript)) {
           uint64_t wbits;
-          if (js::wasm::WasmJitRunCall(wjScript, args.array(), args.length(),
-                                       &wbits)) {
+          int wjr = js::wasm::WasmJitRunCall(wjScript, args.thisv().asRawBits(),
+                                             args.array(), args.length(), &wbits);
+          if (wjr == 2) goto error;  // Mode VS helper threw: propagate
+          if (wjr == 1) {
             args.rval().set(Value::fromRawBits(wbits));
             REGS.sp = args.spAfterCall();
             ADVANCE_AND_DISPATCH(JSOpLength_Call);

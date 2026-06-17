@@ -75,8 +75,9 @@ namespace wasm {
 // caller then misses the PBL fast path so the call goes through the IC). RunCall
 // runs that wasm version from the IC when the args are numbers.
 extern bool WasmJitObserveCall(JSScript* script);
-extern bool WasmJitRunCall(JSScript* script, const JS::Value* args,
-                           uint32_t argc, uint64_t* retBits);
+extern int WasmJitRunCall(JSScript* script, uint64_t thisBits,
+                          const JS::Value* args, uint32_t argc,
+                          uint64_t* retBits);
 }  // namespace wasm
 }  // namespace js
 #endif
@@ -2424,8 +2425,15 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
             // JS->wasm JIT: if this callee was lowered to wasm and the args are
             // numbers, run the host-JITed wasm instead of recursing into PBL.
             uint64_t wbits;
-            if (!flags.isConstructing() &&
-                js::wasm::WasmJitRunCall(script, args + 1, argc, &wbits)) {
+            int wjr = flags.isConstructing()
+                          ? 0
+                          : js::wasm::WasmJitRunCall(script, args[0].asRawBits(),
+                                                     args + 1, argc, &wbits);
+            if (wjr == 2) {  // Mode VS helper threw: propagate, do not re-run
+              ctx.error = PBIResult::Error;
+              return IC_ERROR_SENTINEL();
+            }
+            if (wjr == 1) {
               retValue = wbits;
             } else
 #endif
@@ -7824,7 +7832,7 @@ PBIResult PortableBaselineInterpret(
             // JS->wasm JIT: count this call; once the callee is hot and has been
             // lowered to wasm, miss the fast path so the call routes through the
             // IC (CallScriptedFunction), where the host-JITed wasm version runs.
-            if (!constructing && calleeScript->getWarmUpCount() >= 10 &&
+            if (!constructing && calleeScript->getWarmUpCount() >= 100 &&
                 js::wasm::WasmJitObserveCall(calleeScript.get())) {
               TRACE_PRINTF("missed fastpath: routed to wasm-jit via IC\n");
               break;

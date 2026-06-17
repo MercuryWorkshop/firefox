@@ -106,7 +106,7 @@ vec4 pattern_fragment(vec4 color) {
         repeated_uv.y = v_uv_bounds.w;
     }
 
-    vec4 texel = TEX_SAMPLE(sColor0, repeated_uv);
+    vec4 texel = swizzleColor0(TEX_SAMPLE(sColor0, repeated_uv));
 
     return color * texel;
 }

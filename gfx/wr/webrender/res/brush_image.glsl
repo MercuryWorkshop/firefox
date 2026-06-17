@@ -364,7 +364,7 @@ Fragment brush_fs() {
     // Clamp the uvs to avoid sampling artifacts.
     vec2 uv = clamp(repeated_uv, v_uv_sample_bounds.xy, v_uv_sample_bounds.zw);
 
-    vec4 texel = TEX_SAMPLE(sColor0, uv);
+    vec4 texel = swizzleColor0(TEX_SAMPLE(sColor0, uv));
 
     Fragment frag;
 

@@ -44,7 +44,7 @@ void vs_init_sample_color0(vec2 sample_pos, RectWithEndpoint uv_rect) {
 /// The vertex shader must have called vs_init_sample_color0
 vec4 fs_sample_color0() {
     vec2 uv = clamp(v_uv0, v_uv0_sample_bounds.xy, v_uv0_sample_bounds.zw);
-    vec4 texel = TEX_SAMPLE(sColor0, uv);
+    vec4 texel = swizzleColor0(TEX_SAMPLE(sColor0, uv));
 
     return texel;
 }

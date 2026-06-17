@@ -226,6 +226,19 @@ uniform __samplerExternal2DY2YEXT sColor1;
 uniform __samplerExternal2DY2YEXT sColor2;
 #endif
 
+#ifdef WR_FRAGMENT_SHADER
+// WebGL2 (emscripten) removed GL_TEXTURE_SWIZZLE, so BGRA8 image data uploaded into
+// RGBA8 textures samples with R/B swapped. The device (Device::bind_texture) sets
+// uColor0Swizzle=1 per draw when the sColor0 binding's swizzle is Bgra (uploaded
+// images) and 0 otherwise (render targets; and always 0 on platforms that have real
+// texture swizzle, where it stays at the GL default). swizzleColor0() must wrap every
+// color sample of sColor0; it is a no-op unless the swizzle is set.
+uniform int uColor0Swizzle;
+vec4 swizzleColor0(vec4 c) {
+    return uColor0Swizzle == 1 ? c.bgra : c;
+}
+#endif
+
 //======================================================================================
 // Interpolator definitions
 //======================================================================================

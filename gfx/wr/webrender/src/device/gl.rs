@@ -641,6 +641,9 @@ pub struct Program {
     id: gl::GLuint,
     u_transform: gl::GLint,
     u_texture_size: gl::GLint,
+    // emscripten/WebGL2 only: location of uColor0Swizzle (sColor0 R<->B swap; -1 if
+    // the shader doesn't sample images). See Device::bind_texture.
+    u_color0_swizzle: gl::GLint,
     source_info: ProgramSourceInfo,
     is_initialized: bool,
 }
@@ -1160,6 +1163,9 @@ pub struct Device {
     // device state
     bound_textures: [gl::GLuint; 16],
     bound_program: gl::GLuint,
+    // emscripten/WebGL2 only: uColor0Swizzle location of the currently bound program
+    // (-1 if absent), cached so bind_texture can set it without the Program handle.
+    bound_program_color0_swizzle_loc: gl::GLint,
     bound_program_name: Rc<std::ffi::CString>,
     bound_vao: gl::GLuint,
     bound_read_fbo: (FBOId, DeviceIntPoint),
@@ -1741,12 +1747,22 @@ impl Device {
             // during upload so we must use RGBA textures and pretend BGRA data is RGBA when
             // uploading. Images may be rendered incorrectly as a result.
             gl::GlType::Gles => {
-                warn!("Neither BGRA or texture swizzling are supported. Images may be rendered incorrectly.");
+                // On emscripten/WebGL2 there is no GL_TEXTURE_SWIZZLE and no BGRA
+                // upload, but we still want BGRA8 images to be tagged Swizzle::Bgra
+                // so the shaders can swap R<->B when sampling sColor0 (the GL swizzle
+                // in bind_texture_impl is gated on supports_texture_swizzle, which is
+                // false here, so nothing is emitted to GL). See uColor0Swizzle.
+                let bgra8_swizzle = if cfg!(target_os = "emscripten") {
+                    Swizzle::Bgra
+                } else {
+                    warn!("Neither BGRA or texture swizzling are supported. Images may be rendered incorrectly.");
+                    Swizzle::Rgba
+                };
                 (
                     TextureFormatPair::from(ImageFormat::RGBA8),
                     TextureFormatPair { internal: gl::RGBA8, external: gl::RGBA },
                     gl::UNSIGNED_BYTE,
-                    Swizzle::Rgba,
+                    bgra8_swizzle,
                     TexStorageUsage::Always,
                 )
             }
@@ -2047,6 +2063,7 @@ impl Device {
 
             bound_textures: [0; 16],
             bound_program: 0,
+            bound_program_color0_swizzle_loc: -1,
             bound_program_name: Rc::new(std::ffi::CString::new("").unwrap()),
             bound_vao: 0,
             bound_read_fbo: (FBOId(0), DeviceIntPoint::zero()),
@@ -2135,7 +2152,13 @@ impl Device {
     }
 
     pub fn swizzle_settings(&self) -> Option<SwizzleSettings> {
-        if self.capabilities.supports_texture_swizzle {
+        // On emscripten/WebGL2 there is no GL texture swizzle, but we still report
+        // swizzle settings so BGRA8 images are tagged Swizzle::Bgra (texture_cache).
+        // bind_texture_impl skips the actual GL swizzle (supports_texture_swizzle is
+        // false), and the shader (swizzleColor0 / uColor0Swizzle, set per-bind in
+        // bind_texture) performs the R<->B swap instead. Uploads stay BGRA-in-RGBA
+        // (use_upload_format=false), matching the desktop swizzle path.
+        if self.capabilities.supports_texture_swizzle || cfg!(target_os = "emscripten") {
             Some(self.swizzle_settings)
         } else {
             None
@@ -2375,13 +2398,27 @@ impl Device {
     where
         S: Into<TextureSlot>,
     {
+        let slot = slot.into();
+        let slot_index = slot.0;
         let old_swizzle = texture.active_swizzle.replace(swizzle);
         let set_swizzle = if old_swizzle != swizzle {
             Some(swizzle)
         } else {
             None
         };
-        self.bind_texture_impl(slot.into(), texture.id, texture.target, set_swizzle, None);
+        self.bind_texture_impl(slot, texture.id, texture.target, set_swizzle, None);
+        // WebGL2 has no GL_TEXTURE_SWIZZLE, so for the Color0 sampler we drive the
+        // R<->B swap of BGRA8 image data in the shader (swizzleColor0 / uColor0Swizzle)
+        // instead. Set it every Color0 bind (the bound program may differ from the
+        // last Color0 bind even when the texture is unchanged). Cheap no-op when the
+        // bound program has no such uniform (loc == -1).
+        #[cfg(target_os = "emscripten")]
+        {
+            if slot_index == 0 && self.bound_program_color0_swizzle_loc >= 0 {
+                let v = if swizzle == Swizzle::Bgra { 1 } else { 0 };
+                self.gl.uniform_1i(self.bound_program_color0_swizzle_loc, v);
+            }
+        }
     }
 
     pub fn bind_external_texture<S>(&mut self, slot: S, external_texture: &ExternalTexture)
@@ -2684,6 +2721,7 @@ impl Device {
         program.is_initialized = true;
         program.u_transform = self.gl.get_uniform_location(program.id, "uTransform");
         program.u_texture_size = self.gl.get_uniform_location(program.id, "uTextureSize");
+        program.u_color0_swizzle = self.gl.get_uniform_location(program.id, "uColor0Swizzle");
 
         Ok(())
     }
@@ -2704,6 +2742,10 @@ impl Device {
             self.bound_program = program.id;
             self.bound_program_name = program.source_info.full_name_cstr.clone();
         }
+        // Cache for bind_texture (emscripten sColor0 R<->B shader swizzle). Updated
+        // unconditionally: even if the GL program id is unchanged, the cached value
+        // must match the program we were asked to bind.
+        self.bound_program_color0_swizzle_loc = program.u_color0_swizzle;
         true
     }
 
@@ -3193,6 +3235,7 @@ impl Device {
             id: pid,
             u_transform: 0,
             u_texture_size: 0,
+            u_color0_swizzle: -1,
             source_info,
             is_initialized: false,
         };

@@ -2425,11 +2425,44 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
             // on the actual recursion path keeps the stack consistent during the
             // wasm re-entry. (Was: pushed unconditionally -> deltablue crash when
             // call-heavy fns recompiled to Mode VS built deep re-entrant chains.)
+            //
+            // ALSO CRITICAL: a Mode VS wasm callee can re-enter gecko (wjhelp ->
+            // JS::Call / a getter) which spins up a NEW PortableBaselineInterpret
+            // whose Stack starts at portableBaselineStack().top and which a GC will
+            // frame-walk. Establish a CallNative-style exit frame around the wasm
+            // call (exactly like the isNative path above) so: (a) top points BELOW
+            // the live frame -> re-entrant interpreter doesn't overwrite it, and
+            // (b) the JIT exit-frame chain is consistent for TraceJitFrames. Fully
+            // save/restore so both wjr paths (use-result / fall-to-recursion) see a
+            // pristine stack. The descriptor+exit-frame pair is what keeps this from
+            // being the orphan BaselineStub frame that the old code crashed on.
             uint64_t wbits;
-            int wjr = flags.isConstructing()
-                          ? 0
-                          : js::wasm::WasmJitRunCall(script, args[0].asRawBits(),
-                                                     args + 1, argc, &wbits);
+            int wjr;
+            if (flags.isConstructing()) {
+              wjr = 0;
+            } else {
+              StackVal* savedFP = ctx.stack.fp;
+              void* savedTop = cx.getCx()->portableBaselineStack().top;
+              uint8_t* savedExitFP =
+                  cx.getCx()->activation()->asJit()->jsExitFP();
+              PUSHNATIVE(StackValNative(argc));
+              PUSHNATIVE(
+                  StackValNative(MakeFrameDescriptor(FrameType::BaselineStub)));
+              PUSHNATIVE(StackValNative(nullptr));  // fake return address
+              PUSHNATIVE(StackValNative(savedFP));
+              ctx.stack.fp = sp;
+              PUSHNATIVE(StackValNative(uint32_t(ExitFrameType::CallNative)));
+              cx.getCx()->activation()->asJit()->setJSExitFP(
+                  reinterpret_cast<uint8_t*>(ctx.stack.fp));
+              cx.getCx()->portableBaselineStack().top =
+                  reinterpret_cast<void*>(sp);
+              wjr = js::wasm::WasmJitRunCall(script, args[0].asRawBits(),
+                                             args + 1, argc, &wbits);
+              ctx.stack.fp = savedFP;
+              cx.getCx()->portableBaselineStack().top = savedTop;
+              cx.getCx()->activation()->asJit()->setJSExitFP(savedExitFP);
+              POPNNATIVE(5);
+            }
             if (wjr == 2) {  // Mode VS helper threw: propagate, do not re-run
               ctx.error = PBIResult::Error;
               return IC_ERROR_SENTINEL();

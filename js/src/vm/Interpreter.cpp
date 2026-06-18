@@ -411,7 +411,7 @@ namespace wasm {
 extern bool WasmJitObserveCall(JSScript* script);
 extern int WasmJitRunCall(JSScript* script, uint64_t thisBits,
                           const JS::Value* argv, uint32_t argc,
-                          uint64_t* retBits);
+                          JSObject* envChain, uint64_t* retBits);
 }  // namespace wasm
 }  // namespace js
 #endif
@@ -2032,6 +2032,16 @@ bool MOZ_NEVER_INLINE JS_HAZ_JSNATIVE_CALLER js::Interpret(JSContext* cx,
     CASE(LoopHead) {
       COUNT_COVERAGE();
 
+#if defined(__EMSCRIPTEN__)
+      // JS->wasm JIT: with the native baseline interpreter disabled, the block below
+      // never runs, so loop back-edges never bump warm-up -- leaving hot OUTER-LOOP
+      // functions (richards Scheduler.schedule: called few times, loops heavily) stuck
+      // in the interpreter, never observed for wasm compilation. Count them here.
+      if (!jit::IsBaselineInterpreterEnabled()) {
+        script->incWarmUpCounter();
+      }
+#endif
+
       // Attempt on-stack replacement into the Baseline Interpreter.
       if (jit::IsBaselineInterpreterEnabled()) {
         script->incWarmUpCounter();
@@ -3274,12 +3284,16 @@ bool MOZ_NEVER_INLINE JS_HAZ_JSNATIVE_CALLER js::Interpret(JSContext* cx,
         JSScript* wjScript = maybeFun->baseScript()->asJSScript();
         // Warmup-gate: only hot scripts pay for the (cross-TU) observe/compile
         // machinery -- the millions of cold/non-loop calls on a real page just do
-        // this cheap inline counter check and fall through.
-        if (wjScript->getWarmUpCount() >= 100 &&
+        // this cheap inline counter check and fall through. Threshold 100->10 to
+        // match PBL: a hot OUTER-LOOP function (richards Scheduler.schedule) is called
+        // few times but loops heavily; combined with LoopHead warm-up counting below,
+        // it now accumulates enough warm-up to be observed for compilation.
+        if (wjScript->getWarmUpCount() >= 10 &&
             js::wasm::WasmJitObserveCall(wjScript)) {
           uint64_t wbits;
           int wjr = js::wasm::WasmJitRunCall(wjScript, args.thisv().asRawBits(),
-                                             args.array(), args.length(), &wbits);
+                                             args.array(), args.length(),
+                                             maybeFun->environment(), &wbits);
           if (wjr == 2) goto error;  // Mode VS helper threw: propagate
           if (wjr == 1) {
             args.rval().set(Value::fromRawBits(wbits));

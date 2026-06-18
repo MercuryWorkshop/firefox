@@ -77,7 +77,7 @@ namespace wasm {
 extern bool WasmJitObserveCall(JSScript* script);
 extern int WasmJitRunCall(JSScript* script, uint64_t thisBits,
                           const JS::Value* args, uint32_t argc,
-                          uint64_t* retBits);
+                          JSObject* envChain, uint64_t* retBits);
 }  // namespace wasm
 }  // namespace js
 #endif
@@ -2457,7 +2457,8 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
               cx.getCx()->portableBaselineStack().top =
                   reinterpret_cast<void*>(sp);
               wjr = js::wasm::WasmJitRunCall(script, args[0].asRawBits(),
-                                             args + 1, argc, &wbits);
+                                             args + 1, argc,
+                                             callee->environment(), &wbits);
               ctx.stack.fp = savedFP;
               cx.getCx()->portableBaselineStack().top = savedTop;
               cx.getCx()->activation()->asJit()->setJSExitFP(savedExitFP);
@@ -7873,7 +7874,11 @@ PBIResult PortableBaselineInterpret(
             // JS->wasm JIT: count this call; once the callee is hot and has been
             // lowered to wasm, miss the fast path so the call routes through the
             // IC (CallScriptedFunction), where the host-JITed wasm version runs.
-            if (!constructing && calleeScript->getWarmUpCount() >= 100 &&
+            // Threshold lowered 100->10: a hot OUTER-LOOP function (e.g. richards
+            // Scheduler.schedule) is only CALLED a few times -- it loops internally --
+            // so a high call-count gate never observes it, leaving the hottest function
+            // in the interpreter while its frequently-called callees get compiled.
+            if (!constructing && calleeScript->getWarmUpCount() >= 10 &&
                 js::wasm::WasmJitObserveCall(calleeScript.get())) {
               TRACE_PRINTF("missed fastpath: routed to wasm-jit via IC\n");
               break;
@@ -8338,6 +8343,13 @@ PBIResult PortableBaselineInterpret(
             GOTO_ERROR();
           }
         }
+#endif
+#if defined(__EMSCRIPTEN__)
+        // JS->wasm JIT: count loop back-edges toward warm-up so a hot OUTER-LOOP
+        // function (e.g. richards Scheduler.schedule, called few times but looping
+        // heavily) accumulates warm-up and gets observed for compilation -- otherwise a
+        // call-count-only gate leaves the hottest function stuck in the interpreter.
+        frame->script()->incWarmUpCounter();
 #endif
         COUNT_COVERAGE_PC(pc);
         END_OP(LoopHead);

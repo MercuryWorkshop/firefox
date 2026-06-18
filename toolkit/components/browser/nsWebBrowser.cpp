@@ -108,11 +108,13 @@ nsresult nsWebBrowser::Create(nsIWebBrowserChrome* aContainerWindow,
   uint64_t outerWindowId =
       aInitialWindowChild ? aInitialWindowChild->OuterWindowId() : 0;
 
+  fprintf(stderr, "ZZSPIN: nsWebBrowser::Create entry, calling nsDocShell::Create\n"); fflush(stderr);
   RefPtr<nsDocShell> docShell =
       nsDocShell::Create(aBrowsingContext, outerWindowId);
   if (NS_WARN_IF(!docShell)) {
     return NS_ERROR_FAILURE;
   }
+  fprintf(stderr, "ZZSPIN: nsDocShell::Create returned\n"); fflush(stderr);
   browser->SetDocShell(docShell);
   MOZ_ASSERT(browser->mDocShell == docShell);
 
@@ -138,8 +140,10 @@ nsresult nsWebBrowser::Create(nsIWebBrowserChrome* aContainerWindow,
   // events from subframes. To solve that we install our own chrome event
   // handler that always gets called (even for subframes) for any bubbling
   // event.
+  fprintf(stderr, "ZZSPIN: calling docShell->InitWindow\n"); fflush(stderr);
   MOZ_TRY(docShell->InitWindow(docShellParentWidget, 0, 0, 0, 0,
                                aOpenWindowInfo, aInitialWindowChild));
+  fprintf(stderr, "ZZSPIN: InitWindow returned, AddToWatcher\n"); fflush(stderr);
 
   docShellTreeOwner->AddToWatcher();  // evil twin of Remove in SetDocShell(0)
   docShellTreeOwner->AddChromeListeners();

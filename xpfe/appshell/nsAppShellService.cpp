@@ -409,6 +409,7 @@ nsAppShellService::CreateWindowlessBrowser(bool aIsChrome, uint32_t aChromeMask,
                 : BrowsingContext::Type::Content,
       true);
 
+  fprintf(stderr, "ZZSPIN: CreateIndependent returned\n"); fflush(stderr);
   if (aChromeMask & nsIWebBrowserChrome::CHROME_REMOTE_WINDOW) {
     browsingContext->SetRemoteTabs(true);
   }
@@ -431,10 +432,12 @@ nsAppShellService::CreateWindowlessBrowser(bool aIsChrome, uint32_t aChromeMask,
   /* Next, we create an instance of nsWebBrowser. Instances of this class have
    * an associated doc shell, which is what we're interested in.
    */
+  fprintf(stderr, "ZZSPIN: NullPrincipal+openWindowInfo done, calling nsWebBrowser::Create\n"); fflush(stderr);
   RefPtr<nsWebBrowser> browser;
   MOZ_TRY(nsWebBrowser::Create(stub, widget, browsingContext,
                                nullptr /* initialWindowChild */, openWindowInfo,
                                getter_AddRefs(browser)));
+  fprintf(stderr, "ZZSPIN: nsWebBrowser::Create returned\n"); fflush(stderr);
 
   if (NS_WARN_IF(!browser)) {
     NS_ERROR("Couldn't create instance of nsWebBrowser!");

@@ -8,6 +8,19 @@
 #include "base/message_loop.h"
 #include "base/scoped_nsautorelease_pool.h"
 
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+// Single-OS-thread cooperative (JSPI fiber) build: this base::Thread Run loop runs on a
+// fiber, and event_.Wait() is its ONLY cooperative yield point. When work is posted
+// continuously (e.g. an IPC/necko task that re-posts under load) did_work stays true and
+// the loop spins via "continue" without ever reaching Wait(), so no other fiber -- not even
+// the one that would end the re-post cycle -- can run, and the single thread livelocks.
+// Yield cooperatively on the did_work path so the scheduler can run other fibers.
+#  include <sched.h>
+#  define STJ_COOP_YIELD() sched_yield()
+#else
+#  define STJ_COOP_YIELD() ((void)0)
+#endif
+
 #include "mozilla/BackgroundHangMonitor.h"
 #include "mozilla/ProfilerLabels.h"
 #include "mozilla/ProfilerThreadSleep.h"
@@ -38,13 +51,19 @@ void MessagePumpDefault::Run(Delegate* delegate) {
     did_work |= delegate->DoDelayedWork(&delayed_work_time_);
     if (!keep_running_) break;
 
-    if (did_work) continue;
+    if (did_work) {
+      STJ_COOP_YIELD();
+      continue;
+    }
 
     hangMonitor.NotifyActivity();
     did_work = delegate->DoIdleWork();
     if (!keep_running_) break;
 
-    if (did_work) continue;
+    if (did_work) {
+      STJ_COOP_YIELD();
+      continue;
+    }
 
     if (delayed_work_time_.is_null()) {
       hangMonitor.NotifyWait();

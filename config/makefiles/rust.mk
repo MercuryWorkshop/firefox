@@ -93,10 +93,16 @@ endif
 #   cargo_build_flags += -Zbuild-std=std,panic_abort
 #   export RUSTC_BOOTSTRAP := 1
 #   RUSTFLAGS += -Ctarget-feature=+atomics,+bulk-memory,+mutable-globals
+# gecko-wasm: GECKO_ST=1 is the experimental single-threaded build (no -pthread).
+# It keeps the PREBUILT single-threaded wasm32-emscripten std and must NOT request
+# +atomics (atomics imply shared memory / a threaded link). The atomics build-std
+# path below is only for the normal threaded build.
 ifneq (,$(findstring emscripten,$(RUST_TARGET)))
+ifneq ($(GECKO_ST),1)
 cargo_build_flags += -Zbuild-std=std,panic_abort
 export RUSTC_BOOTSTRAP := 1
 RUSTFLAGS += -Ctarget-feature=+atomics,+bulk-memory,+mutable-globals
+endif
 endif
 
 rustflags_sancov =

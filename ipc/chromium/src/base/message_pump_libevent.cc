@@ -19,6 +19,16 @@
 #include "mozilla/ProfilerThreadSleep.h"
 #include "mozilla/UniquePtr.h"
 
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+// Single-OS-thread cooperative (JSPI fiber) build: yield cooperatively on the did_work
+// path so a continuously-fed Run loop doesn't monopolize the one thread. See the same
+// note in message_pump_default.cc.
+#  include <sched.h>
+#  define STJ_COOP_YIELD() sched_yield()
+#else
+#  define STJ_COOP_YIELD() ((void)0)
+#endif
+
 // This macro checks that the _EVENT_SIZEOF_* constants defined in
 // ipc/chromiume/src/third_party/<platform>/event2/event-config.h are correct.
 #if defined(_EVENT_SIZEOF_SHORT)
@@ -276,12 +286,18 @@ void MessagePumpLibevent::Run(Delegate* delegate) {
     did_work |= delegate->DoDelayedWork(&delayed_work_time_);
     if (!keep_running_) break;
 
-    if (did_work) continue;
+    if (did_work) {
+      STJ_COOP_YIELD();
+      continue;
+    }
 
     did_work = delegate->DoIdleWork();
     if (!keep_running_) break;
 
-    if (did_work) continue;
+    if (did_work) {
+      STJ_COOP_YIELD();
+      continue;
+    }
 
     // EVLOOP_ONCE tells libevent to only block once,
     // but to service all pending events when it wakes up.
@@ -322,7 +338,9 @@ void MessagePumpLibevent::Quit() {
 void MessagePumpLibevent::ScheduleWork() {
   // Tell libevent (in a threadsafe way) that it should break out of its loop.
   char buf = 0;
+  fprintf(stderr, "ZZSPIN: ScheduleWork pre write(wakeup_pipe_in_=%d)\n", wakeup_pipe_in_); fflush(stderr);
   int nwrite = HANDLE_EINTR(write(wakeup_pipe_in_, &buf, 1));
+  fprintf(stderr, "ZZSPIN: ScheduleWork write -> nwrite=%d errno=%d\n", nwrite, errno); fflush(stderr);
   DCHECK(nwrite == 1 || errno == EAGAIN)
       << "[nwrite:" << nwrite << "] [errno:" << errno << "]";
 }

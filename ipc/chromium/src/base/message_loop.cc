@@ -154,12 +154,15 @@ MessageLoop::EventTarget::Dispatch(already_AddRefed<nsIRunnable> aEvent,
   mozilla::MaybeLeakRefPtr<nsIRunnable> event(std::move(aEvent),
                                               aFlags & NS_DISPATCH_FALLIBLE);
 
+  fprintf(stderr, "ZZSPIN: EventTarget::Dispatch pre mMutex lock\n"); fflush(stderr);
   mozilla::MutexAutoLock lock(mMutex);
+  fprintf(stderr, "ZZSPIN: EventTarget::Dispatch got mMutex, mLoop=%p\n", (void*)mLoop); fflush(stderr);
   if (!mLoop) {
     return NS_ERROR_NOT_INITIALIZED;
   }
 
   mLoop->PostTask(event.forget());
+  fprintf(stderr, "ZZSPIN: EventTarget::Dispatch PostTask returned\n"); fflush(stderr);
   return NS_OK;
 }
 
@@ -419,6 +422,7 @@ void MessageLoop::PostIdleTask(already_AddRefed<nsIRunnable> task) {
 // Possibly called on a background thread!
 void MessageLoop::PostTask_Helper(already_AddRefed<nsIRunnable> task,
                                   int delay_ms) {
+  fprintf(stderr, "ZZSPIN: PostTask_Helper entry, GetXPCOMThread=%p\n", (void*)pump_->GetXPCOMThread()); fflush(stderr);
   if (nsISerialEventTarget* target = pump_->GetXPCOMThread()) {
     nsresult rv;
     if (delay_ms) {
@@ -448,11 +452,13 @@ void MessageLoop::PostTask_Helper(already_AddRefed<nsIRunnable> task,
 
   RefPtr<base::MessagePump> pump;
   {
+    fprintf(stderr, "ZZSPIN: PostTask_Helper pre incoming_queue_lock_\n"); fflush(stderr);
     mozilla::MutexAutoLock locked(incoming_queue_lock_);
     mozilla::LogRunnable::LogDispatch(pending_task.task.get());
     incoming_queue_.push(std::move(pending_task));
     pump = pump_;
   }
+  fprintf(stderr, "ZZSPIN: PostTask_Helper pushed, pre ScheduleWork\n"); fflush(stderr);
   // Since the incoming_queue_ may contain a task that destroys this message
   // loop, we cannot exit incoming_queue_lock_ until we are done with |this|.
   // We use a stack-based reference to the message pump so that we can call

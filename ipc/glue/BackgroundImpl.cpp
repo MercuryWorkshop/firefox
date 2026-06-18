@@ -449,25 +449,30 @@ class ChildImpl final : public BackgroundChildImpl {
         return nullptr;
       }
 
+      fprintf(stderr, "ZZSPIN: GOCFCT got starter, pre CreateEndpoints\n"); fflush(stderr);
       Endpoint<PBackgroundParent> parent;
       Endpoint<PBackgroundChild> child;
       nsresult rv;
       rv = PBackground::CreateEndpoints(starter->mOtherProcInfo,
                                         EndpointProcInfo::Current(), &parent,
                                         &child);
+      fprintf(stderr, "ZZSPIN: CreateEndpoints rv=0x%x\n", (unsigned)rv); fflush(stderr);
       if (NS_FAILED(rv)) {
         NS_WARNING("Failed to create top level actor!");
         return nullptr;
       }
 
       RefPtr strongActor = MakeRefPtr<ChildImpl>();
+      fprintf(stderr, "ZZSPIN: pre child.Bind\n"); fflush(stderr);
       if (!child.Bind(strongActor)) {
         CRASH_IN_CHILD_PROCESS("Failed to bind ChildImpl!");
         return nullptr;
       }
+      fprintf(stderr, "ZZSPIN: child.Bind done\n"); fflush(stderr);
       strongActor->SetActorAlive();
       threadLocalInfo->mActor = strongActor.forget();
 
+      fprintf(stderr, "ZZSPIN: pre starter->mTaskQueue->Dispatch(SendInitBackground)\n"); fflush(stderr);
       // Dispatch to the background task queue to create the relevant actor in
       // the remote process.
       starter->mTaskQueue->Dispatch(NS_NewRunnableFunction(
@@ -477,6 +482,7 @@ class ChildImpl final : public BackgroundChildImpl {
               NS_WARNING("Failed to create toplevel actor");
             }
           }));
+      fprintf(stderr, "ZZSPIN: GOCFCT Dispatch done, returning actor\n"); fflush(stderr);
       return threadLocalInfo->mActor;
     }
 

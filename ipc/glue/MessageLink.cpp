@@ -69,7 +69,9 @@ PortLink::PortLink(MessageChannel* aChan, ScopedPort aPort)
   mChan->mMonitor->AssertCurrentThreadOwns();
 
   mObserver = new PortObserverThunk(mChan->mMonitor, this);
+  fprintf(stderr, "ZZSPIN: PortLink pre SetPortObserver\n"); fflush(stderr);
   mNode->SetPortObserver(mPort, mObserver);
+  fprintf(stderr, "ZZSPIN: PortLink SetPortObserver done, pre dispatch openRunnable\n"); fflush(stderr);
 
   // Dispatch an event to the IO loop to trigger an initial
   // `OnPortStatusChanged` to deliver any pending messages. This needs to be run
@@ -78,11 +80,15 @@ PortLink::PortLink(MessageChannel* aChan, ScopedPort aPort)
   // `MessageChannel`.
   nsCOMPtr<nsIRunnable> openRunnable = NewRunnableMethod(
       "PortLink::Open", mObserver, &PortObserverThunk::OnPortStatusChanged);
+  fprintf(stderr, "ZZSPIN: PortLink sameThread=%d pre Dispatch openRunnable\n", (int)aChan->mIsSameThreadChannel); fflush(stderr);
   if (aChan->mIsSameThreadChannel) {
     aChan->mWorkerThread->Dispatch(openRunnable.forget());
   } else {
-    XRE_GetAsyncIOEventTarget()->Dispatch(openRunnable.forget());
+    nsISerialEventTarget* zztgt = XRE_GetAsyncIOEventTarget();
+    fprintf(stderr, "ZZSPIN: asyncIOTarget=%p, dispatching\n", (void*)zztgt); fflush(stderr);
+    zztgt->Dispatch(openRunnable.forget());
   }
+  fprintf(stderr, "ZZSPIN: PortLink openRunnable dispatched\n"); fflush(stderr);
 }
 
 PortLink::~PortLink() {

@@ -618,6 +618,7 @@ bool MessageChannel::Open(ScopedPort aPort, Side aSide,
   }
   MOZ_RELEASE_ASSERT(NS_SUCCEEDED(rv),
                      "error registering ShutdownTask for MessageChannel");
+  fprintf(stderr, "ZZSPIN: MC::Open RegisterShutdownTask done, pre lock+PortLink\n"); fflush(stderr);
 
   {
     MonitorAutoLock lock(*mMonitor);
@@ -628,10 +629,13 @@ bool MessageChannel::Open(ScopedPort aPort, Side aSide,
     mMessageChannelId = aMessageChannelId;
     mWorkerThread = std::move(eventTarget);
     mShutdownTask = shutdownTask;
+    fprintf(stderr, "ZZSPIN: MC::Open pre MakeUnique<PortLink>\n"); fflush(stderr);
     mLink = MakeUnique<PortLink>(this, std::move(aPort));
+    fprintf(stderr, "ZZSPIN: MC::Open PortLink created\n"); fflush(stderr);
     mChannelState = ChannelConnected;
     mSide = aSide;
   }
+  fprintf(stderr, "ZZSPIN: MC::Open pre mListener->OnIPCChannelOpened\n"); fflush(stderr);
 
   // Notify our listener that the underlying IPC channel has been established.
   // IProtocol will use this callback to create the ActorLifecycleProxy, and
@@ -644,6 +648,7 @@ bool MessageChannel::Open(ScopedPort aPort, Side aSide,
   // the worker thread or have notified our listener until after this function
   // returns.
   mListener->OnIPCChannelOpened();
+  fprintf(stderr, "ZZSPIN: MC::Open OnIPCChannelOpened done, returning\n"); fflush(stderr);
   return true;
 }
 

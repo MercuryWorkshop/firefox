@@ -43,8 +43,10 @@ uint32_t sClientManagerThreadLocalIndexDuplicate = kBadThreadLocalIndex;
 }  // anonymous namespace
 
 ClientManager::ClientManager() {
+  fprintf(stderr, "ZZSPIN: ClientManager ctor, pre BackgroundChild::GetOrCreateForCurrentThread\n"); fflush(stderr);
   PBackgroundChild* parentActor =
       BackgroundChild::GetOrCreateForCurrentThread();
+  fprintf(stderr, "ZZSPIN: GetOrCreateForCurrentThread -> %p\n", (void*)parentActor); fflush(stderr);
   if (NS_WARN_IF(!parentActor)) {
     Shutdown();
     return;
@@ -56,8 +58,10 @@ ClientManager::ClientManager() {
     return;
   }
 
+  fprintf(stderr, "ZZSPIN: pre SendPClientManagerConstructor\n"); fflush(stderr);
   PClientManagerChild* sentActor =
       parentActor->SendPClientManagerConstructor(actor);
+  fprintf(stderr, "ZZSPIN: SendPClientManagerConstructor returned %p\n", (void*)sentActor); fflush(stderr);
   if (NS_WARN_IF(!sentActor)) {
     Shutdown();
     return;
@@ -128,7 +132,9 @@ UniquePtr<ClientSource> ClientManager::CreateSourceInternal(
     return source;
   }
 
+  fprintf(stderr, "ZZSPIN: pre ClientSource::Activate\n"); fflush(stderr);
   source->Activate(GetActor());
+  fprintf(stderr, "ZZSPIN: ClientSource::Activate done\n"); fflush(stderr);
 
   return source;
 }

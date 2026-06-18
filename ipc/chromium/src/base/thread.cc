@@ -95,7 +95,9 @@ bool Thread::StartWithOptions(const Options& options) {
   }
 
   // Wait for the thread to start and initialize message_loop_
+  fprintf(stderr, "ZZSPIN: StartWithOptions '%s' pre event.Wait\n", name_.c_str()); fflush(stderr);
   startup_data.event.Wait();
+  fprintf(stderr, "ZZSPIN: StartWithOptions '%s' Wait returned message_loop_=%p\n", name_.c_str(), (void*)message_loop_); fflush(stderr);
 
   DCHECK(message_loop_);
   return true;
@@ -172,12 +174,15 @@ void Thread::ThreadMain() {
   message_loop.set_hang_timeouts(startup_data_->options.transient_hang_timeout,
                                  startup_data_->options.permanent_hang_timeout);
   message_loop_ = &message_loop;
+  fprintf(stderr, "ZZSPIN: [IOfiber] ThreadMain '%s' message_loop_=%p, pre Init\n", name_.c_str(), (void*)message_loop_); fflush(stderr);
 
   // Let the thread do extra initialization.
   // Let's do this before signaling we are started.
   Init();
+  fprintf(stderr, "ZZSPIN: [IOfiber] '%s' Init done, pre Signal\n", name_.c_str()); fflush(stderr);
 
   startup_data_->event.Signal();
+  fprintf(stderr, "ZZSPIN: [IOfiber] '%s' Signal done, pre Run\n", name_.c_str()); fflush(stderr);
   // startup_data_ can't be touched anymore since the starting thread is now
   // unlocked.
 

@@ -629,7 +629,9 @@ nsresult nsDocumentViewer::InitPresentationStuff(bool aDoInitialReflow) {
   // Now make the shell for the document
   nsCOMPtr<Document> doc = mDocument;
   RefPtr<nsPresContext> presContext = mPresContext;
+  fprintf(stderr, "ZZSPIN: pre CreatePresShell\n"); fflush(stderr);
   mPresShell = doc->CreatePresShell(presContext, FindContainerFrame());
+  fprintf(stderr, "ZZSPIN: CreatePresShell -> %p\n", (void*)mPresShell.get()); fflush(stderr);
   if (!mPresShell) {
     return NS_ERROR_FAILURE;
   }
@@ -645,7 +647,9 @@ nsresult nsDocumentViewer::InitPresentationStuff(bool aDoInitialReflow) {
     //
     // Note that we are flushing before we add mPresShell as an observer
     // to avoid bogus notifications.
+    fprintf(stderr, "ZZSPIN: pre FlushPendingNotifications\n"); fflush(stderr);
     mDocument->FlushPendingNotifications(FlushType::ContentAndNotify);
+    fprintf(stderr, "ZZSPIN: FlushPendingNotifications done\n"); fflush(stderr);
   }
 
   mPresShell->BeginObservingDocument();
@@ -678,7 +682,9 @@ nsresult nsDocumentViewer::InitPresentationStuff(bool aDoInitialReflow) {
   if (aDoInitialReflow) {
     RefPtr<PresShell> presShell = mPresShell;
     // Initial reflow
+    fprintf(stderr, "ZZSPIN: pre presShell->Initialize (initial reflow)\n"); fflush(stderr);
     presShell->Initialize();
+    fprintf(stderr, "ZZSPIN: presShell->Initialize done\n"); fflush(stderr);
   }
 
   // now register ourselves as a selection listener, so that we get
@@ -732,9 +738,11 @@ nsresult nsDocumentViewer::InitInternal(nsIWidget* aParentWidget,
 
   nsSubDocumentFrame* containerFrame = FindContainerFrame();
 
+  fprintf(stderr, "ZZSPIN: InitInternal entry aDoCreation=%d\n", (int)aDoCreation); fflush(stderr);
   bool makeCX = false;
   if (aDoCreation) {
     CreateDeviceContext(containerFrame);
+    fprintf(stderr, "ZZSPIN: CreateDeviceContext done\n"); fflush(stderr);
 
     // XXXbz this is a nasty hack to do with the fact that we create
     // presentations both in Init() and in Show()...  Ideally we would only do
@@ -781,7 +789,9 @@ nsresult nsDocumentViewer::InitInternal(nsIWidget* aParentWidget,
     if (window) {
       nsCOMPtr<Document> curDoc = window->GetExtantDoc();
       if (aForceSetNewDocument || curDoc != mDocument) {
+        fprintf(stderr, "ZZSPIN: pre window->SetNewDocument (JS global)\n"); fflush(stderr);
         nsresult rv = window->SetNewDocument(mDocument, nullptr, false, aActor);
+        fprintf(stderr, "ZZSPIN: SetNewDocument returned rv=0x%x\n", (unsigned)rv); fflush(stderr);
         if (NS_FAILED(rv)) {
           Destroy();
           return rv;
@@ -791,6 +801,7 @@ nsresult nsDocumentViewer::InitInternal(nsIWidget* aParentWidget,
   }
 
   if (aDoCreation && mPresContext) {
+    fprintf(stderr, "ZZSPIN: pre InitPresentationStuff\n"); fflush(stderr);
     return InitPresentationStuff(!makeCX);
   }
 

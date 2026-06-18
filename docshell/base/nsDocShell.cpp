@@ -2375,6 +2375,16 @@ already_AddRefed<nsDocShell> nsDocShell::GetInProcessParentDocshell() {
 void nsDocShell::MaybeCreateInitialClientSource(nsIPrincipal* aPrincipal) {
   MOZ_ASSERT(!mIsBeingDestroyed);
 
+  // STJ (single-thread JSPI-fiber) experiment: the initial ClientSource is an optional
+  // service-worker/Clients-API preallocation, NOT needed to render. It kicks off the
+  // first PBackground/ClientManager bring-up, whose IPC I/O + component-manager lock
+  // dance deadlocks (ABBA) across cooperative fibers, and the JS global setup then hits
+  // the stuck lock -> SuspendError (can't JSPI-suspend across JS frames). Skip it here.
+  if (getenv("MOZ_STJ_SKIP_CLIENT")) {
+    fprintf(stderr, "ZZSPIN: MaybeCreateInitialClientSource SKIPPED (STJ)\n"); fflush(stderr);
+    return;
+  }
+
   // If there is an existing document then there is no need to create
   // a client for a future initial about:blank document.
   if (mScriptGlobal && mScriptGlobal->GetCurrentInnerWindow() &&
@@ -2422,18 +2432,23 @@ void nsDocShell::MaybeCreateInitialClientSource(nsIPrincipal* aPrincipal) {
     return;
   }
 
+  fprintf(stderr, "ZZSPIN: pre ClientManager::CreateSource\n"); fflush(stderr);
   mInitialClientSource = ClientManager::CreateSource(
       ClientType::Window, GetMainThreadSerialEventTarget(), principal);
+  fprintf(stderr, "ZZSPIN: ClientManager::CreateSource returned\n"); fflush(stderr);
   MOZ_DIAGNOSTIC_ASSERT(mInitialClientSource);
 
   // Mark the initial client as execution ready, but owned by the docshell.
   // If the client is actually used this will cause ClientSource to force
   // the creation of the initial about:blank by calling
   // nsDocShell::GetDocument().
+  fprintf(stderr, "ZZSPIN: pre DocShellExecutionReady\n"); fflush(stderr);
   mInitialClientSource->DocShellExecutionReady(this);
+  fprintf(stderr, "ZZSPIN: DocShellExecutionReady done, pre MaybeInheritController\n"); fflush(stderr);
 
   // Next, check to see if the parent is controlled.
   MaybeInheritController(mInitialClientSource.get(), principal);
+  fprintf(stderr, "ZZSPIN: MaybeInheritController done\n"); fflush(stderr);
 }
 
 void VerifyCientPrincipalInfosMatch(const mozilla::ipc::PrincipalInfo& aLeft,
@@ -6607,15 +6622,18 @@ nsresult nsDocShell::CreateAboutBlankDocumentViewer(
     // We cannot get the foreign partitioned principal for the initial
     // about:blank page. So, we change to check if we need to use the
     // partitioned principal for the service worker here.
+    fprintf(stderr, "ZZSPIN: pre MaybeCreateInitialClientSource\n"); fflush(stderr);
     MaybeCreateInitialClientSource(
         StoragePrincipalHelper::ShouldUsePartitionPrincipalForServiceWorker(
             this)
             ? partitionedPrincipal
             : principal);
 
+    fprintf(stderr, "ZZSPIN: pre CreateBlankDocument\n"); fflush(stderr);
     // generate (about:blank) document to load
     blankDoc = nsContentDLF::CreateBlankDocument(mLoadGroup, principal,
                                                  partitionedPrincipal, this);
+    fprintf(stderr, "ZZSPIN: CreateBlankDocument returned blankDoc=%p\n", (void*)blankDoc.get()); fflush(stderr);
     if (blankDoc) {
       // Hack: manually set the policyContainer for the new document
       // Please create an actual copy of the policyContainer (do not share the
@@ -6665,9 +6683,11 @@ nsresult nsDocShell::CreateAboutBlankDocumentViewer(
       }
 
       // create a content viewer for us and the new document
+      fprintf(stderr, "ZZSPIN: pre CreateInstanceForDocument\n"); fflush(stderr);
       docFactory->CreateInstanceForDocument(
           NS_ISUPPORTS_CAST(nsIDocShell*, this), blankDoc, "view",
           getter_AddRefs(viewer));
+      fprintf(stderr, "ZZSPIN: CreateInstanceForDocument returned viewer=%p\n", (void*)viewer.get()); fflush(stderr);
 
       // hook 'em up
       if (viewer) {
@@ -6675,7 +6695,9 @@ nsresult nsDocShell::CreateAboutBlankDocumentViewer(
         if (mLoadingEntry && mBrowsingContext->IsTop()) {
           mLoadingEntry->mInfo.SetTransient();
         }
+        fprintf(stderr, "ZZSPIN: pre Embed\n"); fflush(stderr);
         rv = Embed(viewer, aActor, true, nullptr, mCurrentURI);
+        fprintf(stderr, "ZZSPIN: Embed returned rv=0x%x\n", (unsigned)rv); fflush(stderr);
         NS_ENSURE_SUCCESS(rv, rv);
 
         SetCurrentURI(blankDoc->GetDocumentURI(), nullptr,

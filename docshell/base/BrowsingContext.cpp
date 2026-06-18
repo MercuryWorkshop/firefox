@@ -1048,14 +1048,17 @@ void BrowsingContext::Attach(bool aFromIPC, ContentParent* aOriginProcess) {
     }
   }
 
+  fprintf(stderr, "ZZSPIN: Attach pre-NotifyWhenScriptSafe\n"); fflush(stderr);
   if (nsCOMPtr<nsIObserverService> obs = services::GetObserverService()) {
     obs->NotifyWhenScriptSafe(ToSupports(this), "browsing-context-attached",
                               why);
   }
+  fprintf(stderr, "ZZSPIN: Attach post-Notify, pre-CanonicalAttach\n"); fflush(stderr);
 
   if (XRE_IsParentProcess()) {
     Canonical()->CanonicalAttach();
   }
+  fprintf(stderr, "ZZSPIN: Attach DONE\n"); fflush(stderr);
 }
 
 void BrowsingContext::Detach(bool aFromIPC) {

@@ -30,6 +30,16 @@ using JS::SliceBudget;
 
 using RootEntry = RootedValueMap::Entry;
 
+#ifdef __EMSCRIPTEN__
+// The JS->wasm JIT (Mode VS, WasmJS.cpp) keeps live Values in C++ buffers
+// (gWJFrameMem/gWJScratch/gWJHelp*) written by JIT code without store-buffer
+// post-barriers. WJTraceRoots traces them; it is registered as an extra GC roots
+// tracer, but those run only on MAJOR GC. Call it on MINOR GC too so nursery
+// objects held in a Mode VS frame across a safepoint are forwarded (otherwise
+// they go stale on tenuring -> heap corruption).
+extern "C" void WJTraceRoots(JSTracer* trc, void* data);
+#endif
+
 template <typename Base, typename T>
 inline void TypedRootedGCThingBase<Base, T>::trace(JSTracer* trc,
                                                    const char* name) {
@@ -253,6 +263,10 @@ void js::gc::GCRuntime::traceRuntimeForMinorGC(JSTracer* trc,
   gcstats::AutoPhase ap(stats(), gcstats::PhaseKind::MARK_ROOTS);
 
   traceRuntimeCommon(trc, TraceRuntime);
+
+#ifdef __EMSCRIPTEN__
+  WJTraceRoots(trc, nullptr);
+#endif
 }
 
 void js::TraceRuntime(JSTracer* trc) {

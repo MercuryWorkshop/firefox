@@ -3953,22 +3953,111 @@ static bool WJEmitBodyVCF(JSScript* script, Encoder& e, uint32_t nargs,
 static constexpr uint32_t kWJVSHelpIdx = 0;   // wjhelp import function index
 static constexpr uint32_t kWJVSMaxStack = 48;
 // frame byte base local + scratch locals (see WJEmitBodyVS local decls):
-//   0=f64 param; 1,2=i64 t0,t1; 3=f64 tf; 4,5,6,7,8=i32 fb,pc,basesp,ti,ti2
+//   0=f64 param; 1,2=i64 t0,t1; 3=f64 tf; 4,5,6,7,8=i32 fb,pc,basesp,ti,ti2;
+//   9..9+kWJVSMaxStack = i64 operand-stack registers s[0..kWJVSMaxStack).
 static constexpr uint32_t kVSt0 = 1, kVSt1 = 2, kVStf = 3;
 static constexpr uint32_t kVSfb = 4, kVSpc = 5, kVSbasesp = 6, kVSti = 7,
                           kVSti2 = 8;
+static constexpr uint32_t kVSsBase = 9;  // i64 local for operand-stack depth 0
+
+// MODE_VS_REGALLOC Phase 1: the operand stack lives in wasm LOCALS (registers)
+// between safepoints, GC-spilled to the traced frame at the only allocation sites
+// (wjhelp + call_indirect). Args/locals/rval stay in the frame. GECKO_WJVS_FRAME=1
+// reverts to the all-frame-memory operand stack (A/B + rollback).
+static bool WJVSUseLocals() {
+  static int v = -1;
+  if (v < 0) v = getenv("GECKO_WJVS_FRAME") ? 0 : 1;
+  return v != 0;
+}
+// Call-heavy chronically-deopting functions recompile to Mode VS so the hot OO
+// call chain stays in wasm (call_indirect between VS fns) instead of re-entering
+// the interpreter every call -- the main octane OO win (DeltaBlue ~1.35x). Enabled
+// by default now that the TraceJitFrames re-entry crash is fixed (the PBL push-order
+// fix in PortableBaselineInterpret.cpp + minor-GC frame tracing). GECKO_WJVS_NOHASCALL=1
+// reverts to call-free-only recompile.
+static bool WJVSHasCallRecompile() {
+  static int v = -1;
+  if (v < 0) v = getenv("GECKO_WJVS_NOHASCALL") ? 0 : 1;
+  return v != 0;
+}
+
+struct WJVSCtx {
+  JSScript* script;
+  jsbytecode* start;
+  uint32_t nargs, nfixed;
+  uint32_t localBaseS, rvalS, stackBaseS;
+  uint32_t depth;
+};
+
+// Is `slot` an operand-stack slot (vs an arg/local/rval frame slot)?
+static bool WJVSIsStack(const WJVSCtx& c, uint32_t slot) {
+  return WJVSUseLocals() && slot >= c.stackBaseS;
+}
+static uint32_t WJVSLocalFor(const WJVSCtx& c, uint32_t slot) {
+  return kVSsBase + (slot - c.stackBaseS);
+}
 
 static bool WJSAddr(Encoder& e, uint32_t slot) {  // push i32 = fb + slot*8
   return e.writeOp(Op::LocalGet) && e.writeVarU32(kVSfb) &&
          e.writeOp(Op::I32Const) && e.writeVarS32(int32_t(slot) * 8) &&
          e.writeOp(Op::I32Add);
 }
-static bool WJSLoadSlot(Encoder& e, uint32_t slot) {  // push i64 = frame[slot]
+static bool WJSStoreEnd(Encoder& e) {  // stack [addr,i64] -> store
+  return e.writeOp(Op::I64Store) && e.writeVarU32(3) && e.writeVarU32(0);
+}
+// Push i64 = the value at `slot`: an operand-stack local.get, or a frame load.
+static bool WJSLoad(Encoder& e, const WJVSCtx& c, uint32_t slot) {
+  if (WJVSIsStack(c, slot)) {
+    return e.writeOp(Op::LocalGet) && e.writeVarU32(WJVSLocalFor(c, slot));
+  }
   return WJSAddr(e, slot) && e.writeOp(Op::I64Load) && e.writeVarU32(3) &&
          e.writeVarU32(0);
 }
-static bool WJSStoreEnd(Encoder& e) {  // stack [addr,i64] -> store
+// Store-to-`slot` framing: Pre emits the destination address (frame) or nothing
+// (operand-stack local); the caller then emits the i64 value; Post commits it.
+static bool WJSStorePre(Encoder& e, const WJVSCtx& c, uint32_t slot) {
+  if (WJVSIsStack(c, slot)) return true;
+  return WJSAddr(e, slot);
+}
+static bool WJSStorePost(Encoder& e, const WJVSCtx& c, uint32_t slot) {
+  if (WJVSIsStack(c, slot)) {
+    return e.writeOp(Op::LocalSet) && e.writeVarU32(WJVSLocalFor(c, slot));
+  }
   return e.writeOp(Op::I64Store) && e.writeVarU32(3) && e.writeVarU32(0);
+}
+// At a safepoint (allocation/GC), the BYSTANDER operand-stack slots s[0..n) must
+// be copied to the GC-traced frame so a moving GC updates the pointers; reload
+// after so the running code sees the moved pointers. gWJFrameSP already covers the
+// whole frame (set in the prologue), so no SP republish is needed.
+//
+// `n` is the bystander count: depth MINUS the operands this op consumes, because
+// those operands are passed to the helper via gWJHelpA/B/C (or gWJScratch for
+// calls), which WJTraceRoots ALSO traces -- so the GC updates the moved pointers
+// there. The un-spilled operand/free frame slots still get traced, but the frame
+// is init'd to Undefined and only ever written with valid Values, so tracing a
+// stale-but-valid slot is safe (it can only over-retain, never dangle). Spilling
+// only bystanders is the difference between O(depth) and ~O(0) traffic at the
+// common statement-level call (where every live slot is a call operand).
+static bool WJVSSpillRange(Encoder& e, const WJVSCtx& c, uint32_t n) {
+  if (!WJVSUseLocals()) return true;
+  for (uint32_t d = 0; d < n; d++) {
+    if (!WJSAddr(e, c.stackBaseS + d) || !e.writeOp(Op::LocalGet) ||
+        !e.writeVarU32(kVSsBase + d) || !WJSStoreEnd(e)) {
+      return false;
+    }
+  }
+  return true;
+}
+static bool WJVSReloadRange(Encoder& e, const WJVSCtx& c, uint32_t n) {
+  if (!WJVSUseLocals()) return true;
+  for (uint32_t d = 0; d < n; d++) {
+    if (!WJSAddr(e, c.stackBaseS + d) || !e.writeOp(Op::I64Load) ||
+        !e.writeVarU32(3) || !e.writeVarU32(0) || !e.writeOp(Op::LocalSet) ||
+        !e.writeVarU32(kVSsBase + d)) {
+      return false;
+    }
+  }
+  return true;
 }
 static bool WJSIsNum(Encoder& e, uint32_t L) {  // push i32: is local L a number?
   return e.writeOp(Op::LocalGet) && e.writeVarU32(L) && e.writeOp(Op::I64Const) &&
@@ -4007,26 +4096,24 @@ static bool WJVSStoreGlobal(Encoder& e, uint32_t addr, uint32_t L) {  // *addr =
   return e.writeOp(Op::I32Const) && e.writeVarS32(int32_t(addr)) &&
          e.writeOp(Op::LocalGet) && e.writeVarU32(L) && WJSStoreEnd(e);
 }
-// Emit a wjhelp(kind, site) call (operands already in gWJHelp*). Leaves nothing;
-// caller reads the result from gWJScratch[result] if needed.
-static bool WJVSCallHelper(Encoder& e, uint32_t kind, uint32_t site) {
-  return WJConst(e, double(kind)) && WJConst(e, double(site)) &&
-         e.writeOp(Op::Call) && e.writeVarU32(kWJVSHelpIdx) && WJVSExcCheck(e);
+// Emit a wjhelp(kind, site) call (operands already in gWJHelp*). Spills the live
+// operand stack to the traced frame before the call (the helper may allocate/GC)
+// and reloads it after (picking up moved pointers). Leaves nothing; caller reads
+// the result from gWJScratch[result] if needed.
+static bool WJVSCallHelper(Encoder& e, const WJVSCtx& c, uint32_t kind,
+                           uint32_t site, uint32_t spillN) {
+  return WJVSSpillRange(e, c, spillN) && WJConst(e, double(kind)) &&
+         WJConst(e, double(site)) && e.writeOp(Op::Call) &&
+         e.writeVarU32(kWJVSHelpIdx) && WJVSExcCheck(e) &&
+         WJVSReloadRange(e, c, spillN);
 }
-static bool WJVSPushResult(Encoder& e, uint32_t destSlot) {  // dest = scratch[res]
+static bool WJVSPushResult(Encoder& e, const WJVSCtx& c,
+                           uint32_t destSlot) {  // dest = scratch[res]
   uint32_t resAddr = uint32_t(uintptr_t(&gWJScratch[kWJResultSlot]));
-  return WJSAddr(e, destSlot) && e.writeOp(Op::I32Const) &&
+  return WJSStorePre(e, c, destSlot) && e.writeOp(Op::I32Const) &&
          e.writeVarS32(int32_t(resAddr)) && e.writeOp(Op::I64Load) &&
-         e.writeVarU32(3) && e.writeVarU32(0) && WJSStoreEnd(e);
+         e.writeVarU32(3) && e.writeVarU32(0) && WJSStorePost(e, c, destSlot);
 }
-
-struct WJVSCtx {
-  JSScript* script;
-  jsbytecode* start;
-  uint32_t nargs, nfixed;
-  uint32_t localBaseS, rvalS, stackBaseS;
-  uint32_t depth;
-};
 
 // Binary arithmetic in Mode VS: numbers -> inline f64; otherwise wjhelp.
 static bool WJVSBinArith(Encoder& e, WJVSCtx& c, Op fop, uint32_t kind) {
@@ -4034,26 +4121,26 @@ static bool WJVSBinArith(Encoder& e, WJVSCtx& c, Op fop, uint32_t kind) {
   uint32_t aS = c.stackBaseS + c.depth - 2, bS = c.stackBaseS + c.depth - 1;
   uint32_t helpA = uint32_t(uintptr_t(&gWJHelpA));
   uint32_t helpB = uint32_t(uintptr_t(&gWJHelpB));
-  if (!WJSLoadSlot(e, aS) || !e.writeOp(Op::LocalSet) || !e.writeVarU32(kVSt0)) {
+  if (!WJSLoad(e, c, aS) || !e.writeOp(Op::LocalSet) || !e.writeVarU32(kVSt0)) {
     return false;
   }
-  if (!WJSLoadSlot(e, bS) || !e.writeOp(Op::LocalSet) || !e.writeVarU32(kVSt1)) {
+  if (!WJSLoad(e, c, bS) || !e.writeOp(Op::LocalSet) || !e.writeVarU32(kVSt1)) {
     return false;
   }
   if (!WJSIsNum(e, kVSt0) || !WJSIsNum(e, kVSt1) || !e.writeOp(Op::I32And)) {
     return false;
   }
   if (!e.writeOp(Op::If) || !e.writeFixedU8(kVoid)) return false;
-  if (!WJSAddr(e, aS)) return false;
+  if (!WJSStorePre(e, c, aS)) return false;
   if (!WJVUnboxNG(e, kVSt0) || !WJVUnboxNG(e, kVSt1) || !e.writeOp(fop) ||
-      !WJVRebox(e, kVStf) || !WJSStoreEnd(e)) {
+      !WJVRebox(e, kVStf) || !WJSStorePost(e, c, aS)) {
     return false;
   }
   if (!e.writeOp(Op::Else)) return false;
   if (!WJVSStoreGlobal(e, helpA, kVSt0) || !WJVSStoreGlobal(e, helpB, kVSt1)) {
     return false;
   }
-  if (!WJVSCallHelper(e, kind, 0) || !WJVSPushResult(e, aS)) return false;
+  if (!WJVSCallHelper(e, c, kind, 0, c.depth - 2) || !WJVSPushResult(e, c, aS)) return false;
   if (!e.writeOp(Op::End)) return false;
   c.depth -= 1;
   return true;
@@ -4063,19 +4150,19 @@ static bool WJVSUnary(Encoder& e, WJVSCtx& c, bool inc) {
   const uint8_t kVoid = 0x40;
   uint32_t aS = c.stackBaseS + c.depth - 1;
   uint32_t helpA = uint32_t(uintptr_t(&gWJHelpA));
-  if (!WJSLoadSlot(e, aS) || !e.writeOp(Op::LocalSet) || !e.writeVarU32(kVSt0)) {
+  if (!WJSLoad(e, c, aS) || !e.writeOp(Op::LocalSet) || !e.writeVarU32(kVSt0)) {
     return false;
   }
   if (!WJSIsNum(e, kVSt0)) return false;
   if (!e.writeOp(Op::If) || !e.writeFixedU8(kVoid)) return false;
-  if (!WJSAddr(e, aS) || !WJVUnboxNG(e, kVSt0) || !WJConst(e, 1.0) ||
+  if (!WJSStorePre(e, c, aS) || !WJVUnboxNG(e, kVSt0) || !WJConst(e, 1.0) ||
       !e.writeOp(inc ? Op::F64Add : Op::F64Sub) || !WJVRebox(e, kVStf) ||
-      !WJSStoreEnd(e)) {
+      !WJSStorePost(e, c, aS)) {
     return false;
   }
   if (!e.writeOp(Op::Else)) return false;
   if (!WJVSStoreGlobal(e, helpA, kVSt0)) return false;
-  if (!WJVSCallHelper(e, inc ? WJH_INC : WJH_DEC, 0) || !WJVSPushResult(e, aS)) {
+  if (!WJVSCallHelper(e, c, inc ? WJH_INC : WJH_DEC, 0, c.depth - 1) || !WJVSPushResult(e, c, aS)) {
     return false;
   }
   return e.writeOp(Op::End);
@@ -4096,23 +4183,23 @@ static bool WJVSBitOp(Encoder& e, WJVSCtx& c, Op i32op, uint32_t kind, bool uns)
   uint32_t aS = c.stackBaseS + c.depth - 2, bS = c.stackBaseS + c.depth - 1;
   uint32_t helpA = uint32_t(uintptr_t(&gWJHelpA));
   uint32_t helpB = uint32_t(uintptr_t(&gWJHelpB));
-  if (!WJSLoadSlot(e, aS) || !e.writeOp(Op::LocalSet) || !e.writeVarU32(kVSt0) ||
-      !WJSLoadSlot(e, bS) || !e.writeOp(Op::LocalSet) || !e.writeVarU32(kVSt1)) {
+  if (!WJSLoad(e, c, aS) || !e.writeOp(Op::LocalSet) || !e.writeVarU32(kVSt0) ||
+      !WJSLoad(e, c, bS) || !e.writeOp(Op::LocalSet) || !e.writeVarU32(kVSt1)) {
     return false;
   }
   if (!WJSIsNum(e, kVSt0) || !WJSIsNum(e, kVSt1) || !e.writeOp(Op::I32And)) {
     return false;
   }
   if (!e.writeOp(Op::If) || !e.writeFixedU8(kVoid)) return false;
-  if (!WJSAddr(e, aS) || !WJSToInt32(e, kVSt0) || !WJSToInt32(e, kVSt1) ||
+  if (!WJSStorePre(e, c, aS) || !WJSToInt32(e, kVSt0) || !WJSToInt32(e, kVSt1) ||
       !e.writeOp(i32op) ||
       !e.writeOp(uns ? Op::F64ConvertI32U : Op::F64ConvertI32S) ||
-      !WJVRebox(e, kVStf) || !WJSStoreEnd(e)) {
+      !WJVRebox(e, kVStf) || !WJSStorePost(e, c, aS)) {
     return false;
   }
   if (!e.writeOp(Op::Else)) return false;
   if (!WJVSStoreGlobal(e, helpA, kVSt0) || !WJVSStoreGlobal(e, helpB, kVSt1) ||
-      !WJVSCallHelper(e, kind, 0) || !WJVSPushResult(e, aS)) {
+      !WJVSCallHelper(e, c, kind, 0, c.depth - 2) || !WJVSPushResult(e, c, aS)) {
     return false;
   }
   if (!e.writeOp(Op::End)) return false;
@@ -4124,19 +4211,20 @@ static bool WJVSBitNot(Encoder& e, WJVSCtx& c) {
   const uint8_t kVoid = 0x40;
   uint32_t aS = c.stackBaseS + c.depth - 1;
   uint32_t helpA = uint32_t(uintptr_t(&gWJHelpA));
-  if (!WJSLoadSlot(e, aS) || !e.writeOp(Op::LocalSet) || !e.writeVarU32(kVSt0)) {
+  if (!WJSLoad(e, c, aS) || !e.writeOp(Op::LocalSet) || !e.writeVarU32(kVSt0)) {
     return false;
   }
   if (!WJSIsNum(e, kVSt0)) return false;
   if (!e.writeOp(Op::If) || !e.writeFixedU8(kVoid)) return false;
-  if (!WJSAddr(e, aS) || !WJSToInt32(e, kVSt0) || !e.writeOp(Op::I32Const) ||
+  if (!WJSStorePre(e, c, aS) || !WJSToInt32(e, kVSt0) || !e.writeOp(Op::I32Const) ||
       !e.writeVarS32(-1) || !e.writeOp(Op::I32Xor) ||
-      !e.writeOp(Op::F64ConvertI32S) || !WJVRebox(e, kVStf) || !WJSStoreEnd(e)) {
+      !e.writeOp(Op::F64ConvertI32S) || !WJVRebox(e, kVStf) ||
+      !WJSStorePost(e, c, aS)) {
     return false;
   }
   if (!e.writeOp(Op::Else)) return false;
-  if (!WJVSStoreGlobal(e, helpA, kVSt0) || !WJVSCallHelper(e, WJH_BITNOT, 0) ||
-      !WJVSPushResult(e, aS)) {
+  if (!WJVSStoreGlobal(e, helpA, kVSt0) || !WJVSCallHelper(e, c, WJH_BITNOT, 0, c.depth - 1) ||
+      !WJVSPushResult(e, c, aS)) {
     return false;
   }
   if (!e.writeOp(Op::End)) return false;
@@ -4162,10 +4250,10 @@ static bool WJVSCmp(Encoder& e, WJVSCtx& c, JSOp op) {
     case JSOp::StrictEq: fop = Op::F64Eq; kind = WJH_STRICTEQ; break;
     default: fop = Op::F64Ne; kind = WJH_STRICTNE; break;
   }
-  if (!WJSLoadSlot(e, aS) || !e.writeOp(Op::LocalSet) || !e.writeVarU32(kVSt0)) {
+  if (!WJSLoad(e, c, aS) || !e.writeOp(Op::LocalSet) || !e.writeVarU32(kVSt0)) {
     return false;
   }
-  if (!WJSLoadSlot(e, bS) || !e.writeOp(Op::LocalSet) || !e.writeVarU32(kVSt1)) {
+  if (!WJSLoad(e, c, bS) || !e.writeOp(Op::LocalSet) || !e.writeVarU32(kVSt1)) {
     return false;
   }
   if (!WJSIsNum(e, kVSt0) || !WJSIsNum(e, kVSt1) || !e.writeOp(Op::I32And)) {
@@ -4179,7 +4267,7 @@ static bool WJVSCmp(Encoder& e, WJVSCtx& c, JSOp op) {
   if (!WJVSStoreGlobal(e, helpA, kVSt0) || !WJVSStoreGlobal(e, helpB, kVSt1)) {
     return false;
   }
-  if (!WJVSCallHelper(e, kind, 0)) return false;
+  if (!WJVSCallHelper(e, c, kind, 0, c.depth - 2)) return false;
   if (!e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(resAddr)) ||
       !e.writeOp(Op::I64Load) || !e.writeVarU32(3) || !e.writeVarU32(0) ||
       !e.writeOp(Op::I32WrapI64)) {
@@ -4202,8 +4290,8 @@ static bool WJVSGetProp(Encoder& e, WJVSCtx& c, jsbytecode* pc) {
   uint32_t helpA = uint32_t(uintptr_t(&gWJHelpA));
   uint32_t topS = c.stackBaseS + c.depth - 1;
   auto helperGet = [&]() -> bool {
-    return WJVSStoreGlobal(e, helpA, kVSt0) && WJVSCallHelper(e, WJH_GETPROP, site) &&
-           WJVSPushResult(e, topS);
+    return WJVSStoreGlobal(e, helpA, kVSt0) && WJVSCallHelper(e, c, WJH_GETPROP, site, c.depth - 1) &&
+           WJVSPushResult(e, c, topS);
   };
   auto emitOff = [&]() -> bool {  // push i32 off = gWJICTable[2*site+1]
     return e.writeOp(Op::I32Const) && e.writeVarS32(int32_t(icAddr)) &&
@@ -4225,9 +4313,9 @@ static bool WJVSGetProp(Encoder& e, WJVSCtx& c, jsbytecode* pc) {
            e.writeOp(Op::End);
   };
   auto emitLoadTo = [&](uint32_t base) -> bool {  // frame[topS] = slotLoad(base)
-    return WJSAddr(e, topS) && emitSlotLoad(base) && WJSStoreEnd(e);
+    return WJSStorePre(e, c, topS) && emitSlotLoad(base) && WJSStorePost(e, c, topS);
   };
-  if (!WJSLoadSlot(e, topS) || !e.writeOp(Op::LocalSet) || !e.writeVarU32(kVSt0)) {
+  if (!WJSLoad(e, c, topS) || !e.writeOp(Op::LocalSet) || !e.writeVarU32(kVSt0)) {
     return false;
   }
   if (!WJSIsObj(e, kVSt0)) return false;
@@ -4287,7 +4375,7 @@ static bool WJVSGetGName(Encoder& e, WJVSCtx& c, jsbytecode* pc) {
   uint32_t icAddr = uint32_t(uintptr_t(&gWJICTable[2 * site]));
   uint32_t top = c.stackBaseS + c.depth;
   auto helperGet = [&]() -> bool {
-    return WJVSCallHelper(e, WJH_GETGNAME, site) && WJVSPushResult(e, top);
+    return WJVSCallHelper(e, c, WJH_GETGNAME, site, c.depth) && WJVSPushResult(e, c, top);
   };
   auto emitOff = [&]() -> bool {  // push i32 off = gWJICTable[2*site+1]
     return e.writeOp(Op::I32Const) && e.writeVarS32(int32_t(icAddr)) &&
@@ -4326,7 +4414,9 @@ static bool WJVSGetGName(Encoder& e, WJVSCtx& c, jsbytecode* pc) {
     return false;
   }
   if (!e.writeOp(Op::If) || !e.writeFixedU8(kVoid)) return false;
-  if (!WJSAddr(e, top) || !emitSlotLoad(kVSti) || !WJSStoreEnd(e)) return false;  // hit
+  if (!WJSStorePre(e, c, top) || !emitSlotLoad(kVSti) || !WJSStorePost(e, c, top)) {
+    return false;  // hit
+  }
   if (!e.writeOp(Op::Else) || !helperGet() || !e.writeOp(Op::End)) return false;  // shape miss
   if (!e.writeOp(Op::End)) return false;  // end holder!=0 if
   c.depth++;
@@ -4346,12 +4436,12 @@ static bool WJVSSetProp(Encoder& e, WJVSCtx& c, jsbytecode* pc) {
   uint32_t objS = c.stackBaseS + c.depth - 2, valS = c.stackBaseS + c.depth - 1;
   auto helperSet = [&]() -> bool {
     return WJVSStoreGlobal(e, helpA, kVSt0) && WJVSStoreGlobal(e, helpB, kVSt1) &&
-           WJVSCallHelper(e, WJH_SETPROP, site);
+           WJVSCallHelper(e, c, WJH_SETPROP, site, c.depth - 2);
   };
-  if (!WJSLoadSlot(e, objS) || !e.writeOp(Op::LocalSet) || !e.writeVarU32(kVSt0)) {
+  if (!WJSLoad(e, c, objS) || !e.writeOp(Op::LocalSet) || !e.writeVarU32(kVSt0)) {
     return false;
   }
-  if (!WJSLoadSlot(e, valS) || !e.writeOp(Op::LocalSet) || !e.writeVarU32(kVSt1)) {
+  if (!WJSLoad(e, c, valS) || !e.writeOp(Op::LocalSet) || !e.writeVarU32(kVSt1)) {
     return false;
   }
   if (!WJSIsObj(e, kVSt0)) return false;
@@ -4383,9 +4473,9 @@ static bool WJVSSetProp(Encoder& e, WJVSCtx& c, jsbytecode* pc) {
   if (!e.writeOp(Op::Else)) return false;  // not object
   if (!helperSet()) return false;
   if (!e.writeOp(Op::End)) return false;
-  // result (the assigned value, t1) -> frame[objS]
-  if (!WJSAddr(e, objS) || !e.writeOp(Op::LocalGet) || !e.writeVarU32(kVSt1) ||
-      !WJSStoreEnd(e)) {
+  // result (the assigned value, t1) -> operand stack[objS]
+  if (!WJSStorePre(e, c, objS) || !e.writeOp(Op::LocalGet) || !e.writeVarU32(kVSt1) ||
+      !WJSStorePost(e, c, objS)) {
     return false;
   }
   c.depth -= 1;
@@ -4414,10 +4504,10 @@ static bool WJVSGetElem(Encoder& e, WJVSCtx& c, jsbytecode* pc) {
   uint32_t objS = c.stackBaseS + c.depth - 2, idxS = c.stackBaseS + c.depth - 1;
   auto helperGet = [&]() -> bool {
     return WJVSStoreGlobal(e, helpA, kVSt0) && WJVSStoreGlobal(e, helpB, kVSt1) &&
-           WJVSCallHelper(e, WJH_GETELEM, site) && WJVSPushResult(e, objS);
+           WJVSCallHelper(e, c, WJH_GETELEM, site, c.depth - 2) && WJVSPushResult(e, c, objS);
   };
-  if (!WJSLoadSlot(e, objS) || !e.writeOp(Op::LocalSet) || !e.writeVarU32(kVSt0) ||
-      !WJSLoadSlot(e, idxS) || !e.writeOp(Op::LocalSet) || !e.writeVarU32(kVSt1)) {
+  if (!WJSLoad(e, c, objS) || !e.writeOp(Op::LocalSet) || !e.writeVarU32(kVSt0) ||
+      !WJSLoad(e, c, idxS) || !e.writeOp(Op::LocalSet) || !e.writeVarU32(kVSt1)) {
     return false;
   }
   if (!WJSIsObj(e, kVSt0)) return false;
@@ -4454,13 +4544,13 @@ static bool WJVSGetElem(Encoder& e, WJVSCtx& c, jsbytecode* pc) {
     return false;
   }
   if (!e.writeOp(Op::If) || !e.writeFixedU8(kVoid)) return false;
-  // frame[objS] = i64.load[ elements(@ti+12) + ti2*8 ]
-  if (!WJSAddr(e, objS) || !e.writeOp(Op::LocalGet) || !e.writeVarU32(kVSti) ||
+  // stack[objS] = i64.load[ elements(@ti+12) + ti2*8 ]
+  if (!WJSStorePre(e, c, objS) || !e.writeOp(Op::LocalGet) || !e.writeVarU32(kVSti) ||
       !e.writeOp(Op::I32Load) || !e.writeVarU32(2) || !e.writeVarU32(12) ||
       !e.writeOp(Op::LocalGet) || !e.writeVarU32(kVSti2) || !e.writeOp(Op::I32Const) ||
       !e.writeVarS32(8) || !e.writeOp(Op::I32Mul) || !e.writeOp(Op::I32Add) ||
       !e.writeOp(Op::I64Load) || !e.writeVarU32(3) || !e.writeVarU32(0) ||
-      !WJSStoreEnd(e)) {
+      !WJSStorePost(e, c, objS)) {
     return false;
   }
   if (!e.writeOp(Op::Else) || !helperGet() || !e.writeOp(Op::End)) return false;  // oob
@@ -4488,11 +4578,11 @@ static bool WJVSSetElem(Encoder& e, WJVSCtx& c, jsbytecode* pc) {
   auto helperSet = [&]() -> bool {
     return WJVSStoreGlobal(e, helpA, kVSt0) && WJVSStoreGlobal(e, helpB, kVSt1) &&
            e.writeOp(Op::I32Const) && e.writeVarS32(int32_t(helpC)) &&
-           WJSLoadSlot(e, valS) && WJSStoreEnd(e) &&
-           WJVSCallHelper(e, WJH_SETELEM, site);
+           WJSLoad(e, c, valS) && WJSStoreEnd(e) &&
+           WJVSCallHelper(e, c, WJH_SETELEM, site, c.depth - 3);
   };
-  if (!WJSLoadSlot(e, objS) || !e.writeOp(Op::LocalSet) || !e.writeVarU32(kVSt0) ||
-      !WJSLoadSlot(e, idxS) || !e.writeOp(Op::LocalSet) || !e.writeVarU32(kVSt1)) {
+  if (!WJSLoad(e, c, objS) || !e.writeOp(Op::LocalSet) || !e.writeVarU32(kVSt0) ||
+      !WJSLoad(e, c, idxS) || !e.writeOp(Op::LocalSet) || !e.writeVarU32(kVSt1)) {
     return false;
   }
   if (!WJSIsObj(e, kVSt0)) return false;
@@ -4515,7 +4605,7 @@ static bool WJVSSetElem(Encoder& e, WJVSCtx& c, jsbytecode* pc) {
       !e.writeOp(Op::I32And)) {
     return false;
   }
-  if (!WJSLoadSlot(e, valS) || !e.writeOp(Op::I64Const) || !e.writeVarU64(32) ||
+  if (!WJSLoad(e, c, valS) || !e.writeOp(Op::I64Const) || !e.writeVarU64(32) ||
       !e.writeOp(Op::I64ShrU) || !e.writeOp(Op::I64Const) ||
       !e.writeVarS64(int64_t(kWJTagInt32)) || !e.writeOp(Op::I64LeU) ||
       !e.writeOp(Op::I32And)) {
@@ -4539,15 +4629,17 @@ static bool WJVSSetElem(Encoder& e, WJVSCtx& c, jsbytecode* pc) {
   if (!e.writeOp(Op::LocalGet) || !e.writeVarU32(kVSti) || !e.writeOp(Op::I32Load) ||
       !e.writeVarU32(2) || !e.writeVarU32(12) || !e.writeOp(Op::LocalGet) ||
       !e.writeVarU32(kVSti2) || !e.writeOp(Op::I32Const) || !e.writeVarS32(8) ||
-      !e.writeOp(Op::I32Mul) || !e.writeOp(Op::I32Add) || !WJSLoadSlot(e, valS) ||
+      !e.writeOp(Op::I32Mul) || !e.writeOp(Op::I32Add) || !WJSLoad(e, c, valS) ||
       !WJSStoreEnd(e)) {
     return false;
   }
   if (!e.writeOp(Op::Else) || !helperSet() || !e.writeOp(Op::End)) return false;  // oob
   if (!e.writeOp(Op::Else) || !helperSet() || !e.writeOp(Op::End)) return false;  // guard miss
   if (!e.writeOp(Op::Else) || !helperSet() || !e.writeOp(Op::End)) return false;  // not object
-  // result (the assigned value) -> frame[objS]
-  if (!WJSAddr(e, objS) || !WJSLoadSlot(e, valS) || !WJSStoreEnd(e)) return false;
+  // result (the assigned value) -> operand stack[objS]
+  if (!WJSStorePre(e, c, objS) || !WJSLoad(e, c, valS) || !WJSStorePost(e, c, objS)) {
+    return false;
+  }
   c.depth -= 2;
   return true;
 }
@@ -4579,16 +4671,16 @@ static bool WJVSCall(Encoder& e, WJVSCtx& c, jsbytecode* pc) {
   auto marshal = [&]() -> bool {
     for (uint32_t i = 0; i < argc; i++) {
       if (!e.writeOp(Op::I32Const) ||
-          !e.writeVarS32(int32_t(scratchBase + i * 8)) || !WJSLoadSlot(e, arg0S + i) ||
+          !e.writeVarS32(int32_t(scratchBase + i * 8)) || !WJSLoad(e, c, arg0S + i) ||
           !WJSStoreEnd(e)) {
         return false;
       }
     }
     return e.writeOp(Op::I32Const) &&
-           e.writeVarS32(int32_t(scratchBase + kWJThisOff)) && WJSLoadSlot(e, thisS) &&
+           e.writeVarS32(int32_t(scratchBase + kWJThisOff)) && WJSLoad(e, c, thisS) &&
            WJSStoreEnd(e) && WJVSStoreGlobal(e, helpA, kVSt0);
   };
-  if (!WJSLoadSlot(e, calleeS) || !e.writeOp(Op::LocalSet) || !e.writeVarU32(kVSt0)) {
+  if (!WJSLoad(e, c, calleeS) || !e.writeOp(Op::LocalSet) || !e.writeVarU32(kVSt0)) {
     return false;
   }
   if (!marshal()) return false;
@@ -4600,7 +4692,10 @@ static bool WJVSCall(Encoder& e, WJVSCtx& c, jsbytecode* pc) {
     return false;
   }
   if (!e.writeOp(Op::If) || !e.writeFixedU8(kVoid)) return false;
-  // cached hit: call_indirect typeidx 0, tableidx 0
+  // cached hit: spill the live BYSTANDER stack (args/this/callee are already in
+  // gWJScratch/gWJHelpA, which WJTraceRoots also traces), then call_indirect
+  // (typeidx 0, tableidx 0) and reload (picks up moved pointers).
+  if (!WJVSSpillRange(e, c, c.depth - argc - 2)) return false;
   if (!WJConst(e, double(scratchBase)) || !e.writeOp(Op::I32Const) ||
       !e.writeVarS32(int32_t(callIdxAddr)) || !e.writeOp(Op::I32Load) ||
       !e.writeVarU32(2) || !e.writeVarU32(0) || !e.writeOp(Op::CallIndirect) ||
@@ -4608,6 +4703,7 @@ static bool WJVSCall(Encoder& e, WJVSCtx& c, jsbytecode* pc) {
       !e.writeVarU32(kVStf)) {
     return false;
   }
+  if (!WJVSReloadRange(e, c, c.depth - argc - 2)) return false;
   if (!e.writeOp(Op::LocalGet) || !e.writeVarU32(kVStf) || !WJConst(e, 0.0) ||
       !e.writeOp(Op::F64Ne)) {
     return false;
@@ -4620,12 +4716,12 @@ static bool WJVSCall(Encoder& e, WJVSCtx& c, jsbytecode* pc) {
   if (!e.writeOp(Op::If) || !e.writeFixedU8(kVoid)) return false;  // == 2: propagate
   if (!WJVSReturnVal(e, 2.0) || !e.writeOp(Op::End)) return false;
   // deopt 1: callee did not mutate -> generic call (re-marshal first)
-  if (!marshal() || !WJVSCallHelper(e, WJH_CALL, site)) return false;
+  if (!marshal() || !WJVSCallHelper(e, c, WJH_CALL, site, c.depth - argc - 2)) return false;
   if (!e.writeOp(Op::End)) return false;  // end deopt != 0
   if (!e.writeOp(Op::Else)) return false;  // callee guard miss
-  if (!WJVSCallHelper(e, WJH_CALL, site)) return false;
+  if (!WJVSCallHelper(e, c, WJH_CALL, site, c.depth - argc - 2)) return false;
   if (!e.writeOp(Op::End)) return false;  // end guard if
-  if (!WJVSPushResult(e, calleeS)) return false;
+  if (!WJVSPushResult(e, c, calleeS)) return false;
   c.depth -= (argc + 1);
   return true;
 }
@@ -4643,20 +4739,20 @@ static bool WJVSFunctionThis(Encoder& e, WJVSCtx& c) {
     return false;
   }
   if (c.script->strict()) {
-    if (!WJSAddr(e, top) || !e.writeOp(Op::LocalGet) || !e.writeVarU32(kVSt0) ||
-        !WJSStoreEnd(e)) {
+    if (!WJSStorePre(e, c, top) || !e.writeOp(Op::LocalGet) ||
+        !e.writeVarU32(kVSt0) || !WJSStorePost(e, c, top)) {
       return false;
     }
   } else {
     if (!WJSIsObj(e, kVSt0)) return false;
     if (!e.writeOp(Op::If) || !e.writeFixedU8(kVoid)) return false;
-    if (!WJSAddr(e, top) || !e.writeOp(Op::LocalGet) || !e.writeVarU32(kVSt0) ||
-        !WJSStoreEnd(e)) {
+    if (!WJSStorePre(e, c, top) || !e.writeOp(Op::LocalGet) ||
+        !e.writeVarU32(kVSt0) || !WJSStorePost(e, c, top)) {
       return false;
     }
     if (!e.writeOp(Op::Else)) return false;
     if (!WJVSStoreGlobal(e, helpA, kVSt0) ||
-        !WJVSCallHelper(e, WJH_FUNCTIONTHIS, 0) || !WJVSPushResult(e, top)) {
+        !WJVSCallHelper(e, c, WJH_FUNCTIONTHIS, 0, c.depth) || !WJVSPushResult(e, c, top)) {
       return false;
     }
     if (!e.writeOp(Op::End)) return false;
@@ -4664,29 +4760,31 @@ static bool WJVSFunctionThis(Encoder& e, WJVSCtx& c) {
   c.depth++;
   return true;
 }
-// One non-control-flow op in Mode VS (frame-memory operand stack).
+// One non-control-flow op in Mode VS. The operand stack is in wasm locals (or the
+// frame, under GECKO_WJVS_FRAME); args/locals/rval are always in the frame.
 static bool WJEmitOpVS(Encoder& e, jsbytecode* pc, WJVSCtx& c) {
   uint32_t top = c.stackBaseS + c.depth;  // next free stack slot
   switch (JSOp(*pc)) {
     case JSOp::GetArg:
-      if (!WJSAddr(e, top) || !WJSLoadSlot(e, GET_ARGNO(pc)) || !WJSStoreEnd(e)) {
+      if (!WJSStorePre(e, c, top) || !WJSLoad(e, c, GET_ARGNO(pc)) ||
+          !WJSStorePost(e, c, top)) {
         return false;
       }
       c.depth++;
       return true;
     case JSOp::GetLocal:
-      if (!WJSAddr(e, top) || !WJSLoadSlot(e, c.localBaseS + GET_LOCALNO(pc)) ||
-          !WJSStoreEnd(e)) {
+      if (!WJSStorePre(e, c, top) || !WJSLoad(e, c, c.localBaseS + GET_LOCALNO(pc)) ||
+          !WJSStorePost(e, c, top)) {
         return false;
       }
       c.depth++;
       return true;
     case JSOp::SetLocal:  // tee: store tos to local, leave it
       return WJSAddr(e, c.localBaseS + GET_LOCALNO(pc)) &&
-             WJSLoadSlot(e, c.stackBaseS + c.depth - 1) && WJSStoreEnd(e);
+             WJSLoad(e, c, c.stackBaseS + c.depth - 1) && WJSStoreEnd(e);
     case JSOp::SetArg:
       return WJSAddr(e, GET_ARGNO(pc)) &&
-             WJSLoadSlot(e, c.stackBaseS + c.depth - 1) && WJSStoreEnd(e);
+             WJSLoad(e, c, c.stackBaseS + c.depth - 1) && WJSStoreEnd(e);
     case JSOp::Zero:
     case JSOp::One:
     case JSOp::Int8:
@@ -4700,8 +4798,8 @@ static bool WJEmitOpVS(Encoder& e, jsbytecode* pc, WJVSCtx& c) {
                   : JSOp(*pc) == JSOp::Uint16 ? int32_t(GET_UINT16(pc))
                                               : int32_t(GET_UINT24(pc));
       uint64_t bits = (kWJTagInt32 << 32) | uint32_t(v);
-      if (!WJSAddr(e, top) || !e.writeOp(Op::I64Const) ||
-          !e.writeVarS64(int64_t(bits)) || !WJSStoreEnd(e)) {
+      if (!WJSStorePre(e, c, top) || !e.writeOp(Op::I64Const) ||
+          !e.writeVarS64(int64_t(bits)) || !WJSStorePost(e, c, top)) {
         return false;
       }
       c.depth++;
@@ -4727,8 +4825,8 @@ static bool WJEmitOpVS(Encoder& e, jsbytecode* pc, WJVSCtx& c) {
         memcpy(&bits, &d, sizeof(double));
         if (d != d) bits = kWJCanonNaN;
       }
-      if (!WJSAddr(e, top) || !e.writeOp(Op::I64Const) ||
-          !e.writeVarS64(int64_t(bits)) || !WJSStoreEnd(e)) {
+      if (!WJSStorePre(e, c, top) || !e.writeOp(Op::I64Const) ||
+          !e.writeVarS64(int64_t(bits)) || !WJSStorePost(e, c, top)) {
         return false;
       }
       c.depth++;
@@ -4738,8 +4836,8 @@ static bool WJEmitOpVS(Encoder& e, jsbytecode* pc, WJVSCtx& c) {
       JSString* s = c.script->getString(pc);
       if (!s->isAtom()) return false;
       uint64_t bits = (uint64_t(kWJTagString) << 32) | uint32_t(uintptr_t(s));
-      if (!WJSAddr(e, top) || !e.writeOp(Op::I64Const) ||
-          !e.writeVarS64(int64_t(bits)) || !WJSStoreEnd(e)) {
+      if (!WJSStorePre(e, c, top) || !e.writeOp(Op::I64Const) ||
+          !e.writeVarS64(int64_t(bits)) || !WJSStorePost(e, c, top)) {
         return false;
       }
       c.depth++;
@@ -4749,8 +4847,8 @@ static bool WJEmitOpVS(Encoder& e, jsbytecode* pc, WJVSCtx& c) {
       c.depth--;
       return true;
     case JSOp::Dup:
-      if (!WJSAddr(e, top) || !WJSLoadSlot(e, c.stackBaseS + c.depth - 1) ||
-          !WJSStoreEnd(e)) {
+      if (!WJSStorePre(e, c, top) || !WJSLoad(e, c, c.stackBaseS + c.depth - 1) ||
+          !WJSStorePost(e, c, top)) {
         return false;
       }
       c.depth++;
@@ -4781,20 +4879,20 @@ static bool WJEmitOpVS(Encoder& e, jsbytecode* pc, WJVSCtx& c) {
     case JSOp::FunctionThis: return WJVSFunctionThis(e, c);
     case JSOp::Swap: {  // [..,x,y] -> [..,y,x]
       uint32_t s2 = c.stackBaseS + c.depth - 2, s1 = c.stackBaseS + c.depth - 1;
-      return WJSLoadSlot(e, s2) && e.writeOp(Op::LocalSet) && e.writeVarU32(kVSt0) &&
-             WJSAddr(e, s2) && WJSLoadSlot(e, s1) && WJSStoreEnd(e) &&
-             WJSAddr(e, s1) && e.writeOp(Op::LocalGet) && e.writeVarU32(kVSt0) &&
-             WJSStoreEnd(e);
+      return WJSLoad(e, c, s2) && e.writeOp(Op::LocalSet) && e.writeVarU32(kVSt0) &&
+             WJSStorePre(e, c, s2) && WJSLoad(e, c, s1) && WJSStorePost(e, c, s2) &&
+             WJSStorePre(e, c, s1) && e.writeOp(Op::LocalGet) &&
+             e.writeVarU32(kVSt0) && WJSStorePost(e, c, s1);
     }
     case JSOp::SetRval:
-      if (!WJSAddr(e, c.rvalS) || !WJSLoadSlot(e, c.stackBaseS + c.depth - 1) ||
+      if (!WJSAddr(e, c.rvalS) || !WJSLoad(e, c, c.stackBaseS + c.depth - 1) ||
           !WJSStoreEnd(e)) {
         return false;
       }
       c.depth--;
       return true;
     case JSOp::GetRval:
-      if (!WJSAddr(e, top) || !WJSLoadSlot(e, c.rvalS) || !WJSStoreEnd(e)) {
+      if (!WJSStorePre(e, c, top) || !WJSLoad(e, c, c.rvalS) || !WJSStorePost(e, c, top)) {
         return false;
       }
       c.depth++;
@@ -4871,11 +4969,14 @@ static bool WJEmitBodyVS(JSScript* script, Encoder& e, uint32_t nargs,
   if (K == 0 || K > 1024) return false;
   if (!WJStackSafe(script, isStart)) return false;
 
-  // Locals: 2 i64 (t0,t1), 1 f64 (tf), 5 i32 (fb,pc,basesp,ti,ti2).
-  if (!e.writeVarU32(3)) return false;
+  // Locals: 2 i64 (t0,t1), 1 f64 (tf), 5 i32 (fb,pc,basesp,ti,ti2),
+  // kWJVSMaxStack i64 (operand-stack registers s[0..kWJVSMaxStack); used only when
+  // WJVSUseLocals(), but always declared so local indices are stable).
+  if (!e.writeVarU32(4)) return false;
   if (!e.writeVarU32(2) || !e.writeFixedU8(kI64)) return false;
   if (!e.writeVarU32(1) || !e.writeFixedU8(kF64)) return false;
   if (!e.writeVarU32(5) || !e.writeFixedU8(kI32)) return false;
+  if (!e.writeVarU32(kWJVSMaxStack) || !e.writeFixedU8(kI64)) return false;
 
   // Prologue: basesp = gWJFrameSP; overflow -> deopt (pre-bump, sound).
   if (!e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(spAddr)) ||
@@ -4986,7 +5087,7 @@ static bool WJEmitBodyVS(JSScript* script, Encoder& e, uint32_t nargs,
         terminated = true;
       } else if (op == JSOp::Return) {
         // frame[rvalS] = frame[top-1]; br $exit
-        if (!WJSAddr(e, c.rvalS) || !WJSLoadSlot(e, c.stackBaseS + c.depth - 1) ||
+        if (!WJSAddr(e, c.rvalS) || !WJSLoad(e, c, c.stackBaseS + c.depth - 1) ||
             !WJSStoreEnd(e) || !e.writeOp(Op::Br) || !e.writeVarU32(2)) {
           return false;
         }
@@ -5030,7 +5131,7 @@ static bool WJEmitBodyVS(JSScript* script, Encoder& e, uint32_t nargs,
     return false;
   }
   if (!e.writeOp(Op::LocalGet) || !e.writeVarU32(0) ||
-      !e.writeOp(MiscOp::I32TruncSatF64U) || !WJSLoadSlot(e, c.rvalS) ||
+      !e.writeOp(MiscOp::I32TruncSatF64U) || !WJSLoad(e, c, c.rvalS) ||
       !e.writeOp(Op::I64Store) || !e.writeVarU32(3) || !e.writeVarU32(kWJResultOff)) {
     return false;
   }
@@ -5436,14 +5537,18 @@ static bool WJCompile(JSScript* script, WasmJitEntry& entry) {
     }
     modeVS = true;
     useModeV = false;  // Mode VS keeps `hasCall` (call_indirect uses the table)
-  } else if (entry.forceVS && vsOK && !hasCall) {
-    // Adaptive: a chronically-deopting NON-mutating, CALL-FREE function recompiles
-    // as no-restart Mode VS. Restricted to call-free: deep VS->helper->interpreter
-    // ->VS chains (call-heavy recompiled fns) make gecko's GC walk many nested JIT
-    // activation frames -> "memory access out of bounds" in TraceJitFrames (a hard
-    // renderer crash). Call-free recompiled fns don't build those deep chains.
+  } else if (entry.forceVS && vsOK && (!hasCall || WJVSHasCallRecompile())) {
+    // Adaptive: a chronically-deopting NON-mutating function recompiles as no-restart
+    // Mode VS. Historically restricted to call-free (deep VS->helper->interpreter->VS
+    // chains crashed gecko's GC in TraceJitFrames). GECKO_WJVS_HASCALL=1 lifts that
+    // restriction (under investigation) so the hot OO call chain can stay in wasm.
     modeVS = true;
     useModeV = false;
+    if (hasCall && getenv("GECKO_DEBUG_JIT")) {
+      fprintf(stderr, "[wasm-jit]   forceVS-recompile HASCALL fn %s:%u\n",
+              script->filename() ? script->filename() : "?",
+              uint32_t(script->lineno()));
+    }
   }
   int tableId = wasmhost_jit_table();  // shared call_indirect table (created once)
   if (hasCall && tableId < 0) return false;  // can't do calls without the table

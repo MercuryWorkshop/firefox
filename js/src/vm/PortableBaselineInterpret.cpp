@@ -2413,17 +2413,18 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
             }
             retValue = args[0].asRawBits();
           } else {
-            TRACE_PRINTF("pushing callee: %p\n", callee);
-            PUSHNATIVE(
-                StackValNative(CalleeToToken(callee, flags.isConstructing())));
-
-            PUSHNATIVE(StackValNative(
-                MakeFrameDescriptorForJitCall(FrameType::BaselineStub, argc)));
-
             JSScript* script = callee->nonLazyScript();
 #if defined(__EMSCRIPTEN__)
             // JS->wasm JIT: if this callee was lowered to wasm and the args are
             // numbers, run the host-JITed wasm instead of recursing into PBL.
+            // CRITICAL: run the wasm BEFORE pushing the BaselineStub call frame.
+            // A half-pushed call frame (callee token + descriptor with no
+            // BaselineFrame on top) left on the PBL stack while the host wasm
+            // re-enters gecko (wjhelp -> js::Call) makes a nursery GC walk an
+            // inconsistent frame chain -> OOB in TraceJitExitFrame. Pushing it only
+            // on the actual recursion path keeps the stack consistent during the
+            // wasm re-entry. (Was: pushed unconditionally -> deltablue crash when
+            // call-heavy fns recompiled to Mode VS built deep re-entrant chains.)
             uint64_t wbits;
             int wjr = flags.isConstructing()
                           ? 0
@@ -2438,6 +2439,13 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
             } else
 #endif
             {
+              TRACE_PRINTF("pushing callee: %p\n", callee);
+              PUSHNATIVE(
+                  StackValNative(CalleeToToken(callee, flags.isConstructing())));
+
+              PUSHNATIVE(StackValNative(
+                  MakeFrameDescriptorForJitCall(FrameType::BaselineStub, argc)));
+
               jsbytecode* pc = script->code();
               ImmutableScriptData* isd = script->immutableScriptData();
               PBIResult result;

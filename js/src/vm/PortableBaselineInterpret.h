@@ -332,7 +332,8 @@ PBIResult PortableBaselineInterpret(
     JSContext* cx_, State& state, Stack& stack, StackVal* sp,
     JSObject* envChain, Value* ret, jsbytecode* pc, ImmutableScriptData* isd,
     jsbytecode* restartEntryPC, jit::BaselineFrame* restartFrame,
-    StackVal* restartEntryFrame, PBIResult restartCode);
+    StackVal* restartEntryFrame, PBIResult restartCode,
+    const uint64_t* osrLocals = nullptr, uint32_t osrNLocals = 0);
 
 uint8_t* GetPortableFallbackStub(jit::BaselineICFallbackKind kind);
 uint8_t* GetICInterpreter();

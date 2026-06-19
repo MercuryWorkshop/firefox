@@ -66,6 +66,7 @@
 #include "vm/Interpreter-inl.h"
 #include "vm/JSScript-inl.h"
 #include "vm/PlainObject-inl.h"
+#include "vm/Realm-inl.h"  // js::AutoRealm (JS->wasm JIT Phase F resume realm entry)
 
 #if defined(__EMSCRIPTEN__)
 namespace js {
@@ -5971,7 +5972,8 @@ PBIResult PortableBaselineInterpret(
     JSContext* cx_, State& state, Stack& stack, StackVal* sp,
     JSObject* envChain, Value* ret, jsbytecode* pc, ImmutableScriptData* isd,
     jsbytecode* restartEntryPC, BaselineFrame* restartFrame,
-    StackVal* restartEntryFrame, PBIResult restartCode) {
+    StackVal* restartEntryFrame, PBIResult restartCode,
+    const uint64_t* osrLocals, uint32_t osrNLocals) {
 #define RESTART(code)                                                 \
   if (!IsRestart) {                                                   \
     TRACE_PRINTF("Restarting (code %d sp %p fp %p)\n", int(code), sp, \
@@ -6064,6 +6066,18 @@ PBIResult PortableBaselineInterpret(
   sp -= nfixed;
   for (uint32_t i = 0; i < nfixed; i++) {
     sp[i] = StackVal(UndefinedValue());
+  }
+  // JS->wasm JIT Phase F (deopt resume): when resuming a partially-executed Mode VS
+  // function in the interpreter at a non-zero pc, seed the fixed-slot locals with the
+  // values the wasm left in its frame (entering at `pc` skips the prologue that would
+  // otherwise initialize them). Inert (osrLocals == nullptr) on every normal entry.
+  if (osrLocals) {
+    uint32_t n = osrNLocals < nfixed ? osrNLocals : nfixed;
+    for (uint32_t i = 0; i < n; i++) {
+      // local i lives at unaliasedLocal(i) = valueSlot(i) = (Value*)frame-(i+1), which after
+      // `sp = frame; sp -= nfixed` is sp[nfixed-1-i] (the local order is reversed vs sp[]).
+      sp[nfixed - 1 - i] = StackVal(Value::fromRawBits(osrLocals[i]));
+    }
   }
   ret->setUndefined();
 
@@ -9420,6 +9434,67 @@ bool PortableBaselineTrampoline(JSContext* cx, size_t argc, Value* argv,
 
   return true;
 }
+
+#if defined(__EMSCRIPTEN__)
+// JS->wasm JIT Phase F: finish a partially-executed Mode VS function in the interpreter.
+// A fresh PBL activation (modeled on PortableBaselineTrampoline) entered at `pcOff` instead
+// of pc 0, with the fixed-slot locals seeded from `osrLocals` (the values the wasm left in
+// its frame -- entering mid-body skips the prologue that would init them). `pcOff` must be a
+// JumpTarget/LoopHead (the first op resyncs the IC-entry pointer). `args`/`thisBits` are the
+// original call inputs (resume is only used for no-SetArg bodies, so they are still valid).
+// Returns false + leaves an exception pending on error.
+bool WasmJitResumeViaPBL(JSContext* cx, JSScript* script, uint64_t thisBits,
+                         const Value* args, uint32_t argc, JSObject* envChain,
+                         const uint64_t* osrLocals, uint32_t nLocals,
+                         uint32_t pcOff, uint64_t* retBits) {
+  JSFunction* fun = script->function();
+  if (!fun) return false;
+  // Enter the function's realm: the resumed frame's realm must equal cx->realm() (the normal
+  // call machinery does this; our direct re-entry must too, else the frame realm-check in
+  // exception unwinding / DebugEpilogue asserts). Required when reached from js::Interpret.
+  js::AutoRealm ar(cx, fun);
+  // The PBL frames pushed below must live under a JitActivation (GC's TraceActivations walks
+  // them via the jit exit-FP chain; the PBL call sites assume cx->activation()->asJit()).
+  // When resume is reached via the PBL path the enclosing JitActivation already exists; when
+  // reached via the js::Interpret -> WasmJitRunCall shortcut (an InterpreterActivation), there
+  // is none -> a nursery GC mid-resume mis-traces the interpreter frame (splay crash). Push a
+  // JitActivation here iff we are not already in one.
+  mozilla::Maybe<js::jit::JitActivation> jitAct;
+  if (!cx->activation() || !cx->activation()->isJit()) {
+    jitAct.emplace(cx);
+  }
+  // PBL needs IC entries (jitScript). It was pre-created at compile time (WJCompile) in a
+  // clean context -- creating it HERE (nested inside a wasm call) corrupted the IC LifoAlloc.
+  // AutoKeepJitScripts must outlive the whole PBL run below (PBL uses frame->icScript()).
+  js::jit::AutoKeepJitScripts keep(cx);
+  if (!script->hasJitScript()) {
+    return false;
+  }
+  State state(cx);
+  Stack stack(cx->portableBaselineStack());
+  StackVal* sp = stack.top;
+  CalleeToken calleeToken = CalleeToToken(fun, /*constructing=*/false);
+  size_t numFormals = fun->nargs();
+  size_t numActuals = std::max<size_t>(argc, numFormals);
+  size_t numUndefs = numActuals - argc;
+  for (size_t i = 0; i < numUndefs; i++) PUSH(StackVal(UndefinedValue()));
+  for (size_t i = 0; i < argc; i++) PUSH(StackVal(args[argc - 1 - i]));  // argN..arg1
+  PUSH(StackVal(Value::fromRawBits(thisBits)));                         // `this` (argv[-1])
+  PUSHNATIVE(StackValNative(calleeToken));
+  PUSHNATIVE(
+      StackValNative(MakeFrameDescriptorForJitCall(FrameType::CppToJSJit, argc)));
+  jsbytecode* pc = script->code() + pcOff;
+  ImmutableScriptData* isd = script->immutableScriptData();
+  Value result;
+  PBIResult ret = PortableBaselineInterpret<false, kHybridICsInterp>(
+      cx, state, stack, sp, envChain, &result, pc, isd, nullptr, nullptr,
+      nullptr, PBIResult::Ok, osrLocals, nLocals);
+  fprintf(stderr, "[resume] post-PBL ret=%d\n", int(ret)); fflush(stderr);
+  if (ret == PBIResult::Error || ret == PBIResult::UnwindError) return false;
+  *retBits = result.asRawBits();
+  return true;
+}
+#endif
 
 MethodStatus CanEnterPortableBaselineInterpreter(JSContext* cx,
                                                  RunState& state) {

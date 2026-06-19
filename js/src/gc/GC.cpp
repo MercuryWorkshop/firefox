@@ -1038,7 +1038,7 @@ bool GCRuntime::init(uint32_t maxbytes) {
   Arena::checkLookupTables();
 
   if (!TlsGCContext.init()) {
-    return false;
+return false;
   }
   TlsGCContext.set(&mainThreadContext.ref());
 
@@ -1052,7 +1052,7 @@ bool GCRuntime::init(uint32_t maxbytes) {
 #endif
 
   if (!resizeMarkersVector()) {
-    return false;
+return false;
   }
 
   {
@@ -1061,7 +1061,7 @@ bool GCRuntime::init(uint32_t maxbytes) {
     MOZ_ALWAYS_TRUE(tunables.setParameter(JSGC_MAX_BYTES, maxbytes));
 
     if (!nursery().init(lock)) {
-      return false;
+return false;
     }
   }
 
@@ -1079,12 +1079,12 @@ bool GCRuntime::init(uint32_t maxbytes) {
   }
 
   if (!initSweepActions()) {
-    return false;
+return false;
   }
 
   UniquePtr<Zone> zone = MakeUnique<Zone>(rt, Zone::AtomsZone);
   if (!zone || !zone->init()) {
-    return false;
+return false;
   }
 
   // The atoms zone is stored as the first element of the zones vector.

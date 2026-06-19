@@ -1938,6 +1938,22 @@ bool DocumentLoadListener::MaybeTriggerProcessSwitch(
   MOZ_DIAGNOSTIC_ASSERT(mParentChannelListener);
   MOZ_DIAGNOSTIC_ASSERT(aWillSwitchToRemote);
 
+#if defined(__EMSCRIPTEN__)
+  // Single-process wasm embedding: no content/extension subprocess can ever be
+  // launched (fork/socketpair are unsupported). A process switch therefore always
+  // fails at child-process launch ("Failed to launch tab subprocess"), which aborts
+  // the document load and leaves the tab stuck at about:blank. Force every
+  // navigation to stay in the current (parent) process. This is correct because
+  // e10s/Fission are disabled here and every document already runs in the parent;
+  // the only loads that would otherwise switch are ones an active extension pushes
+  // into a "web"/"extension" content process (e.g. uBlock Origin once its filters
+  // load and it attaches content scripts / a response StreamFilter). Those now load
+  // in-process: content scripts still inject (the extension is in the parent too),
+  // and a cross-process StreamFilter just degrades to no filtering for that request.
+  *aWillSwitchToRemote = false;
+  return false;
+#endif
+
   MOZ_LOG(gProcessIsolationLog, LogLevel::Verbose,
           ("DocumentLoadListener MaybeTriggerProcessSwitch [this=%p, uri=%s, "
            "browserid=%" PRIx64 "]",

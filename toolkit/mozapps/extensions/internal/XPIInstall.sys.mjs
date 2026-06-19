@@ -915,9 +915,11 @@ function shouldVerifySignedState(aAddonType, aLocation) {
     return false;
   }
 
-  // Otherwise only check signatures if the add-on is one of the signed
-  // types.
-  return XPIExports.XPIDatabase.SIGNED_TYPES.has(aAddonType);
+  // gecko-wasm: this single-process wasm embedding doesn't enforce add-on signing,
+  // and the async NSS verification (gCertDB.openSignedAppFileAsync) never completes
+  // here -> a normal extension install hangs forever at "Verifying". Skip signature
+  // verification for non-system add-ons (system add-ons above still verify).
+  return false;
 }
 
 /**

@@ -719,7 +719,13 @@
 
           // In this case we default to the privileged about process as that's
           // the best guess we can make, and we'll likely need it eventually.
-          remoteType = E10SUtils.PRIVILEGEDABOUT_REMOTE_TYPE;
+          // ...but only when this window is multiprocess. In a single-process
+          // build (e10s off) there's no content process to host a remote browser,
+          // so a remote initial browser is stuck in a broken remote=true /
+          // remoteType=null state; default to the parent process instead.
+          remoteType = gMultiProcessBrowser
+            ? E10SUtils.PRIVILEGEDABOUT_REMOTE_TYPE
+            : E10SUtils.NOT_REMOTE;
         }
       }
 

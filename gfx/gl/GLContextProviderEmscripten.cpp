@@ -231,10 +231,17 @@ class GLContextEmscripten final : public GLContext {
               // opaque rendered content).
               o.style.position = 'absolute';
               o.style.border = 'none';
-              o.style.left = (screen.clientLeft || 0) + 'px';  // inside #screen's border
-              o.style.top = (screen.clientTop || 0) + 'px';
-              o.style.width = screen.width + 'px';   // overlay #screen's content box
-              o.style.height = screen.height + 'px';
+              // Fill the viewport like #screen (CSS 100vw/100vh) rather than fixing
+              // a pixel size: on window resize the compositor resizes the offscreen
+              // #screen canvas (RenderCompositorOGL::BeginFrame) so the presented
+              // ImageBitmap is the new window size, and transferFromImageBitmap
+              // updates this canvas's backing to match -- so a viewport-filling CSS
+              // box keeps the displayed frame 1:1 at any size. A fixed px size would
+              // leave the chrome clipped/mispositioned after a resize.
+              o.style.left = '0';
+              o.style.top = '0';
+              o.style.width = '100vw';
+              o.style.height = '100vh';
               o.style.pointerEvents = 'none';
               (screen.parentNode || document.body).appendChild(o);
             }

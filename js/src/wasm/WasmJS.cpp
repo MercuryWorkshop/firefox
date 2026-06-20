@@ -21,7 +21,9 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>     // JS->wasm JIT (Ion front-end) recursive inliner
 #include <unordered_map>  // JS->wasm JIT script cache
+#include <unordered_set>  // JS->wasm JIT (Ion front-end) loop-head set
 #include <vector>         // JS->wasm JIT basic-block analysis
 
 #include "jsapi.h"
@@ -34,10 +36,21 @@
 #include "frontend/FrontendContext.h"  // AutoReportFrontendContext
 #include "gc/GCContext.h"
 #include "jit/AtomicOperations.h"
+#include "jit/CompileInfo.h"          // ION-REWRITE: bytecode->MIR front-end + OptimizeMIR reuse
 #include "jit/FlushICache.h"
+#include "jit/Ion.h"                  // ION-REWRITE: OptimizeMIR
+#include "jit/IonOptimizationLevels.h"  // ION-REWRITE: IonOptimizations / OptimizationLevel::Wasm
 #include "jit/JitContext.h"
 #include "jit/JitOptions.h"
 #include "jit/JitScript.h"  // PHASE F: pre-create JitScript at compile for deopt-resume
+#include "jit/BaselineIC.h"      // ION-REWRITE: read Baseline ICs (decoupled oracle)
+#include "jit/CacheIR.h"         // ION-REWRITE: CacheOp / CacheIROpInfos
+#include "jit/CacheIRReader.h"   // ION-REWRITE: iterate CacheIR ops
+#include "jit/CacheIRCompiler.h"  // ION-REWRITE: CacheIRStubInfo stub-field access
+#include "jit/MIR-wasm.h"             // ION-REWRITE: MWasm* nodes
+#include "jit/MIR.h"                  // ION-REWRITE: MConstant/MAdd/MUnreachable/...
+#include "jit/MIRGenerator.h"         // ION-REWRITE: MIRGenerator
+#include "jit/MIRGraph.h"             // ION-REWRITE: MIRGraph/MBasicBlock
 #include "jit/Simulator.h"
 #include "js/ColumnNumber.h"  // JS::ColumnNumberOneOrigin
 #include "js/ForOfIterator.h"
@@ -2138,7 +2151,8 @@ enum WJHelperKind {
   WJH_POSTBARRIER,  // GC post-write barrier for an object-valued inline SetProp store
   WJH_RESUME,  // PHASE F: self-resume the bailing fn in PBL from gWJHelpA=script,gWJHelpB=basesp
   WJH_NEWOBJECT,  // ALLOC: create the object-literal/template object for this NewObject/NewInit site
-  WJH_INITPROP   // ALLOC: define a data property (constructor `this.x=v` / object literal); leaves obj
+  WJH_INITPROP,   // ALLOC: define a data property (constructor `this.x=v` / object literal); leaves obj
+  WJH_IONCALL    // reused-Ion non-inlined call: a=callee fn, gWJHelpB=argc, this/args in gWJScratch
 };
 
 struct WasmJitEntry {
@@ -2157,6 +2171,10 @@ struct WasmJitEntry {
   bool wantInline = false;     // recompile with leaf-method inlining (ICs warm)
   bool wantBake = false;       // LEAN EMISSION: recompile baking shape/off constants (ICs warm)
   bool triggeredInline = false;  // one-shot: don't re-trigger the inline recompile
+  bool isIon = false;          // installed via the reused-Ion pipeline (IONINT)
+  bool ionWarmTried = false;   // one-shot: retried Ion after ICs warmed
+  uint32_t ionBackoff = 0;     // PBL->Ion: calls to wait before retrying Ion compile
+  uint8_t ionFails = 0;        // PBL->Ion: failed Ion-compile attempts (retry cap)
   bool hasCall = false;        // contains JSOp::Call (an inline-recompile candidate)
   bool hasMathCall = false;    // observed a Math.* intrinsic call (triggers a recompile to emit it)
   bool usesAliased = false;    // contains JSOp::GetAliasedVar -> never a fast-call target
@@ -4297,8 +4315,44 @@ static std::unordered_map<uint64_t, WJInlineRec> gWJInlineCallee;
 // emit `i32/i64.load(this + <off>)` after ONE hoisted `this.shape==<shape> else deopt`, instead
 // of the per-access IC-table load + shape compare + branch. Recorded at WJFillIC; read at the
 // specialized recompile. Only own data props (holder==0), non-poly sites.
-struct WJShapeRec { uint32_t shape; uint32_t off; };
+struct WJShapeRec { uint32_t shape; uint32_t off; uint8_t vty; };  // vty: 0=double 1=int32 2=other
 static std::unordered_map<uint64_t, WJShapeRec> gWJShapeRec;
+// Polymorphic method-dispatch record: per method-load GetProp site (script,pcOff),
+// up to 4 (receiver shape -> method JSFunction low32) pairs observed at IC-fill.
+// The Ion front-end builds a receiver-shape dispatch chain that inlines each task
+// type's method body (richards' task.run is megamorphic over 4 task types).
+struct WJMethodPolyRec {
+  uint32_t shapes[4] = {0, 0, 0, 0};
+  uint32_t fns[4] = {0, 0, 0, 0};
+  uint8_t n = 0;
+};
+static std::unordered_map<uint64_t, WJMethodPolyRec> gWJMethodPoly;
+// (shape, byte-offset) -> observed field value type (vty 0/1/3), populated by any
+// wj-compiled function's runtime IC fill. The Baseline-IC oracle (WJReadBaselineICs)
+// has shape+offset from CacheIR but NOT the value type (typeData is unpopulated in
+// the portable-baseline build), so it reuses a vty observed by another function
+// that accessed the same shape's field. Keyed (shape<<32)|offset.
+static std::unordered_map<uint64_t, uint8_t> gWJFieldVty;
+// shape low32 -> a live object pointer (low32) of that shape, captured at IC-fill.
+// Lets the Ion oracle read the value type of ANY field of an observed shape (even
+// fields no function accessed) by walking a representative instance at compile
+// time -> unboxed typed loads instead of the boxed/tag-dispatch path. Validated
+// (shape word still matches) before use; cleared on GC (addresses can be reused).
+static std::unordered_map<uint32_t, uint32_t> gWJShapeSample;
+// Dense-array element site (GetElem/SetElem): the observed array shape, so the
+// Ion FE can shape-guard then load/store elements_[index] directly. Keyed
+// (script,pcOff).
+static std::unordered_map<uint64_t, uint32_t> gWJElemShape;
+// Program-wide own-property record keyed by property NAME (atom low32): the
+// (shape, offset, vty) seen for that name, or ambiguous if seen on >1 shape/off.
+// Lets a COLD GetProp site (fallback-only IC, e.g. a rarely-taken branch) resolve
+// a monomorphic-by-name field via a shape guard, even with no per-site IC data.
+struct WJPropRec { uint32_t shape; uint32_t off; uint8_t vty; bool ambig; };
+static std::unordered_map<uint32_t, WJPropRec> gWJPropByName;
+// Ion-rewrite property-access gate: a sample live receiver objptr (i32) per
+// (script,pcOff), captured at IC-fill so the self-contained Ion front-end test
+// can pass a real object to its compiled wasm. Test-only; not used in production.
+static std::unordered_map<uint64_t, uint32_t> gWJSampleRecv;
 static uint64_t gWJInlinedCalls = 0;  // call sites emitted as inline bodies (diagnostic)
 static bool gWJEmitInline = false;  // this compile may inline (set in WJCompile)
 static bool gWJEmitBake = false;  // LEAN EMISSION: this (specialized) compile bakes shape/off constants
@@ -8561,6 +8615,7 @@ static void WJFillIC(uint32_t site) {
   // Resolve the property to {recvShape, off, holder(0=own), holderShape}. Returns
   // (via the lambda) false on anything unsupported (accessor, missing, etc.).
   uint32_t recvShape = 0, offVal = 0, holderVal = 0, holderShapeVal = 0;
+  uint32_t methodFnLow = 0;  // proto-method JSFunction low32 (for poly dispatch)
   bool resolved = false;
   if (gWJSiteLen[site]) {
     // Length site: cache the shape only for dense arrays (the emit loads the
@@ -8599,6 +8654,10 @@ static void WJFillIC(uint32_t site) {
         offVal = encodeOff(hp->slot(), hobj.numFixedSlots());
         holderVal = uint32_t(uintptr_t(&hobj));
         holderShapeVal = uint32_t(uintptr_t(hobj.shape()));
+        JS::Value mval = hobj.getSlot(hp->slot());
+        if (mval.isObject() && mval.toObject().is<JSFunction>()) {
+          methodFnLow = uint32_t(uintptr_t(&mval.toObject()));
+        }
         resolved = true;
       }
     }
@@ -8644,6 +8703,27 @@ static void WJFillIC(uint32_t site) {
   holderCell(useWay) = holderVal;
   holderShapeCell(useWay) = holderShapeVal;
   shapeCell(useWay) = recvShape;  // shape last
+  // Capture a representative live instance of this shape for the Ion oracle's
+  // field-type reading (unboxing). Overwrite freely -- the latest is freshest.
+  gWJShapeSample[recvShape] = uint32_t(uintptr_t(&nobj));
+  // Polymorphic method dispatch: record (recvShape -> methodFn) for a proto-method
+  // GetProp so the Ion front-end can inline each task type's body behind a shape
+  // guard. Also capture a sample receiver (method sites have no own-field record).
+  if (op == JSOp::GetProp && holderVal != 0 && methodFnLow) {
+    WJMethodPolyRec& m = gWJMethodPoly[WJInlineKey(s.script, s.pcOff)];
+    bool seen = false;
+    for (uint8_t i = 0; i < m.n; i++) {
+      if (m.shapes[i] == recvShape) { m.fns[i] = methodFnLow; seen = true; break; }
+    }
+    if (!seen && m.n < 4) {
+      m.shapes[m.n] = recvShape;
+      m.fns[m.n] = methodFnLow;
+      m.n++;
+    }
+    if (gWJSampleRecv.find(WJInlineKey(s.script, s.pcOff)) == gWJSampleRecv.end()) {
+      gWJSampleRecv[WJInlineKey(s.script, s.pcOff)] = uint32_t(uintptr_t(&nobj));
+    }
+  }
   // LEAN EMISSION foundation: record own-monomorphic {shape,off} by (script,pcOff) for a
   // specialized recompile to bake as constants. Own data prop only (holder==0), non-poly,
   // non-length, fixed-or-dyn offset. Skipped for proto/poly/length sites (not bakeable as a
@@ -8653,7 +8733,28 @@ static void WJFillIC(uint32_t site) {
   // record the observed shape; the baked guard falls to the helper on any shape mismatch.
   if (holderVal == 0 && !gWJSiteLen[site] &&
       (op == JSOp::GetProp || op == JSOp::SetProp || op == JSOp::StrictSetProp)) {
-    gWJShapeRec[WJInlineKey(s.script, s.pcOff)] = WJShapeRec{recvShape, offVal};
+    // Record the field's observed value type so the Ion front-end can specialize
+    // the unboxed load: int32-valued fields (richards' common case) are stored as
+    // int32-boxed Values, NOT double bits, so a raw f64 load would read NaN.
+    uint8_t vty = 2;  // other: not f64-able (bail)
+    {
+      // Slot index from the byte offset (fixed: 16+slot*8; dynamic: encodes
+      // slot-nfixed). Read its observed value type for the Ion FE's unboxing.
+      uint32_t slot = (offVal & kWJDynSlot)
+                          ? (((offVal & ~kWJDynSlot) / 8) + nobj.numFixedSlots())
+                          : ((offVal - 16) / 8);
+      JS::Value fv = nobj.getSlot(slot);
+      if (fv.isInt32()) vty = 1;
+      else if (fv.isDouble()) vty = 0;
+      else if (fv.isObject() || fv.isNull()) vty = 3;  // object-or-null ref field
+    }
+    gWJShapeRec[WJInlineKey(s.script, s.pcOff)] = WJShapeRec{recvShape, offVal, vty};
+    gWJSampleRecv[WJInlineKey(s.script, s.pcOff)] = uint32_t(uintptr_t(&nobj));
+    // Share the observed value type by (shape, offset) so the Baseline-IC oracle
+    // can type fields of functions the WJ JIT never compiled.
+    if (vty != 2) {
+      gWJFieldVty[(uint64_t(recvShape) << 32) | offVal] = vty;
+    }
   }
 }
 
@@ -8773,6 +8874,11 @@ static void WJFinalizeCB(JS::GCContext*, JSFinalizeStatus status, void*) {
   // them. Drop them (re-recorded on the next miss) so a recompile never derefs a stale
   // address.
   gWJInlineCallee.clear();
+  gWJMethodPoly.clear();  // raw JSFunction*/shape addresses; re-recorded on next miss
+  gWJFieldVty.clear();    // shape addresses can be reused across GC -> drop
+  gWJElemShape.clear();
+  gWJPropByName.clear();  // shape/atom addresses can be reused across GC
+  gWJShapeSample.clear();  // raw object pointers; dead after GC
 }
 
 extern "C" void WJTraceRoots(JSTracer* trc, void*);  // defined near wjhelp (below)
@@ -8812,7 +8918,2847 @@ static bool WJModeVSSupported(JSOp op) {
   }
 }
 
+// ===================== ION MIDDLE-END SMOKE TEST =====================
+// Gate for the Ion-tier rewrite. The plan: drive Ion's MIR optimizer
+// (OptimizeMIR -> GVN/LICM/ScalarReplacement/AliasAnalysis) from a JS-bytecode
+// -> MIR front-end, then emit wasm from the optimized SSA graph. That only works
+// if the middle-end actually RUNS in this JS_CODEGEN_NONE build (no native
+// backend). This builds a trivial wasm-mode MIR graph and runs OptimizeMIR on it
+// to confirm it executes (vs assert/crash). Gated by GECKO_WJVS_IONSMOKE.
+static void WJIonSmokeTest() {
+  using namespace js::jit;
+  fprintf(stderr, "[ion-smoke] begin\n");
+  fflush(stderr);
+
+  LifoAlloc lifo(TempAllocator::PreferredLifoChunkSize,
+                 js::BackgroundMallocArena);
+  TempAllocator alloc(&lifo);
+  JitContext jitContext;  // wasm-compilation ctor; compilingWasm() comes from CompileInfo
+
+  CompileInfo compileInfo(/*nlocals=*/0);  // script()==nullptr => compilingWasm()
+  MIRGraph graph(&alloc);
+  JitCompileOptions options;
+  MIRGenerator mirGen(/*realm=*/nullptr, options, &alloc, &graph, &compileInfo,
+                      IonOptimizations.get(OptimizationLevel::Wasm),
+                      /*wasmCodeMeta=*/nullptr);
+
+  // Trivial but non-empty graph: two congruent int32 constants + an add, then a
+  // control terminator. GVN should fold c1==c2; DCE should drop the dead add.
+  MBasicBlock* entry =
+      MBasicBlock::New(graph, compileInfo, /*pred=*/nullptr, MBasicBlock::NORMAL);
+  if (!entry) {
+    fprintf(stderr, "[ion-smoke] block alloc FAILED\n");
+    fflush(stderr);
+    return;
+  }
+  graph.addBlock(entry);
+
+  MConstant* c1 = MConstant::NewInt32(alloc, 21);
+  MConstant* c2 = MConstant::NewInt32(alloc, 21);
+  entry->add(c1);
+  entry->add(c2);
+  MAdd* sum = MAdd::NewWasm(alloc, c1, c2, MIRType::Int32);
+  entry->add(sum);
+  entry->end(MUnreachable::New(alloc));
+
+  fprintf(stderr, "[ion-smoke] graph built (%zu blocks), calling OptimizeMIR...\n",
+          graph.numBlocks());
+  fflush(stderr);
+
+  bool ok = OptimizeMIR(&mirGen);
+
+  fprintf(stderr, "[ion-smoke] OptimizeMIR returned %d, blocks now=%zu\n",
+          (int)ok, graph.numBlocks());
+  fflush(stderr);
+}
+
+// ===================== ION MIR -> WASM BACK-END =====================
+// The novel half of the Ion-reuse rewrite: walk an OptimizeMIR'd SSA graph and
+// emit a wasm function body. Strategy: every MDefinition that is used gets its own
+// wasm LOCAL; each instruction computes its value (pushing operands via local.get)
+// then local.set's its own local. This "value-per-local" form is trivially correct
+// and lets the HOST engine (V8/TurboFan) re-run real register allocation + folding.
+// Control-flow + phis come later; slice 1 handles a single block ending in a return.
+
+static uint8_t WJWasmValType(js::jit::MIRType t) {
+  using js::jit::MIRType;
+  switch (t) {
+    case MIRType::Int32:   return uint8_t(TypeCode::I32);
+    case MIRType::Int64:   return uint8_t(TypeCode::I64);
+    case MIRType::Double:  return uint8_t(TypeCode::F64);
+    case MIRType::Float32: return uint8_t(TypeCode::F32);
+    case MIRType::Pointer: return uint8_t(TypeCode::I32);  // wasm32
+    default:               return 0;  // unsupported
+  }
+}
+
+namespace {
+// Per-compilation back-end state: maps each MDefinition id() to a wasm local slot.
+struct WJIonBackend {
+  std::vector<int32_t> localOf;   // def id -> wasm local index (-1 = none)
+  std::vector<uint8_t> localTy;   // wasm valtype per assigned local (in index order)
+  uint32_t paramCount = 0;        // wasm function params occupy the low local indices
+
+  int32_t local(const js::jit::MDefinition* d) const {
+    uint32_t id = d->id();
+    return id < localOf.size() ? localOf[id] : -1;
+  }
+  void ensureSize(uint32_t id) {
+    if (id >= localOf.size()) localOf.resize(id + 1, -1);
+  }
+  // Assign a fresh local for def d (call in emission order so indices are stable).
+  int32_t assign(const js::jit::MDefinition* d) {
+    ensureSize(d->id());
+    if (localOf[d->id()] >= 0) return localOf[d->id()];
+    uint8_t ty = WJWasmValType(d->type());
+    int32_t idx = int32_t(paramCount + localTy.size());
+    localTy.push_back(ty);
+    localOf[d->id()] = idx;
+    return idx;
+  }
+};
+}  // namespace
+
+// Emit `local.get` for an operand's value (it must already have a local assigned).
+static bool WJIonGetOperand(Encoder& e, WJIonBackend& be,
+                            const js::jit::MDefinition* d) {
+  int32_t l = be.local(d);
+  if (l < 0) return false;
+  return e.writeOp(Op::LocalGet) && e.writeVarU32(uint32_t(l));
+}
+
+// Emit the value-computation for one instruction, leaving its result on the wasm
+// stack. Returns false on an unsupported node.
+static bool WJIonEmitValue(Encoder& e, WJIonBackend& be,
+                           js::jit::MDefinition* ins) {
+  using namespace js::jit;
+  switch (ins->op()) {
+    case MDefinition::Opcode::Constant: {
+      MConstant* c = ins->toConstant();
+      if (c->type() == MIRType::Int32) {
+        return e.writeOp(Op::I32Const) && e.writeVarS32(c->toInt32());
+      }
+      if (c->type() == MIRType::Int64) {
+        return e.writeOp(Op::I64Const) && e.writeVarS64(c->toInt64());
+      }
+      if (c->type() == MIRType::Double) {
+        return e.writeOp(Op::F64Const) && e.writeFixedF64(c->numberToDouble());
+      }
+      return false;
+    }
+    case MDefinition::Opcode::ReinterpretCast: {
+      // Bit-cast between same-width int/float. Used to unbox a boxed double Value
+      // (i64) to f64, and to re-box an f64 number into a double Value (i64).
+      if (!WJIonGetOperand(e, be, ins->getOperand(0))) return false;
+      MIRType from = ins->getOperand(0)->type();
+      if (from == MIRType::Int64 && ins->type() == MIRType::Double) {
+        return e.writeOp(Op::F64ReinterpretI64);
+      }
+      if (from == MIRType::Double && ins->type() == MIRType::Int64) {
+        return e.writeOp(Op::I64ReinterpretF64);
+      }
+      return false;
+    }
+    case MDefinition::Opcode::ExtendInt32ToInt64: {
+      if (!WJIonGetOperand(e, be, ins->getOperand(0))) {
+        MDefinition* od = ins->getOperand(0);
+        fprintf(stderr, "[ion-be] Extend operand op#%u type%u no-local\n",
+                unsigned(od->op()), unsigned(od->type()));
+        if (od->isPhi()) {
+          MPhi* p = od->toPhi();
+          for (size_t pi = 0; pi < p->numOperands(); pi++) {
+            MDefinition* in = p->getOperand(pi);
+            fprintf(stderr, "[ion-be]   phi in#%zu op#%u type%u\n", pi,
+                    unsigned(in->op()), unsigned(in->type()));
+          }
+        }
+        return false;
+      }
+      return e.writeOp(ins->toExtendInt32ToInt64()->isUnsigned()
+                           ? Op::I64ExtendI32U
+                           : Op::I64ExtendI32S);
+    }
+    case MDefinition::Opcode::TruncateToInt32: {
+      // JS ToInt32 of a number. Use the SATURATING truncation (trunc_sat): JS
+      // ToInt32 must NEVER trap (NaN -> 0), whereas i32.trunc_f64_s TRAPS on NaN
+      // or out-of-range. Exact for in-range integers (richards' small ints); full
+      // JS modulo-2^32 wrap-around is not modeled (clamps instead).
+      if (!WJIonGetOperand(e, be, ins->getOperand(0))) return false;
+      if (ins->getOperand(0)->type() == MIRType::Double) {
+        return e.writeOp(MiscOp::I32TruncSatF64S);
+      }
+      return ins->getOperand(0)->type() == MIRType::Int32;  // already i32
+    }
+    case MDefinition::Opcode::WasmBinaryBitwise: {
+      if (!WJIonGetOperand(e, be, ins->getOperand(0)) ||
+          !WJIonGetOperand(e, be, ins->getOperand(1))) {
+        return false;
+      }
+      auto sub = ins->toWasmBinaryBitwise()->subOpcode();
+      bool i64 = ins->type() == MIRType::Int64;
+      switch (sub) {
+        case MWasmBinaryBitwise::SubOpcode::And:
+          return e.writeOp(i64 ? Op::I64And : Op::I32And);
+        case MWasmBinaryBitwise::SubOpcode::Or:
+          return e.writeOp(i64 ? Op::I64Or : Op::I32Or);
+        case MWasmBinaryBitwise::SubOpcode::Xor:
+          return e.writeOp(i64 ? Op::I64Xor : Op::I32Xor);
+      }
+      return false;
+    }
+    case MDefinition::Opcode::WJIonCall: {
+      // Non-inlined call: callee operand -> gWJHelpA, argc -> gWJHelpB, then
+      // wjhelp(WJH_IONCALL,0). Args/this were marshalled to gWJScratch by the
+      // preceding stores. On deopt (!=0) return 1.0; else load the i64 result.
+      MWJIonCall* call = ins->toWJIonCall();
+      uint32_t helpA = uint32_t(uintptr_t(&gWJHelpA));
+      uint32_t helpB = uint32_t(uintptr_t(&gWJHelpB));
+      uint32_t resAddr = uint32_t(uintptr_t(&gWJScratch[kWJResultSlot]));
+      if (!e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(helpA))) return false;
+      if (!WJIonGetOperand(e, be, call->callee())) return false;  // i64 callee
+      if (!e.writeOp(Op::I64Store) || !e.writeVarU32(3) || !e.writeVarU32(0)) {
+        return false;
+      }
+      if (!e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(helpB)) ||
+          !e.writeOp(Op::I64Const) || !e.writeVarS64(int64_t(call->argc())) ||
+          !e.writeOp(Op::I64Store) || !e.writeVarU32(3) || !e.writeVarU32(0)) {
+        return false;
+      }
+      if (!e.writeOp(Op::F64Const) || !e.writeFixedF64(double(WJH_IONCALL)) ||
+          !e.writeOp(Op::F64Const) || !e.writeFixedF64(0.0) ||
+          !e.writeOp(Op::Call) || !e.writeVarU32(kWJVSHelpIdx)) {
+        return false;  // -> f64 deopt code
+      }
+      if (!e.writeOp(Op::F64Const) || !e.writeFixedF64(0.0) ||
+          !e.writeOp(Op::F64Ne) || !e.writeOp(Op::If) ||
+          !e.writeFixedU8(0x40)) {
+        return false;  // if (deopt != 0)
+      }
+      if (!e.writeOp(Op::F64Const) || !e.writeFixedF64(1.0) ||
+          !e.writeOp(Op::Return) || !e.writeOp(Op::End)) {
+        return false;  //   return 1.0 (whole fn deopts to interpreter)
+      }
+      if (!e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(resAddr)) ||
+          !e.writeOp(Op::I64Load) || !e.writeVarU32(3) || !e.writeVarU32(0)) {
+        return false;  // result (i64) on stack
+      }
+      return true;
+    }
+    case MDefinition::Opcode::Lsh:
+    case MDefinition::Opcode::Rsh:
+    case MDefinition::Opcode::Ursh: {
+      if (!WJIonGetOperand(e, be, ins->getOperand(0)) ||
+          !WJIonGetOperand(e, be, ins->getOperand(1))) {
+        return false;
+      }
+      return e.writeOp(ins->isLsh()   ? Op::I32Shl
+                       : ins->isRsh() ? Op::I32ShrS
+                                      : Op::I32ShrU);
+    }
+    case MDefinition::Opcode::WasmSelect: {
+      MWasmSelect* sel = ins->toWasmSelect();
+      if (!WJIonGetOperand(e, be, sel->trueExpr()) ||
+          !WJIonGetOperand(e, be, sel->falseExpr()) ||
+          !WJIonGetOperand(e, be, sel->condExpr())) {
+        return false;
+      }
+      return e.writeOp(Op::SelectNumeric);
+    }
+    case MDefinition::Opcode::WasmFloatConstant: {
+      MWasmFloatConstant* c = ins->toWasmFloatConstant();
+      if (c->type() == MIRType::Double) {
+        return e.writeOp(Op::F64Const) && e.writeFixedF64(c->toDouble());
+      }
+      return false;
+    }
+    case MDefinition::Opcode::Add: {
+      if (!WJIonGetOperand(e, be, ins->getOperand(0)) ||
+          !WJIonGetOperand(e, be, ins->getOperand(1))) {
+        return false;
+      }
+      if (ins->type() == MIRType::Int32) return e.writeOp(Op::I32Add);
+      if (ins->type() == MIRType::Double) return e.writeOp(Op::F64Add);
+      return false;
+    }
+    case MDefinition::Opcode::Sub: {
+      if (!WJIonGetOperand(e, be, ins->getOperand(0)) ||
+          !WJIonGetOperand(e, be, ins->getOperand(1))) {
+        return false;
+      }
+      if (ins->type() == MIRType::Int32) return e.writeOp(Op::I32Sub);
+      if (ins->type() == MIRType::Double) return e.writeOp(Op::F64Sub);
+      return false;
+    }
+    case MDefinition::Opcode::Mul: {
+      if (!WJIonGetOperand(e, be, ins->getOperand(0)) ||
+          !WJIonGetOperand(e, be, ins->getOperand(1))) {
+        return false;
+      }
+      if (ins->type() == MIRType::Int32) return e.writeOp(Op::I32Mul);
+      if (ins->type() == MIRType::Double) return e.writeOp(Op::F64Mul);
+      return false;
+    }
+    case MDefinition::Opcode::Div: {
+      if (!WJIonGetOperand(e, be, ins->getOperand(0)) ||
+          !WJIonGetOperand(e, be, ins->getOperand(1))) {
+        return false;
+      }
+      if (ins->type() == MIRType::Double) return e.writeOp(Op::F64Div);
+      return false;
+    }
+    case MDefinition::Opcode::Compare: {
+      MCompare* c = ins->toCompare();
+      if (!WJIonGetOperand(e, be, c->getOperand(0)) ||
+          !WJIonGetOperand(e, be, c->getOperand(1))) {
+        return false;
+      }
+      if (c->compareType() == MCompare::Compare_Double) {
+        switch (c->jsop()) {
+          case JSOp::Lt: return e.writeOp(Op::F64Lt);
+          case JSOp::Le: return e.writeOp(Op::F64Le);
+          case JSOp::Gt: return e.writeOp(Op::F64Gt);
+          case JSOp::Ge: return e.writeOp(Op::F64Ge);
+          case JSOp::Eq:
+          case JSOp::StrictEq: return e.writeOp(Op::F64Eq);
+          case JSOp::Ne:
+          case JSOp::StrictNe: return e.writeOp(Op::F64Ne);
+          default: return false;
+        }
+      }
+      if (c->compareType() == MCompare::Compare_Int32 ||
+          c->compareType() == MCompare::Compare_UInt32) {
+        bool u = c->compareType() == MCompare::Compare_UInt32;
+        switch (c->jsop()) {
+          case JSOp::Lt: return e.writeOp(u ? Op::I32LtU : Op::I32LtS);
+          case JSOp::Le: return e.writeOp(u ? Op::I32LeU : Op::I32LeS);
+          case JSOp::Gt: return e.writeOp(u ? Op::I32GtU : Op::I32GtS);
+          case JSOp::Ge: return e.writeOp(u ? Op::I32GeU : Op::I32GeS);
+          case JSOp::Eq:
+          case JSOp::StrictEq: return e.writeOp(Op::I32Eq);
+          case JSOp::Ne:
+          case JSOp::StrictNe: return e.writeOp(Op::I32Ne);
+          default: return false;
+        }
+      }
+      if (c->compareType() == MCompare::Compare_Int64 ||
+          c->compareType() == MCompare::Compare_UInt64) {
+        switch (c->jsop()) {
+          case JSOp::Eq:
+          case JSOp::StrictEq: return e.writeOp(Op::I64Eq);
+          case JSOp::Ne:
+          case JSOp::StrictNe: return e.writeOp(Op::I64Ne);
+          default: return false;
+        }
+      }
+      return false;
+    }
+    case MDefinition::Opcode::ToDouble: {
+      MDefinition* in = ins->getOperand(0);
+      if (!WJIonGetOperand(e, be, in)) return false;
+      if (in->type() == MIRType::Int32) return e.writeOp(Op::F64ConvertI32S);
+      if (in->type() == MIRType::Double) return true;  // already f64
+      return false;
+    }
+    case MDefinition::Opcode::WasmLoad: {
+      MWasmLoad* l = ins->toWasmLoad();
+      if (!WJIonGetOperand(e, be, l->base())) return false;
+      const wasm::MemoryAccessDesc& acc = l->access();
+      uint32_t a = acc.align();
+      uint32_t alignLog2 = a >= 8 ? 3 : a >= 4 ? 2 : a >= 2 ? 1 : 0;
+      Op loadOp;
+      switch (acc.type()) {
+        case js::Scalar::Int32:
+        case js::Scalar::Uint32: loadOp = Op::I32Load; break;
+        case js::Scalar::Float64: loadOp = Op::F64Load; break;
+        case js::Scalar::Int64: loadOp = Op::I64Load; break;
+        default: return false;
+      }
+      return e.writeOp(loadOp) && e.writeVarU32(alignLog2) &&
+             e.writeVarU32(uint32_t(acc.offset64()));
+    }
+    case MDefinition::Opcode::WrapInt64ToInt32: {
+      // Extract a half of an i64 (bottomHalf = low32). I32WrapI64 yields the low
+      // 32 bits; the high half is unused by our object-pointer extraction.
+      if (!WJIonGetOperand(e, be, ins->getOperand(0))) return false;
+      return e.writeOp(Op::I32WrapI64);
+    }
+    default:
+      return false;
+  }
+}
+
+// Emit an effectful MWasmStore: push base + value, then iN.store. Has no result
+// local (its effect is the heap write), so the body emitter calls this directly
+// instead of the value+local.set path.
+static bool WJIonEmitStore(Encoder& e, WJIonBackend& be,
+                           js::jit::MWasmStore* st) {
+  using namespace js::jit;
+  if (!WJIonGetOperand(e, be, st->base()) ||
+      !WJIonGetOperand(e, be, st->value())) {
+    return false;
+  }
+  const wasm::MemoryAccessDesc& acc = st->access();
+  uint32_t a = acc.align();
+  uint32_t alignLog2 = a >= 8 ? 3 : a >= 4 ? 2 : a >= 2 ? 1 : 0;
+  Op storeOp;
+  switch (acc.type()) {
+    case js::Scalar::Int32:
+    case js::Scalar::Uint32: storeOp = Op::I32Store; break;
+    case js::Scalar::Float64: storeOp = Op::F64Store; break;
+    case js::Scalar::Int64: storeOp = Op::I64Store; break;
+    default: return false;
+  }
+  return e.writeOp(storeOp) && e.writeVarU32(alignLog2) &&
+         e.writeVarU32(uint32_t(acc.offset64()));
+}
+
+// Emit phi-destruction copies for the edge (from -> to): for each phi in `to`,
+// copy the operand corresponding to `from`'s predecessor slot into the phi's
+// local. (Sequential copies; assumes no parallel-copy swap hazard -- true for
+// the simple loops/joins in slice 2.)
+static bool WJIonEmitEdgeCopies(Encoder& e, WJIonBackend& be,
+                                js::jit::MBasicBlock* from,
+                                js::jit::MBasicBlock* to) {
+  using namespace js::jit;
+  uint32_t k = to->getPredecessorIndex(from);
+  for (MPhiIterator p = to->phisBegin(); p != to->phisEnd(); p++) {
+    MPhi* phi = *p;
+    int32_t dst = be.local(phi);
+    if (dst < 0) continue;
+    MDefinition* src = phi->getOperand(k);
+    if (!WJIonGetOperand(e, be, src)) return false;
+    if (!e.writeOp(Op::LocalSet) || !e.writeVarU32(uint32_t(dst))) return false;
+  }
+  return true;
+}
+
+// Set $bid to `target`'s dispatch index and branch back to the dispatch loop.
+static bool WJIonGotoBlock(Encoder& e, uint32_t bidLocal, uint32_t loopDepthFromHere,
+                           uint32_t targetIndex) {
+  return e.writeOp(Op::I32Const) && e.writeVarS32(int32_t(targetIndex)) &&
+         e.writeOp(Op::LocalSet) && e.writeVarU32(bidLocal) &&
+         e.writeOp(Op::Br) && e.writeVarU32(loopDepthFromHere);
+}
+
+// Walk the optimized graph and emit the wasm function body. Control flow is
+// lowered to a single dispatch loop: each MBasicBlock becomes a case selected by
+// a $bid i32 local via br_table; block transitions set $bid + br back to the loop;
+// phis are destructed into per-edge local copies. Correct for any reducible CFG;
+// TurboFan re-optimizes the shape. argParams[0..nargs) are the wasm parameters.
+static bool WJIonEmitBody(js::jit::MIRGraph& graph, Encoder& e,
+                          js::jit::MWasmParameter** argParams, uint32_t nargs) {
+  using namespace js::jit;
+  const uint8_t kVoid = 0x40;
+  WJIonBackend be;
+  be.paramCount = nargs;
+  for (uint32_t i = 0; i < nargs; i++) {
+    be.ensureSize(argParams[i]->id());
+    be.localOf[argParams[i]->id()] = int32_t(i);
+  }
+
+  // Collect blocks in RPO and assign dispatch indices.
+  std::vector<MBasicBlock*> blocks;
+  std::unordered_map<MBasicBlock*, uint32_t> blockIdx;
+  for (ReversePostorderIterator b = graph.rpoBegin(); b != graph.rpoEnd(); b++) {
+    blockIdx[*b] = uint32_t(blocks.size());
+    blocks.push_back(*b);
+  }
+  const uint32_t n = uint32_t(blocks.size());
+
+  // Assign locals: phis first (so edge copies can target them), then each
+  // value-producing instruction. Record per-block emission order.
+  for (MBasicBlock* b : blocks) {
+    for (MPhiIterator p = b->phisBegin(); p != b->phisEnd(); p++) {
+      if (WJWasmValType((*p)->type()) != 0) be.assign(*p);
+    }
+  }
+  for (MBasicBlock* b : blocks) {
+    for (MInstructionIterator it = b->begin(); it != b->end(); it++) {
+      MInstruction* ins = *it;
+      if (ins->isControlInstruction() || ins->isWasmParameter()) continue;
+      if (WJWasmValType(ins->type()) == 0) continue;
+      be.assign(ins);
+    }
+  }
+
+  // $bid selector local is the LAST local (index nargs + localTy.size()).
+  const uint32_t bidLocal = be.paramCount + uint32_t(be.localTy.size());
+
+  // Locals declaration: all value/phi locals (f64/...) + the $bid i32.
+  if (!e.writeVarU32(uint32_t(be.localTy.size()) + 1)) return false;
+  for (uint8_t ty : be.localTy) {
+    if (!e.writeVarU32(1) || !e.writeFixedU8(ty)) return false;
+  }
+  if (!e.writeVarU32(1) || !e.writeFixedU8(uint8_t(TypeCode::I32))) return false;
+
+  // Fast path: single block, no control flow -> emit straight-line (no loop).
+  if (n == 1) {
+    MBasicBlock* b = blocks[0];
+    for (MInstructionIterator it = b->begin(); it != b->end(); it++) {
+      MInstruction* ins = *it;
+      if (ins->isControlInstruction() || ins->isWasmParameter()) continue;
+      if (ins->isWasmStore()) {
+        if (!WJIonEmitStore(e, be, ins->toWasmStore())) return false;
+        continue;
+      }
+      if (be.local(ins) < 0) continue;
+      if (!WJIonEmitValue(e, be, ins)) {
+        fprintf(stderr, "[ion-be] unsupported node op#%u type%u nOperands%u\n", unsigned(ins->op()), unsigned(ins->type()), unsigned(ins->numOperands()));
+        return false;
+      }
+      if (!e.writeOp(Op::LocalSet) || !e.writeVarU32(uint32_t(be.local(ins)))) {
+        return false;
+      }
+    }
+    MControlInstruction* t = b->lastIns();
+    if (t->isWasmReturn()) {
+      if (!WJIonGetOperand(e, be, t->getOperand(0))) return false;
+      if (!e.writeOp(Op::Return)) return false;
+    } else if (t->isUnreachable()) {
+      if (!e.writeOp(Op::Unreachable)) return false;
+    } else {
+      return false;
+    }
+    return e.writeOp(Op::End);
+  }
+
+  // Dispatch loop. Nesting (outer->inner): loop $L { block $b0 { block $b1 {
+  // ... { block $b_{n-1} { br_table } } body_{n-1} } body_{n-2} } ... } body_0.
+  // From inside the innermost block, $b_i is at depth (n-1-i); $L is at depth n.
+  if (!e.writeOp(Op::Loop) || !e.writeFixedU8(kVoid)) return false;  // $L
+  for (uint32_t i = 0; i < n; i++) {
+    if (!e.writeOp(Op::Block) || !e.writeFixedU8(kVoid)) return false;  // $b_i
+  }
+  // br_table on $bid: entry i -> depth (n-1-i); default -> 0 (=$b_{n-1}).
+  if (!e.writeOp(Op::LocalGet) || !e.writeVarU32(bidLocal)) return false;
+  if (!e.writeOp(Op::BrTable) || !e.writeVarU32(n)) return false;
+  for (uint32_t i = 0; i < n; i++) {
+    if (!e.writeVarU32(n - 1 - i)) return false;
+  }
+  if (!e.writeVarU32(0)) return false;  // default
+
+  // Bodies in reverse order: B_{n-1} (right after innermost end) down to B0.
+  for (uint32_t ri = 0; ri < n; ri++) {
+    uint32_t bi = n - 1 - ri;
+    MBasicBlock* b = blocks[bi];
+    if (!e.writeOp(Op::End)) return false;  // close block $b_{bi}; body starts here
+
+    for (MInstructionIterator it = b->begin(); it != b->end(); it++) {
+      MInstruction* ins = *it;
+      if (ins->isControlInstruction() || ins->isWasmParameter()) continue;
+      if (ins->isWasmStore()) {
+        if (!WJIonEmitStore(e, be, ins->toWasmStore())) return false;
+        continue;
+      }
+      if (be.local(ins) < 0) continue;
+      if (!WJIonEmitValue(e, be, ins)) {
+        fprintf(stderr, "[ion-be] unsupported node op#%u type%u nOperands%u\n", unsigned(ins->op()), unsigned(ins->type()), unsigned(ins->numOperands()));
+        return false;
+      }
+      if (!e.writeOp(Op::LocalSet) || !e.writeVarU32(uint32_t(be.local(ins)))) {
+        return false;
+      }
+    }
+
+    // Depth of $L from this body: we have closed (ri+1) blocks, so the remaining
+    // enclosing blocks are (n-1-ri) plus the loop => $L at depth (n-1-ri).
+    uint32_t loopDepthHere = n - 1 - ri;
+    MControlInstruction* t = b->lastIns();
+    if (t->isWasmReturn()) {
+      if (!WJIonGetOperand(e, be, t->getOperand(0)) || !e.writeOp(Op::Return)) {
+        return false;
+      }
+    } else if (t->isUnreachable()) {
+      if (!e.writeOp(Op::Unreachable)) return false;
+    } else if (t->isGoto()) {
+      MBasicBlock* s = t->getSuccessor(0);
+      if (!WJIonEmitEdgeCopies(e, be, b, s)) return false;
+      if (!WJIonGotoBlock(e, bidLocal, loopDepthHere, blockIdx[s])) return false;
+    } else if (t->isTest()) {
+      MTest* test = t->toTest();
+      MBasicBlock* tb = test->ifTrue();
+      MBasicBlock* fb = test->ifFalse();
+      // if (cond) { copies(true); bid=true; br $L } else { ...false... }
+      if (!WJIonGetOperand(e, be, test->getOperand(0))) return false;
+      if (!e.writeOp(Op::If) || !e.writeFixedU8(kVoid)) return false;
+      if (!WJIonEmitEdgeCopies(e, be, b, tb)) return false;
+      // inside the If, $L is one deeper.
+      if (!WJIonGotoBlock(e, bidLocal, loopDepthHere + 1, blockIdx[tb])) return false;
+      if (!e.writeOp(Op::Else)) return false;
+      if (!WJIonEmitEdgeCopies(e, be, b, fb)) return false;
+      if (!WJIonGotoBlock(e, bidLocal, loopDepthHere + 1, blockIdx[fb])) return false;
+      if (!e.writeOp(Op::End)) return false;  // end If
+      if (!e.writeOp(Op::Unreachable)) return false;  // both arms branched
+    } else {
+      return false;
+    }
+  }
+
+  if (!e.writeOp(Op::Unreachable)) return false;  // fell out of dispatch
+  if (!e.writeOp(Op::End)) return false;          // end loop $L
+  // The loop never exits (all paths return/br); the function-level fallthru is
+  // unreachable, but wasm still requires the body to be stack-valid at end.
+  if (!e.writeOp(Op::Unreachable)) return false;
+  return e.writeOp(Op::End);                       // end function body
+}
+
+// End-to-end back-end test: build a tiny MIR graph (() -> f64 returning 84.0),
+// OptimizeMIR it, emit a complete wasm module, host-compile + instantiate + call,
+// and verify the result. Proves the MIR->wasm output stage. Gated GECKO_WJVS_IONBE.
+static void WJIonBackendTest() {
+  using namespace js::jit;
+  fprintf(stderr, "[ion-be] begin\n");
+  fflush(stderr);
+
+  LifoAlloc lifo(TempAllocator::PreferredLifoChunkSize,
+                 js::BackgroundMallocArena);
+  TempAllocator alloc(&lifo);
+  JitContext jitContext;
+
+  CompileInfo compileInfo(/*nlocals=*/0);
+  MIRGraph graph(&alloc);
+  JitCompileOptions options;
+  MIRGenerator mirGen(nullptr, options, &alloc, &graph, &compileInfo,
+                      IonOptimizations.get(OptimizationLevel::Wasm), nullptr);
+
+  MBasicBlock* entry =
+      MBasicBlock::New(graph, compileInfo, nullptr, MBasicBlock::NORMAL);
+  if (!entry) { fprintf(stderr, "[ion-be] block FAILED\n"); return; }
+  graph.addBlock(entry);
+
+  // instance param so MWasmReturn is well-formed; never materialized in wasm.
+  MWasmParameter* instance =
+      MWasmParameter::New(alloc, ABIArg(InstanceReg), MIRType::Pointer);
+  entry->add(instance);
+
+  // (42.0 + 42.0) = 84.0; two congruent consts let GVN dedup.
+  MWasmFloatConstant* d1 = MWasmFloatConstant::NewDouble(alloc, 42.0);
+  MWasmFloatConstant* d2 = MWasmFloatConstant::NewDouble(alloc, 42.0);
+  entry->add(d1);
+  entry->add(d2);
+  MAdd* sum = MAdd::NewWasm(alloc, d1, d2, MIRType::Double);
+  entry->add(sum);
+  entry->end(MWasmReturn::New(alloc, sum, instance));
+
+  if (!OptimizeMIR(&mirGen)) {
+    fprintf(stderr, "[ion-be] OptimizeMIR FAILED\n");
+    return;
+  }
+  fprintf(stderr, "[ion-be] optimized, blocks=%zu\n", graph.numBlocks());
+
+  // Assemble a complete module: type ()->f64, one func, export "f", code = body.
+  Bytes out;
+  Encoder e(out);
+  const uint8_t kF64 = uint8_t(TypeCode::F64);
+  if (!e.writeFixedU32(MagicNumber) ||
+      !e.writeFixedU32(EncodingVersionModule)) {
+    fprintf(stderr, "[ion-be] header FAILED\n");
+    return;
+  }
+  size_t s;
+  // Type section: type0 = () -> f64
+  if (!e.startSection(SectionId::Type, &s) || !e.writeVarU32(1) ||
+      !e.writeFixedU8(0x60) || !e.writeVarU32(0) || !e.writeVarU32(1) ||
+      !e.writeFixedU8(kF64)) {
+    fprintf(stderr, "[ion-be] type sec FAILED\n");
+    return;
+  }
+  e.finishSection(s);
+  // Function section: func0 : type0
+  if (!e.startSection(SectionId::Function, &s) || !e.writeVarU32(1) ||
+      !e.writeVarU32(0)) {
+    return;
+  }
+  e.finishSection(s);
+  // Export section: "f" = func0
+  if (!e.startSection(SectionId::Export, &s) || !e.writeVarU32(1) ||
+      !e.writeBytes("f", 1) || !e.writeFixedU8(0x00) || !e.writeVarU32(0)) {
+    return;
+  }
+  e.finishSection(s);
+  // Code section
+  if (!e.startSection(SectionId::Code, &s) || !e.writeVarU32(1)) return;
+  size_t bodyOff;
+  if (!e.writePatchableVarU32(&bodyOff)) return;
+  size_t bodyStart = e.currentOffset();
+  if (!WJIonEmitBody(graph, e, /*argParams=*/nullptr, /*nargs=*/0)) {
+    fprintf(stderr, "[ion-be] EMIT BODY FAILED\n");
+    return;
+  }
+  e.patchVarU32(bodyOff, uint32_t(e.currentOffset() - bodyStart));
+  e.finishSection(s);
+
+  fprintf(stderr, "[ion-be] module built (%zu bytes), host-compiling...\n",
+          size_t(out.length()));
+  fflush(stderr);
+
+  int handle = wasmhost_compile(out.begin(), int(out.length()));
+  if (handle < 0) {
+    fprintf(stderr, "[ion-be] HOST COMPILE FAILED (invalid wasm)\n");
+    return;
+  }
+  int rc = wasmhost_instantiate(handle, nullptr, 0);
+  if (rc != 0) {
+    fprintf(stderr, "[ion-be] INSTANTIATE FAILED rc=%d\n", rc);
+    return;
+  }
+  double result = wasmhost_call(handle, 0, nullptr, 0);
+  fprintf(stderr, "[ion-be] RESULT = %g (expect 84) %s\n", result,
+          result == 84.0 ? "OK" : "*** MISMATCH ***");
+  fflush(stderr);
+}
+
+// ===================== ION BYTECODE -> MIR FRONT-END =====================
+// Slice 2: numeric functions with reducible control flow (if/else + while loops).
+// Every JS arg/local/value/rval is f64 (matching the existing Mode N/V model).
+// Locals + rval live in MIR SLOTS (CompileInfo) so MBasicBlock's slot machinery
+// auto-creates phis at joins/loop headers; the JS operand stack is tracked via
+// block push/pop. Control flow uses WarpBuilder's pending-edge algorithm:
+// JumpTarget/LoopHead start blocks; forward branches register pending edges that
+// resolve into phis; loop backedges call setBackedgeWasm. Bails on anything
+// outside the supported set (property access, calls, &&/||, SetArg, bitops, ...).
+namespace {
+struct WJPendEdge {
+  js::jit::MBasicBlock* block;
+  uint32_t successor;  // index into block->lastIns() successors
+};
+}  // namespace
+
+static constexpr int kWJInlineMaxDepth = 6;
+
+// Resolve a recorded inline callee (monomorphic way 0) for a call site, with an
+// arg-count check. Returns nullptr if not statically inlinable.
+static JSScript* WJResolveInlineCallee(JSScript* fscript, uint32_t pcOff,
+                                       uint32_t argc) {
+  auto it = gWJInlineCallee.find(WJInlineKey(fscript, pcOff));
+  if (it == gWJInlineCallee.end() || it->second.n == 0) return nullptr;
+  JSFunction* fun = reinterpret_cast<JSFunction*>(uintptr_t(it->second.fns[0]));
+  if (!fun || !fun->isInterpreted() || !fun->baseScript() ||
+      !fun->baseScript()->hasBytecode() || fun->nargs() != argc) {
+    return nullptr;
+  }
+  return fun->baseScript()->asJSScript();
+}
+
+// Upper bound on the extra CompileInfo local slots needed to inline the whole
+// call graph rooted at `cs`: one frame's (args + locals + rval) per inlined
+// callee instance, summed over the inline expansion up to the depth bound. The
+// builder allocates inline-frame slot ranges sequentially and must stay within
+// info.nlocals(); sizing CompileInfo with this count guarantees that.
+static uint32_t WJCountInlineSlots(JSScript* cs, int depth) {
+  if (depth > kWJInlineMaxDepth) return 0;
+  uint32_t total = 0;
+  jsbytecode* start = cs->code();
+  jsbytecode* end = cs->codeEnd();
+  // Sum a frame's slots (args+locals+rval) plus its inline subtree.
+  auto addFn = [&](uint32_t fnLow, int wantArgc) {
+    JSFunction* fun = reinterpret_cast<JSFunction*>(uintptr_t(fnLow));
+    if (!fun || !fun->isInterpreted() || !fun->baseScript() ||
+        !fun->baseScript()->hasBytecode()) {
+      return;
+    }
+    if (wantArgc >= 0 && int(fun->nargs()) != wantArgc) return;
+    JSScript* callee = fun->baseScript()->asJSScript();
+    total += fun->nargs() + callee->nfixed() + 1 +
+             WJCountInlineSlots(callee, depth + 1);
+  };
+  for (jsbytecode* pc = start; pc < end; pc += GetBytecodeLength(pc)) {
+    JSOp op = JSOp(*pc);
+    uint32_t off = uint32_t(pc - start);
+    if (op == JSOp::Call || op == JSOp::CallContent ||
+        op == JSOp::CallIgnoresRv) {
+      uint32_t argc = GET_ARGC(pc);
+      auto it = gWJInlineCallee.find(WJInlineKey(cs, off));
+      if (it == gWJInlineCallee.end() || it->second.n == 0) continue;
+      total += 1;  // dispatch merge slot
+      for (uint8_t w = 0; w < it->second.n; w++) addFn(it->second.fns[w], argc);
+    } else if (op == JSOp::GetProp) {
+      // Method-load site -> polymorphic dispatch inlines every way's body.
+      auto mit = gWJMethodPoly.find(WJInlineKey(cs, off));
+      if (mit == gWJMethodPoly.end() || mit->second.n == 0) continue;
+      total += 1;  // dispatch merge slot
+      for (uint8_t w = 0; w < mit->second.n; w++) addFn(mit->second.fns[w], -1);
+    } else if (op == JSOp::Or || op == JSOp::And || op == JSOp::Coalesce) {
+      total += 1;  // logical-operator result slot (operand stack across a branch)
+    }
+  }
+  return total;
+}
+
+static bool WJIonBuildMIR(JSScript* script, js::jit::MIRGenerator& mir,
+                          js::jit::TempAllocator& alloc, js::jit::MIRGraph& graph,
+                          js::jit::CompileInfo& info,
+                          js::jit::MBasicBlock* entry,
+                          js::jit::MDefinition* instance,
+                          js::jit::MWasmParameter** argParams, uint32_t nargs,
+                          uint32_t nfixed,
+                          js::jit::MDefinition* topThisDef = nullptr,
+                          js::jit::MDefinition* scratchResultBase = nullptr,
+                          js::jit::MDefinition** scratchArgs = nullptr) {
+  using namespace js::jit;
+  jsbytecode* const start = script->code();
+  jsbytecode* const end = script->codeEnd();
+
+  auto konstIn = [&](MBasicBlock* b, double v) -> MDefinition* {
+    MWasmFloatConstant* c = MWasmFloatConstant::NewDouble(alloc, v);
+    b->add(c);
+    return c;
+  };
+  // Entry-block slot init: args from params; every other local slot (this
+  // frame's locals + rval AND all inline-frame slot ranges) to 0.0, so blocks
+  // created before an inline frame is entered have non-null slots to copy/phi.
+  for (uint32_t i = 0; i < nargs; i++) {
+    // Scratch-ABI args are i64 boxed Values loaded from gWJScratch; direct-ABI
+    // args are the wasm parameters.
+    entry->initSlot(info.localSlot(i),
+                    scratchArgs ? scratchArgs[i] : argParams[i]);
+  }
+  // UNIFORM i64 SLOTS: every local slot holds a NaN-boxed i64 Value, so a loop
+  // header's slot phis always merge i64==i64 (never Double-vs-Value, which the
+  // NDEBUG build silently mis-builds since setBackedgeWasm's type assert is
+  // compiled out -> OptimizeMIR then miscompiles the loop). The boxed double 0.0
+  // is bit-identical to i64 0, so the slot-zero init is an i64 const 0.
+  for (uint32_t i = nargs; i < info.nlocals(); i++) {
+    MConstant* z = MConstant::NewInt64(alloc, 0);
+    entry->add(z);
+    entry->initSlot(info.localSlot(i), z);
+  }
+
+  MBasicBlock* cur = entry;
+  // pending/loopHeader/loopHeadOff are keyed by NAMESPACED offset (frame.offBase
+  // + local pc offset) so inline frames built into the same graph don't collide.
+  std::unordered_map<uint32_t, std::vector<WJPendEdge>> pending;
+  std::unordered_map<uint32_t, MBasicBlock*> loopHeader;
+  // Logical operators (||/&&): the result value spans a branch (the operand stack
+  // is normally empty at block boundaries). We spill it to a per-op slot at the
+  // branch; at the target join the slot is phi-merged and reloaded. Maps the
+  // (namespaced) target offset -> that slot.
+  std::unordered_map<uint32_t, uint32_t> logicalJoinSlot;
+  std::unordered_set<uint32_t> loopHeadOff;
+  uint32_t loopDepth = 0;
+  // Front-end CSE for property access (Ion's GVN can't CSE MWasmLoad -- it has
+  // no congruentTo). Within a linear dominator region: remember which receivers
+  // have had their shape guarded (skip the redundant guard) and cache loaded
+  // field values (reuse instead of re-loading). Both are invalidated wherever
+  // dominance breaks (joins, loop headers) and by any heap mutation (SetProp).
+  std::unordered_map<MDefinition*, uint32_t> guardedShape;  // recv -> guarded shape
+  std::vector<std::tuple<MDefinition*, uint32_t, MDefinition*>> fieldCache;
+  // Memoized object-pointer unbox (boxed i64 recv -> i32 ptr), so repeated field
+  // accesses on the same receiver share one wrap node and stay CSE-able.
+  std::unordered_map<MDefinition*, MDefinition*> objPtrMemo;
+  auto invalidateCSE = [&]() {
+    guardedShape.clear();
+    fieldCache.clear();
+    objPtrMemo.clear();
+  };
+  // Method-call idiom: maps a callee-placeholder def (the re-pushed receiver) to
+  // the method-load GetProp pcOff, so the Call can find its polymorphic dispatch
+  // record (gWJMethodPoly) and inline each receiver type's body behind a guard.
+  std::unordered_map<MDefinition*, uint32_t> methodOffOf;
+  // The JS operand stack lives OUTSIDE block slots (empty at every block
+  // boundary, so it never crosses blocks / needs phis). Each inline frame gets
+  // its OWN operand stack (the callee's stack is independent of the caller's),
+  // tracked via `curStk`; inline-frame args/locals/rval live in dedicated
+  // CompileInfo slots starting at `nextSlotBase`.
+  std::vector<MDefinition*> rootStk;
+  std::vector<MDefinition*>* curStk = &rootStk;
+  uint32_t nextSlotBase = nargs + nfixed + 1;
+  uint32_t nextOffBase = uint32_t(end - start) + 1;
+  uint64_t gWJBuildOps = 0;  // decode-iteration guard (catch builder infinite loops)
+  uint32_t gWJBuildFrames = 0;  // total inlined frames (catch inline explosion)
+
+  auto konst = [&](double v) -> MDefinition* { return konstIn(cur, v); };
+  auto push = [&](MDefinition* d) { curStk->push_back(d); };
+  auto pop = [&]() -> MDefinition* {
+    MDefinition* d = curStk->back();
+    curStk->pop_back();
+    return d;
+  };
+  // Boxed-value unbox helpers (assigned below, after konstI32). Forward-declared
+  // so binF64/cmp can use them; identity on Double/Int32 (existing typed values).
+  std::function<MDefinition*(MDefinition*)> asNumber, asObjPtr, boxObj,
+      boxForStore;
+  auto binF64 = [&](MInstruction* (*mk)(TempAllocator&, MDefinition*,
+                                        MDefinition*)) {
+    MDefinition* b = pop();
+    MDefinition* a = pop();
+    a = asNumber(a);
+    b = asNumber(b);
+    MInstruction* n = mk(alloc, a, b);
+    cur->add(n);
+    push(n);
+  };
+  auto cmp = [&](JSOp jsop) {
+    MDefinition* b = pop();
+    MDefinition* a = pop();
+    bool rel = (jsop == JSOp::Lt || jsop == JSOp::Le || jsop == JSOp::Gt ||
+                jsop == JSOp::Ge);
+    bool objA = a->type() == MIRType::Int32 || a->type() == MIRType::Int64;
+    bool objB = b->type() == MIRType::Int32 || b->type() == MIRType::Int64;
+    MCompare::CompareType ct;
+    if (!rel && objA && objB) {
+      // Reference / null identity compare on object pointers.
+      a = asObjPtr(a);
+      b = asObjPtr(b);
+      ct = MCompare::Compare_Int32;
+    } else {
+      a = asNumber(a);
+      b = asNumber(b);
+      ct = MCompare::Compare_Double;
+    }
+    MCompare* c = MCompare::NewWasm(alloc, a, b, jsop, ct);
+    cur->add(c);
+    push(c);
+  };
+  auto konstI32 = [&](int32_t v) -> MDefinition* {
+    MConstant* c = MConstant::NewInt32(alloc, v);
+    cur->add(c);
+    return c;
+  };
+  // BOXED VALUE MODEL: object/unknown-typed fields are carried as the raw i64
+  // NaN-boxed Value and unboxed lazily at use. boxedVty maps such an i64 def to
+  // its observed value type (0 double / 1 int32 / 3 object) or 2 (unknown) so the
+  // unbox can be specialized. The unbox helpers are IDENTITY on Double/Int32 (the
+  // pre-existing typed values), so wiring them into consumers is a no-op for those
+  // -- only genuinely boxed (i64) values trigger real unboxing.
+  std::unordered_map<MDefinition*, uint8_t> boxedVty;
+  // Unbox a value to an f64 number.
+  asNumber = [&](MDefinition* d) -> MDefinition* {
+    if (d->type() == MIRType::Double) return d;
+    if (d->type() == MIRType::Int32) {
+      MToDouble* t = MToDouble::New(alloc, d);
+      t->setMovableUnchecked();
+      cur->add(t);
+      return t;
+    }
+    if (d->type() != MIRType::Int64) return d;  // unexpected
+    auto vit = boxedVty.find(d);
+    uint8_t vty = vit != boxedVty.end() ? vit->second : 2;
+    if (vty == 0) {  // double-boxed: bit-reinterpret
+      MReinterpretCast* r = MReinterpretCast::New(alloc, d, MIRType::Double);
+      cur->add(r);
+      return r;
+    }
+    MWrapInt64ToInt32* low = MWrapInt64ToInt32::New(alloc, d, /*bottomHalf=*/true);
+    cur->add(low);
+    if (vty == 1) {  // int32-boxed: convert payload
+      MToDouble* t = MToDouble::New(alloc, low);
+      t->setMovableUnchecked();
+      cur->add(t);
+      return t;
+    }
+    // Unknown: runtime tag dispatch. isInt = (d == (int32-box of low32)).
+    MToDouble* asI = MToDouble::New(alloc, low);
+    cur->add(asI);
+    MReinterpretCast* asD = MReinterpretCast::New(alloc, d, MIRType::Double);
+    cur->add(asD);
+    MExtendInt32ToInt64* ext =
+        MExtendInt32ToInt64::New(alloc, low, /*isUnsigned=*/true);
+    cur->add(ext);
+    MConstant* tagK = MConstant::NewInt64(alloc, int64_t(kWJTagInt32 << 32));
+    cur->add(tagK);
+    MWasmBinaryBitwise* cand = MWasmBinaryBitwise::New(
+        alloc, ext, tagK, MIRType::Int64, MWasmBinaryBitwise::SubOpcode::Or);
+    cur->add(cand);
+    MCompare* isInt = MCompare::NewWasm(alloc, d, cand, JSOp::Eq,
+                                        MCompare::Compare_Int64);
+    cur->add(isInt);
+    MWasmSelect* sel = MWasmSelect::New(alloc, asI, asD, isInt);
+    cur->add(sel);
+    return sel;
+  };
+  // Unbox a value to an i32 object pointer (low32 of a boxed Value; 0 for null).
+  asObjPtr = [&](MDefinition* d) -> MDefinition* {
+    if (d->type() != MIRType::Int64) return d;  // already an i32 pointer
+    auto it = objPtrMemo.find(d);
+    if (it != objPtrMemo.end()) return it->second;
+    MWrapInt64ToInt32* w = MWrapInt64ToInt32::New(alloc, d, /*bottomHalf=*/true);
+    cur->add(w);
+    objPtrMemo[d] = w;
+    return w;
+  };
+  // Box an i32 object pointer (0 == null) into an i64 Value. CRITICAL: a 0 pointer
+  // must become the NULL Value (tag kWJTagNull), NOT an object Value with payload 0
+  // -- otherwise GC would trace a reference to address 0 and crash. Pick the tag by
+  // (ptr==0): null vs object, then OR in the (zero-extended) pointer payload.
+  boxObj = [&](MDefinition* ptr) -> MDefinition* {
+    MExtendInt32ToInt64* lo =
+        MExtendInt32ToInt64::New(alloc, ptr, /*isUnsigned=*/true);
+    cur->add(lo);
+    MCompare* isNull = MCompare::NewWasm(alloc, ptr, konstI32(0), JSOp::Eq,
+                                         MCompare::Compare_Int32);
+    cur->add(isNull);
+    MConstant* nullHi = MConstant::NewInt64(alloc, int64_t(kWJTagNull) << 32);
+    cur->add(nullHi);
+    MConstant* objHi = MConstant::NewInt64(alloc, int64_t(kWJTagObject) << 32);
+    cur->add(objHi);
+    MWasmSelect* hi = MWasmSelect::New(alloc, nullHi, objHi, isNull);
+    cur->add(hi);
+    MWasmBinaryBitwise* boxed = MWasmBinaryBitwise::New(
+        alloc, hi, lo, MIRType::Int64, MWasmBinaryBitwise::SubOpcode::Or);
+    cur->add(boxed);
+    return boxed;
+  };
+  // Direct-param mode (no scratchArgs) passes object args + `this` as raw i32
+  // pointers, but boxed object fields (vty2/vty3) are uniform i64 Values. If an
+  // i32 arg and an i64 boxed field ever merge into the same wasm local the phi
+  // degrades to MIRType::Value (no wasm local) and the backend can't emit it.
+  // Re-box object params to i64 here (cur==entry) so every object-typed value
+  // has one representation. Scratch-ABI args are already boxed i64.
+  if (!scratchArgs) {
+    for (uint32_t i = 0; i < nargs; i++) {
+      if (!argParams[i]) continue;
+      // Direct ABI: object args are i32 pointers (-> object Value via boxObj),
+      // number args are f64 (-> double Value). Box both so every slot is i64.
+      if (argParams[i]->type() == MIRType::Int32) {
+        entry->setSlot(info.localSlot(i), boxObj(argParams[i]));
+      } else if (argParams[i]->type() == MIRType::Double) {
+        entry->setSlot(info.localSlot(i), boxForStore(argParams[i]));
+      }
+    }
+    if (topThisDef && topThisDef->type() == MIRType::Int32) {
+      topThisDef = boxObj(topThisDef);
+    }
+  }
+  // Box a value into the raw i64 Value to store into a slot: a boxed i64 is
+  // stored as-is; an f64 number is a double Value (bit-reinterpret); an i32
+  // Coerce a value to an i32 for a JS bitwise op. A boxed int Value's payload is
+  // its low32; a float constant folds; an i32 passes through; a non-constant f64
+  // truncates (i32.trunc_f64_s -- exact for the small ints richards uses).
+  auto asInt32 = [&](MDefinition* d) -> MDefinition* {
+    if (d->type() == MIRType::Int32) return d;
+    if (d->type() == MIRType::Int64) {
+      // A boxed i64. For an INT-boxed Value (vty1) the low32 payload IS ToInt32.
+      // For a DOUBLE-boxed number (vty0) or an unknown box (vty2, e.g. a slot
+      // value) the low32 is the low bits of the f64 -- garbage -- so go through
+      // ToNumber and truncate (JS ToInt32 = trunc-to-int32 of ToNumber; objects
+      // -> NaN -> 0, which is also correct ToInt32).
+      auto vit = boxedVty.find(d);
+      uint8_t vty = vit != boxedVty.end() ? vit->second : 2;
+      if (vty == 1) {
+        MWrapInt64ToInt32* w =
+            MWrapInt64ToInt32::New(alloc, d, /*bottomHalf=*/true);
+        cur->add(w);
+        return w;
+      }
+      MTruncateToInt32* t = MTruncateToInt32::New(alloc, asNumber(d));
+      cur->add(t);
+      return t;
+    }
+    if (d->isWasmFloatConstant()) {
+      return konstI32(int32_t(d->toWasmFloatConstant()->toDouble()));
+    }
+    if (d->isConstant() && d->type() == MIRType::Double) {
+      return konstI32(int32_t(d->toConstant()->numberToDouble()));
+    }
+    MTruncateToInt32* t = MTruncateToInt32::New(alloc, d);
+    cur->add(t);
+    return t;
+  };
+  // object pointer gets the object tag.
+  boxForStore = [&](MDefinition* d) -> MDefinition* {
+    if (d->type() == MIRType::Int64) return d;
+    if (d->type() == MIRType::Double) {
+      MReinterpretCast* r = MReinterpretCast::New(alloc, d, MIRType::Int64);
+      cur->add(r);
+      return r;
+    }
+    // An Int32 here is ALWAYS a numeric (bitwise / ToInt32) result -- object
+    // pointers always flow as boxed i64 Values, never raw i32. So box it as an
+    // int32-tagged NUMBER Value (kWJTagInt32 | u32), NOT an object Value. Boxing
+    // it as an object (the old behaviour) made `this.x = a & b` store a bogus
+    // object Value into a numeric field, which then read back as NaN/garbage.
+    MExtendInt32ToInt64* lo =
+        MExtendInt32ToInt64::New(alloc, d, /*isUnsigned=*/true);
+    cur->add(lo);
+    MConstant* hi = MConstant::NewInt64(alloc, int64_t(kWJTagInt32) << 32);
+    cur->add(hi);
+    MWasmBinaryBitwise* boxed = MWasmBinaryBitwise::New(
+        alloc, hi, lo, MIRType::Int64, MWasmBinaryBitwise::SubOpcode::Or);
+    cur->add(boxed);
+    return boxed;
+  };
+  // Box a number as an INT32-tagged Value: (kWJTagInt32 << 32) | (u32)ToInt32(d).
+  // Used to store into a field OBSERVED as int (vty1), which is READ back as the
+  // low32 int payload. boxForStore would make a DOUBLE Value (raw f64 bits) whose
+  // low32 is garbage when re-read as an int -- so an int field mutated by compiled
+  // code (richards' `this.v2++`) must round-trip through the int box to stay
+  // consistent with both the int read path and the interpreter's int Values.
+  auto boxForStoreInt = [&](MDefinition* d) -> MDefinition* {
+    if (d->type() == MIRType::Int64) return d;  // already a boxed Value
+    MDefinition* i32 = asInt32(d);
+    MExtendInt32ToInt64* lo =
+        MExtendInt32ToInt64::New(alloc, i32, /*isUnsigned=*/true);
+    cur->add(lo);
+    MConstant* hi = MConstant::NewInt64(alloc, int64_t(kWJTagInt32) << 32);
+    cur->add(hi);
+    MWasmBinaryBitwise* boxed = MWasmBinaryBitwise::New(
+        alloc, hi, lo, MIRType::Int64, MWasmBinaryBitwise::SubOpcode::Or);
+    cur->add(boxed);
+    return boxed;
+  };
+  // Field/heap load into `cur`. The field offset is folded into the address
+  // (base = ptr + off) with a 0 access-offset, so two loads of the SAME field
+  // share an address node (GVN CSEs them; distinct fields never merge).
+  auto loadAt = [&](MDefinition* ptr, uint32_t off, js::Scalar::Type sty,
+                    MIRType rty) -> MDefinition* {
+    MDefinition* base = ptr;
+    if (off != 0) {
+      MInstruction* add = MAdd::NewWasm(alloc, ptr, konstI32(int32_t(off)),
+                                        MIRType::Int32);
+      cur->add(add);
+      base = add;
+    }
+    uint32_t align =
+        (sty == js::Scalar::Float64 || sty == js::Scalar::Int64) ? 8 : 4;
+    wasm::MemoryAccessDesc acc(/*memoryIndex=*/0, sty, align, /*offset=*/0,
+                               wasm::TrapSiteDesc(), /*hugeMemory=*/false);
+    MWasmLoad* l = MWasmLoad::New(alloc, /*memoryBase=*/nullptr, base, acc, rty);
+    // MWasmLoad is created Guard-but-not-Movable. Mark it movable so GVN can CSE
+    // repeated loads and LICM can hoist loop-invariant ones out of loops --
+    // correctness is preserved by AliasAnalysis (any aliasing WasmHeap store in
+    // the loop sets a dependency that blocks the hoist). This is THE enabler for
+    // the richards win (shape-guard + field-load hoisting out of the hot loop).
+    if (!getenv("GECKO_WJVS_NOMOVE")) l->setMovableUnchecked();
+    cur->add(l);
+    return l;
+  };
+  // Field/heap store into `cur` (offset folded into the address, like loadAt).
+  auto storeAt = [&](MDefinition* ptr, uint32_t off, js::Scalar::Type sty,
+                     MDefinition* val) {
+    MDefinition* base = ptr;
+    if (off != 0) {
+      MInstruction* add = MAdd::NewWasm(alloc, ptr, konstI32(int32_t(off)),
+                                        MIRType::Int32);
+      cur->add(add);
+      base = add;
+    }
+    uint32_t align =
+        (sty == js::Scalar::Float64 || sty == js::Scalar::Int64) ? 8 : 4;
+    wasm::MemoryAccessDesc acc(/*memoryIndex=*/0, sty, align, /*offset=*/0,
+                               wasm::TrapSiteDesc(), /*hugeMemory=*/false);
+    MWasmStore* st = MWasmStore::New(alloc, /*memoryBase=*/nullptr, base, acc, val);
+    cur->add(st);
+  };
+  // Guard `recv`'s shape (deopt -> sentinel 1.0 on miss) unless it is already
+  // guarded for this shape in the current dominator region; advances `cur` into
+  // the fast continuation block.
+  auto ensureGuard = [&](MDefinition* recv, uint32_t recShape) -> bool {
+    auto git = guardedShape.find(recv);
+    if (git != guardedShape.end() && git->second == recShape) return true;
+    MDefinition* shapeWord = loadAt(recv, 0, js::Scalar::Int32, MIRType::Int32);
+    MCompare* g = MCompare::NewWasm(alloc, shapeWord, konstI32(int32_t(recShape)),
+                                    JSOp::Eq, MCompare::Compare_Int32);
+    cur->add(g);
+    MBasicBlock* cont = MBasicBlock::New(graph, info, cur, MBasicBlock::NORMAL);
+    MBasicBlock* deopt = MBasicBlock::New(graph, info, cur, MBasicBlock::NORMAL);
+    if (!cont || !deopt) return false;
+    cont->setLoopDepth(loopDepth);
+    deopt->setLoopDepth(loopDepth);
+    graph.addBlock(cont);
+    graph.addBlock(deopt);
+    cur->end(MTest::New(alloc, g, cont, deopt));
+    deopt->end(MWasmReturn::New(alloc, konstIn(deopt, 1.0), instance));
+    cur = cont;
+    guardedShape[recv] = recShape;
+    return true;
+  };
+  // Resolve a slot byte-offset (possibly carrying the kWJDynSlot bit) to the base
+  // pointer + real offset for a field access: a fixed slot is at recv+off; a
+  // dynamic slot is at slots_(= *(recv+8)) + (off & ~kWJDynSlot).
+  auto fieldBase = [&](MDefinition* recv, uint32_t off,
+                       uint32_t* realOff) -> MDefinition* {
+    if (off & kWJDynSlot) {
+      *realOff = off & ~kWJDynSlot;
+      return loadAt(recv, 8, js::Scalar::Int32, MIRType::Int32);  // slots_ ptr
+    }
+    *realOff = off;
+    return recv;
+  };
+  // Shared GetProp(field) for own fixed double slots: shape-guard `recv` (CSE'd)
+  // then load the field (CSE'd on recv+off). Returns the value def, or nullptr if
+  // this site has no own-fixed-slot record (caller treats that as "method load /
+  // bail"). Keyed by the FRAME's script so inlined callees resolve their own ICs.
+  auto getPropField = [&](JSScript* fscript, MDefinition* recv,
+                          uint32_t pcOff) -> MDefinition* {
+    uint32_t recShape, recOff;
+    uint8_t recVty;
+    auto rec = gWJShapeRec.find(WJInlineKey(fscript, pcOff));
+    if (rec != gWJShapeRec.end() && rec->second.shape != 0) {
+      recShape = rec->second.shape;
+      recOff = rec->second.off;
+      recVty = rec->second.vty;
+    } else {
+      // Cold site (fallback-only IC, e.g. a rarely-taken branch): resolve a field
+      // that is monomorphic program-wide by its property name, behind a shape
+      // guard. Proto methods aren't indexed here -> still return null (method idiom).
+      jsbytecode* spc = fscript->offsetToPC(pcOff);
+      uint32_t nameLow = uint32_t(uintptr_t(fscript->getName(spc)));
+      auto pit = gWJPropByName.find(nameLow);
+      if (pit == gWJPropByName.end() || pit->second.ambig ||
+          pit->second.shape == 0) {
+        return nullptr;
+      }
+      recShape = pit->second.shape;
+      recOff = pit->second.off;
+      recVty = pit->second.vty;
+    }
+    MDefinition* objp = asObjPtr(recv);  // boxed-i64 receiver -> i32 object ptr
+    if (!ensureGuard(objp, recShape)) return nullptr;
+    uint32_t foff = recOff;
+    for (auto& t : fieldCache) {
+      if (std::get<0>(t) == objp && std::get<1>(t) == foff) return std::get<2>(t);
+    }
+    uint32_t fo;
+    MDefinition* base = fieldBase(objp, foff, &fo);  // fixed: objp+off; dyn: slots_
+    MDefinition* fv;
+    if (recVty == 2) {
+      // Unknown value type (no observation): load the raw boxed Value (i64) and
+      // unbox lazily at use (asNumber/asObjPtr). This is how fields of functions
+      // the WJ JIT never compiled (richards schedule) are handled correctly --
+      // copies stay boxed, receivers/null extract the pointer, arithmetic unboxes.
+      fv = loadAt(base, fo, js::Scalar::Int64, MIRType::Int64);
+      boxedVty[fv] = 2;
+    } else if (recVty == 1) {
+      // int32-boxed field: load the i32 payload (low word at `fo`) and convert
+      // to f64. (Type-speculative: no value-type guard yet -> unsound if the field
+      // later holds a non-int32; richards field types are stable. FUTURE: tag
+      // guard + deopt.)
+      MDefinition* iv = loadAt(base, fo, js::Scalar::Int32, MIRType::Int32);
+      MToDouble* d = MToDouble::New(alloc, iv);
+      d->setMovableUnchecked();
+      cur->add(d);
+      fv = d;
+    } else if (recVty == 3) {
+      // object-or-null reference field: load the boxed Value (i64) and carry it
+      // BOXED (not eager-wrapped to i32), so all object/unknown fields + boxed
+      // object args have one uniform i64 representation -- a local merging them
+      // never degrades to MIRType::Value (which has no wasm local). asObjPtr
+      // extracts the pointer at use (receiver/null check); asNumber unboxes for
+      // arithmetic. Same path as vty2; vty stored for unbox specialization.
+      fv = loadAt(base, fo, js::Scalar::Int64, MIRType::Int64);
+      boxedVty[fv] = 3;
+    } else {
+      fv = loadAt(base, fo, js::Scalar::Float64, MIRType::Double);
+    }
+    fieldCache.emplace_back(objp, foff, fv);
+    return fv;
+  };
+  // One inline (or top-level) frame to decode. Inline frames get their own
+  // CompileInfo slot range [slotBase, slotBase+nargs+nfixed+1) and their own
+  // namespace `offBase` for pending/loopHeader/loopHeadOff keys.
+  struct WJFrameDesc {
+    JSScript* script;
+    jsbytecode* start;
+    jsbytecode* end;
+    uint32_t slotBase;
+    uint32_t nargs;
+    uint32_t nfixed;
+    uint32_t offBase;
+    MDefinition* thisDef;
+    bool isInline;
+    int depth;
+  };
+  // Decode one frame's bytecode into the shared MIRGraph, with full control flow
+  // (branches + loops via block slots/phis). Inline callees recurse here, so a
+  // whole call graph -- INCLUDING callees with if/loops -- collapses into one
+  // MIRGraph that GVN/LICM optimize across. Each inline frame routes its
+  // returns through a continuation block (the return value via its rval slot);
+  // the caller reads that slot to continue. This is richards' real lever.
+  std::function<bool(const WJFrameDesc&, std::vector<MDefinition*>&)> buildFrame;
+  // Polymorphic method dispatch: guard the receiver shape and inline the matching
+  // method body for each observed way; a shape miss deopts (sentinel). All way
+  // bodies merge their return value into one dispatch slot read at the join.
+  auto emitMethodDispatch = [&](const WJMethodPolyRec& poly, MDefinition* recv,
+                                std::vector<MDefinition*>& cargs, uint32_t argc,
+                                int callerDepth) -> bool {
+    recv = asObjPtr(recv);  // boxed-i64 receiver -> i32 object pointer
+    MDefinition* shapeWord = loadAt(recv, 0, js::Scalar::Int32, MIRType::Int32);
+    uint32_t dispSlot = nextSlotBase++;
+    if (dispSlot >= info.nlocals()) {
+      fprintf(stderr, "[ion-fe] dispatch slot overflow\n");
+      return false;
+    }
+    // The dispatch slot merges all ways' results; box each to a uniform i64 so
+    // the join phi is i64 (not MIRType::Value from mixed return types).
+    cur->setSlot(info.localSlot(dispSlot), boxForStore(konst(0.0)));
+    std::vector<WJPendEdge> contEdges;
+    for (uint8_t w = 0; w < poly.n; w++) {
+      JSFunction* fun = reinterpret_cast<JSFunction*>(uintptr_t(poly.fns[w]));
+      if (!fun || !fun->isInterpreted() || !fun->baseScript() ||
+          !fun->baseScript()->hasBytecode() || fun->nargs() != argc) {
+        fprintf(stderr, "[ion-fe] dispatch way %u not inlinable\n", w);
+        return false;
+      }
+      JSScript* cs = fun->baseScript()->asJSScript();
+      MCompare* g = MCompare::NewWasm(alloc, shapeWord,
+                                      konstI32(int32_t(poly.shapes[w])), JSOp::Eq,
+                                      MCompare::Compare_Int32);
+      cur->add(g);
+      MBasicBlock* body = MBasicBlock::New(graph, info, cur, MBasicBlock::NORMAL);
+      MBasicBlock* next = MBasicBlock::New(graph, info, cur, MBasicBlock::NORMAL);
+      if (!body || !next) return false;
+      body->setLoopDepth(loopDepth);
+      next->setLoopDepth(loopDepth);
+      graph.addBlock(body);
+      graph.addBlock(next);
+      cur->end(MTest::New(alloc, g, body, next));
+      cur = body;
+      // The dispatch compare already proved recv's shape on this (true) edge --
+      // record it so the inlined method body's field accesses skip the redundant
+      // shape guard (the hottest per-node work in richards).
+      guardedShape[recv] = poly.shapes[w];
+      WJFrameDesc cfr;
+      cfr.script = cs;
+      cfr.start = cs->code();
+      cfr.end = cs->codeEnd();
+      cfr.nargs = fun->nargs();
+      cfr.nfixed = cs->nfixed();
+      cfr.slotBase = nextSlotBase;
+      cfr.offBase = nextOffBase;
+      cfr.thisDef = recv;
+      cfr.isInline = true;
+      cfr.depth = callerDepth + 1;
+      if (cfr.slotBase + cfr.nargs + cfr.nfixed + 1 > info.nlocals()) {
+        fprintf(stderr, "[ion-fe] inline slot overflow (dispatch)\n");
+        return false;
+      }
+      nextSlotBase += cfr.nargs + cfr.nfixed + 1;
+      nextOffBase += uint32_t(cfr.end - cfr.start) + 1;
+      uint32_t crvalIdx = cfr.slotBase + cfr.nargs + cfr.nfixed;
+      std::vector<MDefinition*> argsCopy = cargs;
+      if (!buildFrame(cfr, argsCopy)) return false;
+      cur->setSlot(info.localSlot(dispSlot),
+                   boxForStore(cur->getSlot(info.localSlot(crvalIdx))));
+      MGoto* go = MGoto::New(alloc, nullptr);
+      cur->end(go);
+      contEdges.push_back({cur, MGoto::TargetIndex});
+      cur = next;
+      invalidateCSE();  // each way body is a separate dominator region
+    }
+    // No observed shape matched -> deopt sentinel (real integration bails here).
+    cur->end(MWasmReturn::New(alloc, konst(1.0), instance));
+    MBasicBlock* cont = nullptr;
+    for (const WJPendEdge& e : contEdges) {
+      if (!cont) {
+        cont = MBasicBlock::New(graph, info, e.block, MBasicBlock::NORMAL);
+        if (!cont) return false;
+        cont->setLoopDepth(loopDepth);
+        graph.addBlock(cont);
+      } else {
+        if (!cont->addPredecessor(alloc, e.block)) return false;
+      }
+      e.block->lastIns()->initSuccessor(e.successor, cont);
+    }
+    if (!cont) return false;
+    cur = cont;
+    invalidateCSE();
+    MDefinition* res = cur->getSlot(info.localSlot(dispSlot));
+    boxedVty[res] = 2;  // dispatch result is a boxed Value -> unbox lazily at use
+    push(res);
+    return true;
+  };
+  // Non-inlined call (like real Ion: inline what you can, call the rest). Marshal
+  // this/args (boxed i64) into gWJScratch, then MWJIonCall(callee) which the
+  // backend lowers to wjhelp(WJH_IONCALL) (the interpreter runs the callee) +
+  // deopt check + result load. `callee` must be the real callee Value (i64).
+  auto emitNonInlinedCall = [&](MDefinition* callee, MDefinition* thisv,
+                                std::vector<MDefinition*>& cargs,
+                                uint32_t argc) -> bool {
+    uint32_t scratchAddr = uint32_t(uintptr_t(static_cast<void*>(gWJScratch)));
+    for (uint32_t i = 0; i < argc; i++) {
+      storeAt(konstI32(int32_t(scratchAddr)), i * 8, js::Scalar::Int64,
+              boxForStore(cargs[i]));
+    }
+    storeAt(konstI32(int32_t(scratchAddr)), kWJThisOff, js::Scalar::Int64,
+            boxForStore(thisv ? thisv : konst(0.0)));
+    MWJIonCall* call = MWJIonCall::New(alloc, boxForStore(callee), argc);
+    cur->add(call);
+    boxedVty[call] = 2;  // result is a boxed Value
+    push(call);
+    return true;
+  };
+  buildFrame = [&](const WJFrameDesc& fr,
+                   std::vector<MDefinition*>& inArgs) -> bool {
+    if (fr.depth > kWJInlineMaxDepth) return false;
+    if (++gWJBuildFrames > 20000) {
+      fprintf(stderr,
+              "[ion-be] FRAME GUARD tripped (%u frames) at %s:%u depth=%u "
+              "(inline explosion)\n",
+              gWJBuildFrames, fr.script->filename() ? fr.script->filename() : "?",
+              uint32_t(fr.script->lineno()), fr.depth);
+      return false;
+    }
+    const uint32_t rvalSlotIdx = fr.slotBase + fr.nargs + fr.nfixed;
+    jsbytecode* const start = fr.start;
+    jsbytecode* const end = fr.end;
+    // Record this frame's loop heads (namespaced) for backedge detection.
+    for (jsbytecode* p = start; p < end;) {
+      uint32_t bl = GetBytecodeLength(p);
+      if (bl == 0) {
+        fprintf(stderr, "[ion-be] zero bytecode length at line=%u off=%u op=%s\n",
+                uint32_t(fr.script->lineno()), uint32_t(p - start),
+                js::CodeName(JSOp(*p)));
+        return false;
+      }
+      if (JSOp(*p) == JSOp::LoopHead) {
+        loopHeadOff.insert(fr.offBase + uint32_t(p - start));
+      }
+      p += bl;
+    }
+    // An inline frame runs on its own operand stack and seeds its arg/local/rval
+    // slots in the (live) current block before decoding its body.
+    std::vector<MDefinition*> frameStk;
+    std::vector<MDefinition*>* savedStk = curStk;
+    std::vector<WJPendEdge> retEdges;
+    if (fr.isInline) {
+      curStk = &frameStk;
+      // Uniform i64 slots: args/locals are NaN-boxed Values (boxForStore handles
+      // f64/i32/i64) so every slot phi is i64==i64.
+      for (uint32_t i = 0; i < fr.nargs; i++) {
+        cur->setSlot(info.localSlot(fr.slotBase + i),
+                     i < inArgs.size() ? boxForStore(inArgs[i]) : boxForStore(konst(0.0)));
+      }
+      for (uint32_t j = 0; j < fr.nfixed; j++) {
+        cur->setSlot(info.localSlot(fr.slotBase + fr.nargs + j),
+                     boxForStore(konst(0.0)));
+      }
+      cur->setSlot(info.localSlot(rvalSlotIdx), boxForStore(konst(0.0)));
+    }
+
+    for (jsbytecode* pc = start; pc < end;) {
+      if (++gWJBuildOps > 2000000) {
+        fprintf(stderr,
+                "[ion-be] BUILD GUARD tripped at %s:%u loff=%u op=%s depth=%u "
+                "(infinite builder loop)\n",
+                fr.script->filename() ? fr.script->filename() : "?",
+                uint32_t(fr.script->lineno()), uint32_t(pc - start),
+                js::CodeName(JSOp(*pc)), fr.depth);
+        return false;
+      }
+      uint32_t loff = uint32_t(pc - start);
+      uint32_t off = fr.offBase + loff;
+      JSOp op = JSOp(*pc);
+      uint32_t len = GetBytecodeLength(pc);
+
+      // --- Block-entry transitions ---
+      if (op == JSOp::LoopHead) {
+        // Start a pending loop header; current (if live) is its entry predecessor.
+        if (cur) {
+          MBasicBlock* header = MBasicBlock::New(graph, info, cur,
+                                                 MBasicBlock::PENDING_LOOP_HEADER);
+          if (!header) return false;
+          loopDepth++;
+          header->setLoopDepth(loopDepth);
+          graph.addBlock(header);
+          cur->end(MGoto::New(alloc, header));
+          loopHeader[off] = header;
+          cur = header;
+          curStk->clear();  // operand stack is empty at a loop header
+          invalidateCSE();  // dominance breaks at a loop header
+        }
+      } else if (op == JSOp::JumpTarget) {
+        // Logical-operator join: the fall-through (RHS) path has its result on the
+        // stack; stash it into the logical slot so it phi-merges with the LHS
+        // value carried on the short-circuit edge.
+        auto lj = logicalJoinSlot.find(off);
+        uint32_t logicalL = 0;
+        bool isLogical = lj != logicalJoinSlot.end();
+        if (isLogical) {
+          logicalL = lj->second;
+          logicalJoinSlot.erase(lj);
+          if (cur) cur->setSlot(info.localSlot(logicalL), boxForStore(pop()));
+        }
+        auto it = pending.find(off);
+        bool haveEdges = it != pending.end() && !it->second.empty();
+        if (haveEdges || cur == nullptr) {
+          std::vector<WJPendEdge> edges =
+              haveEdges ? std::move(it->second) : std::vector<WJPendEdge>();
+          if (haveEdges) pending.erase(off);
+          MBasicBlock* join = nullptr;
+          if (cur) {
+            // Fall-through edge from cur into a fresh join block.
+            join = MBasicBlock::New(graph, info, cur, MBasicBlock::NORMAL);
+            if (!join) return false;
+            join->setLoopDepth(loopDepth);
+            graph.addBlock(join);
+            cur->end(MGoto::New(alloc, join));
+          }
+          for (const WJPendEdge& e : edges) {
+            if (!join) {
+              join = MBasicBlock::New(graph, info, e.block, MBasicBlock::NORMAL);
+              if (!join) return false;
+              join->setLoopDepth(loopDepth);
+              graph.addBlock(join);
+            } else {
+              if (!join->addPredecessor(alloc, e.block)) return false;
+            }
+            e.block->lastIns()->initSuccessor(e.successor, join);
+          }
+          cur = join;
+          curStk->clear();  // operand stack is empty at a join
+          invalidateCSE();  // dominance breaks at a join
+          if (isLogical) push(cur->getSlot(info.localSlot(logicalL)));
+        }
+      }
+
+      if (cur == nullptr) {  // dead code until a target opens a block
+        pc += len;
+        continue;
+      }
+
+      // --- Op emission ---
+      switch (op) {
+        case JSOp::GetArg: {
+          MDefinition* v = cur->getSlot(info.localSlot(fr.slotBase + GET_ARGNO(pc)));
+          boxedVty[v] = 2;  // slots are uniform boxed i64 -> unbox lazily at use
+          push(v);
+          break;
+        }
+        case JSOp::SetArg:
+          cur->setSlot(info.localSlot(fr.slotBase + GET_ARGNO(pc)),
+                       boxForStore(curStk->back()));
+          break;
+        case JSOp::GetLocal: {
+          MDefinition* v = cur->getSlot(
+              info.localSlot(fr.slotBase + fr.nargs + GET_LOCALNO(pc)));
+          boxedVty[v] = 2;
+          push(v);
+          break;
+        }
+        case JSOp::SetLocal:
+          cur->setSlot(info.localSlot(fr.slotBase + fr.nargs + GET_LOCALNO(pc)),
+                       boxForStore(curStk->back()));
+          break;
+        case JSOp::Zero: push(konst(0.0)); break;
+        case JSOp::One: push(konst(1.0)); break;
+        case JSOp::Int8: push(konst(double(GET_INT8(pc)))); break;
+        case JSOp::Int32: push(konst(double(GET_INT32(pc)))); break;
+        case JSOp::Uint16: push(konst(double(GET_UINT16(pc)))); break;
+        case JSOp::Uint24: push(konst(double(GET_UINT24(pc)))); break;
+        case JSOp::Double: {
+          double d;
+          memcpy(&d, pc + 1, sizeof(double));
+          push(konst(d));
+          break;
+        }
+        case JSOp::Add:
+          binF64([](TempAllocator& a, MDefinition* l, MDefinition* r) -> MInstruction* {
+            return MAdd::NewWasm(a, l, r, MIRType::Double);
+          });
+          break;
+        case JSOp::Sub:
+          binF64([](TempAllocator& a, MDefinition* l, MDefinition* r) -> MInstruction* {
+            return MSub::NewWasm(a, l, r, MIRType::Double, /*preserveNaN=*/true);
+          });
+          break;
+        case JSOp::Mul:
+          binF64([](TempAllocator& a, MDefinition* l, MDefinition* r) -> MInstruction* {
+            return MMul::NewWasm(a, l, r, MIRType::Double, MMul::Normal,
+                                 /*preserveNaN=*/true);
+          });
+          break;
+        case JSOp::BitAnd:
+        case JSOp::BitOr:
+        case JSOp::BitXor: {
+          MDefinition* b = asInt32(pop());
+          MDefinition* a = asInt32(pop());
+          auto sub = op == JSOp::BitAnd  ? MWasmBinaryBitwise::SubOpcode::And
+                     : op == JSOp::BitOr ? MWasmBinaryBitwise::SubOpcode::Or
+                                         : MWasmBinaryBitwise::SubOpcode::Xor;
+          MWasmBinaryBitwise* n =
+              MWasmBinaryBitwise::New(alloc, a, b, MIRType::Int32, sub);
+          cur->add(n);
+          push(n);  // JS bitwise result is an int32
+          break;
+        }
+        case JSOp::Lsh:
+        case JSOp::Rsh:
+        case JSOp::Ursh: {
+          MDefinition* b = asInt32(pop());
+          MDefinition* a = asInt32(pop());
+          MInstruction* n =
+              op == JSOp::Lsh
+                  ? static_cast<MInstruction*>(MLsh::New(alloc, a, b, MIRType::Int32))
+              : op == JSOp::Rsh
+                  ? static_cast<MInstruction*>(MRsh::New(alloc, a, b, MIRType::Int32))
+                  : static_cast<MInstruction*>(
+                        MUrsh::NewWasm(alloc, a, b, MIRType::Int32));
+          cur->add(n);
+          push(n);  // JS shift result is an int32
+          break;
+        }
+        case JSOp::Lt: cmp(JSOp::Lt); break;
+        case JSOp::Le: cmp(JSOp::Le); break;
+        case JSOp::Gt: cmp(JSOp::Gt); break;
+        case JSOp::Ge: cmp(JSOp::Ge); break;
+        case JSOp::Eq:
+        case JSOp::StrictEq: cmp(JSOp::Eq); break;
+        case JSOp::Ne:
+        case JSOp::StrictNe: cmp(JSOp::Ne); break;
+        case JSOp::StrictConstantEq:
+        case JSOp::StrictConstantNe: {
+          // Fused `x === <const>` / `x !== <const>`. In the object-pointer model a
+          // null/undefined check is an i32 compare against 0; an Int32 const
+          // compares against the (numeric) value.
+          using ET = js::ConstantCompareOperand::EncodedType;
+          js::ConstantCompareOperand cco =
+              js::ConstantCompareOperand::fromRawValue(GET_UINT16(pc));
+          bool isEq = (op == JSOp::StrictConstantEq);
+          MDefinition* val = pop();
+          MDefinition* rhs = nullptr;
+          MCompare::CompareType ct = MCompare::Compare_Int32;
+          ET t = cco.type();
+          if (t == ET::Null || t == ET::Undefined) {
+            // Object-pointer / null check: unbox to the i32 pointer (0 == null).
+            val = asObjPtr(val);
+            if (val->type() != MIRType::Int32) {
+              fprintf(stderr, "[ion-fe] StrictConstant null on non-ptr\n");
+              return false;
+            }
+            rhs = konstI32(0);
+          } else if (t == ET::Int32) {
+            if (val->type() == MIRType::Int32) {
+              rhs = konstI32(cco.toInt32());
+            } else {
+              val = asNumber(val);
+              rhs = konst(double(cco.toInt32()));
+              ct = MCompare::Compare_Double;
+            }
+          } else {
+            fprintf(stderr, "[ion-fe] StrictConstant unsupported operand\n");
+            return false;
+          }
+          MCompare* c = MCompare::NewWasm(alloc, val, rhs,
+                                          isEq ? JSOp::Eq : JSOp::Ne, ct);
+          cur->add(c);
+          push(c);
+          break;
+        }
+        case JSOp::Inc:
+        case JSOp::Dec: {
+          MDefinition* v = asNumber(pop());
+          MDefinition* one = konst(1.0);
+          MInstruction* n =
+              op == JSOp::Inc
+                  ? static_cast<MInstruction*>(MAdd::NewWasm(alloc, v, one,
+                                                             MIRType::Double))
+                  : static_cast<MInstruction*>(MSub::NewWasm(
+                        alloc, v, one, MIRType::Double, /*preserveNaN=*/true));
+          cur->add(n);
+          push(n);
+          break;
+        }
+        case JSOp::Pos:
+        case JSOp::ToNumeric:
+          break;  // identity on a number
+        case JSOp::Pop: pop(); break;
+        case JSOp::Dup: push(curStk->back()); break;
+        case JSOp::FunctionThis:
+        case JSOp::GlobalThis:
+          push(fr.thisDef ? fr.thisDef : konst(0.0));
+          break;
+        case JSOp::SetRval:
+          cur->setSlot(info.localSlot(rvalSlotIdx), boxForStore(pop()));
+          break;
+        case JSOp::GetRval: push(cur->getSlot(info.localSlot(rvalSlotIdx))); break;
+        case JSOp::JumpIfFalse:
+        case JSOp::JumpIfTrue: {
+          // MTest needs an i32 condition. A boxed i64 (e.g. a boxed boolean from a
+          // dispatched method, or an object-ref for `if (obj)`) is reduced to its
+          // low32 truthiness (0 = null/false/0, nonzero = object/true).
+          MDefinition* condv = asInt32(pop());
+          uint32_t tgt = uint32_t(int64_t(off) + GET_JUMP_OFFSET(pc));
+          uint32_t fall = off + len;
+          MTest* test = MTest::New(alloc, condv, nullptr, nullptr);
+          cur->end(test);
+          // JumpIfTrue: true->tgt, false->fall. JumpIfFalse: true->fall, false->tgt.
+          uint32_t trueOff = (op == JSOp::JumpIfTrue) ? tgt : fall;
+          uint32_t falseOff = (op == JSOp::JumpIfTrue) ? fall : tgt;
+          auto wire = [&](uint32_t edgeOff, uint32_t succIdx) -> bool {
+            if (loopHeadOff.count(edgeOff) && edgeOff <= off) {  // backedge
+              MBasicBlock* h = loopHeader[edgeOff];
+              test->initSuccessor(succIdx, h);
+              return h->setBackedgeWasm(cur, 0);
+            }
+            pending[edgeOff].push_back({cur, succIdx});
+            return true;
+          };
+          if (!wire(trueOff, MTest::TrueBranchIndex)) return false;
+          if (!wire(falseOff, MTest::FalseBranchIndex)) return false;
+          cur = nullptr;
+          break;
+        }
+        case JSOp::Goto: {
+          uint32_t tgt = uint32_t(int64_t(off) + GET_JUMP_OFFSET(pc));
+          MGoto* go = MGoto::New(alloc, nullptr);
+          cur->end(go);
+          if (loopHeadOff.count(tgt) && tgt <= off) {  // backedge
+            MBasicBlock* h = loopHeader[tgt];
+            go->initSuccessor(MGoto::TargetIndex, h);
+            if (!h->setBackedgeWasm(cur, 0)) return false;
+            if (loopDepth) loopDepth--;
+          } else {
+            pending[tgt].push_back({cur, MGoto::TargetIndex});
+          }
+          cur = nullptr;
+          break;
+        }
+        case JSOp::Or:
+        case JSOp::And: {
+          // Short-circuit: keep the LHS value (jump to target) when truthy (Or) /
+          // falsy (And); else fall through to evaluate the RHS. The result spans
+          // the branch, so spill it to a slot (reloaded at the join).
+          MDefinition* v = pop();
+          uint32_t L = nextSlotBase++;
+          if (L >= info.nlocals()) {
+            fprintf(stderr, "[ion-fe] logical slot overflow\n");
+            return false;
+          }
+          cur->setSlot(info.localSlot(L), boxForStore(v));
+          uint32_t tgt = uint32_t(int64_t(off) + GET_JUMP_OFFSET(pc));
+          MDefinition* condv = (v->type() == MIRType::Int32) ? v : asInt32(v);
+          MTest* test = MTest::New(alloc, condv, nullptr, nullptr);
+          MBasicBlock* fall =
+              MBasicBlock::New(graph, info, cur, MBasicBlock::NORMAL);
+          if (!fall) return false;
+          fall->setLoopDepth(loopDepth);
+          graph.addBlock(fall);
+          cur->end(test);
+          uint32_t keepSucc = (op == JSOp::Or) ? MTest::TrueBranchIndex
+                                               : MTest::FalseBranchIndex;
+          uint32_t fallSucc = (op == JSOp::Or) ? MTest::FalseBranchIndex
+                                               : MTest::TrueBranchIndex;
+          pending[tgt].push_back({cur, keepSucc});
+          test->initSuccessor(fallSucc, fall);
+          logicalJoinSlot[tgt] = L;
+          cur = fall;
+          // SpiderMonkey's JSOp::Or/And PEEK the condition (leave it on the
+          // stack); the fall-through path has an explicit JSOp::Pop that removes
+          // it before evaluating the RHS. We consumed it via pop() above to stash
+          // it into slot L for the short-circuit edge -- re-push it on the
+          // fall-through so that JSOp::Pop balances (else the stack underflows to
+          // size -1 and corrupts, hanging the builder).
+          push(v);
+          break;
+        }
+        case JSOp::Return: {
+          MDefinition* r = pop();
+          if (!fr.isInline) {
+            if (scratchResultBase) {
+              storeAt(scratchResultBase, kWJResultOff, js::Scalar::Int64,
+                      boxForStore(r));
+              cur->end(MWasmReturn::New(alloc, konst(0.0), instance));
+            } else {
+              cur->end(MWasmReturn::New(alloc, asNumber(r), instance));
+            }
+          } else {
+            // Route to the frame's return-continuation: stash the value (boxed to
+            // a uniform i64) in the rval slot and Goto a join built after the body.
+            cur->setSlot(info.localSlot(rvalSlotIdx), boxForStore(r));
+            MGoto* g = MGoto::New(alloc, nullptr);
+            cur->end(g);
+            retEdges.push_back({cur, MGoto::TargetIndex});
+          }
+          cur = nullptr;
+          break;
+        }
+        case JSOp::RetRval: {
+          if (!fr.isInline) {
+            MDefinition* rv = cur->getSlot(info.localSlot(rvalSlotIdx));
+            if (scratchResultBase) {
+              storeAt(scratchResultBase, kWJResultOff, js::Scalar::Int64,
+                      boxForStore(rv));
+              cur->end(MWasmReturn::New(alloc, konst(0.0), instance));
+            } else {
+              cur->end(MWasmReturn::New(alloc, asNumber(rv), instance));
+            }
+          } else {
+            MGoto* g = MGoto::New(alloc, nullptr);  // rval slot already holds value
+            cur->end(g);
+            retEdges.push_back({cur, MGoto::TargetIndex});
+          }
+          cur = nullptr;
+          break;
+        }
+        case JSOp::GetProp: {
+          MDefinition* recv = pop();  // receiver object pointer (i32)
+          // Method-call idiom (Dup; GetProp method; Swap; Call) takes PRIORITY over
+          // own-field resolution: a method load must never be resolved as a
+          // same-named field. richards has "queue" as a METHOD on Scheduler but a
+          // FIELD on TaskControlBlock -- resolving `this.scheduler.queue` as the
+          // TCB.queue field guards the wrong shape and deopts (corrupting the
+          // stateful scheduler). The trailing Swap unambiguously marks the idiom.
+          if (JSOp(*(pc + len)) == JSOp::Swap) {
+            push(recv);  // re-push recv as the callee placeholder for the Call
+            methodOffOf[recv] = loff;
+            break;
+          }
+          // Own fixed-slot field -> shape-guarded load (GVN/LICM-able).
+          MDefinition* fv = getPropField(fr.script, recv, loff);
+          if (fv) {
+            push(fv);
+          } else {
+            fprintf(stderr,
+                    "[ion-fe] GetProp@%u (%s:%u): no record, next=%s\n", loff,
+                    fr.script->filename() ? fr.script->filename() : "?",
+                    uint32_t(fr.script->lineno()),
+                    js::CodeName(JSOp(*(pc + len))));
+            return false;
+          }
+          break;
+        }
+        case JSOp::GetElem: {
+          // Dense array element read: shape-guard the array, then load the boxed
+          // Value at elements_[index] (elements_ points at element 0). Unchecked
+          // bounds (speculative; valid indices in richards). Result is boxed i64.
+          auto eit = gWJElemShape.find(WJInlineKey(fr.script, loff));
+          if (eit == gWJElemShape.end()) {
+            fprintf(stderr, "[ion-fe] GetElem@%u: no dense-array record\n", loff);
+            return false;
+          }
+          MDefinition* idx = asInt32(pop());
+          MDefinition* arr = asObjPtr(pop());
+          if (!ensureGuard(arr, eit->second)) return false;
+          MDefinition* elemsPtr =
+              loadAt(arr, 12, js::Scalar::Int32, MIRType::Int32);  // elements_
+          MMul* byteOff = MMul::NewWasm(alloc, idx, konstI32(8), MIRType::Int32,
+                                        MMul::Normal, /*preserveNaN=*/false);
+          cur->add(byteOff);
+          MAdd* addr =
+              MAdd::NewWasm(alloc, elemsPtr, byteOff, MIRType::Int32);
+          cur->add(addr);
+          MDefinition* el = loadAt(addr, 0, js::Scalar::Int64, MIRType::Int64);
+          boxedVty[el] = 2;
+          push(el);
+          break;
+        }
+        case JSOp::SetElem:
+        case JSOp::StrictSetElem: {
+          // Dense array element write: [arr, idx, val] -> [val].
+          auto eit = gWJElemShape.find(WJInlineKey(fr.script, loff));
+          if (eit == gWJElemShape.end()) {
+            fprintf(stderr, "[ion-fe] SetElem@%u: no dense-array record\n", loff);
+            return false;
+          }
+          MDefinition* val = pop();
+          MDefinition* idx = asInt32(pop());
+          MDefinition* arr = asObjPtr(pop());
+          if (!ensureGuard(arr, eit->second)) return false;
+          MDefinition* elemsPtr =
+              loadAt(arr, 12, js::Scalar::Int32, MIRType::Int32);
+          MMul* byteOff = MMul::NewWasm(alloc, idx, konstI32(8), MIRType::Int32,
+                                        MMul::Normal, /*preserveNaN=*/false);
+          cur->add(byteOff);
+          MAdd* addr = MAdd::NewWasm(alloc, elemsPtr, byteOff, MIRType::Int32);
+          cur->add(addr);
+          storeAt(addr, 0, js::Scalar::Int64, boxForStore(val));
+          // Dense append bookkeeping: writing the raw element slot is not enough --
+          // a JS-level read respects the ObjectElements header. Grow
+          // initializedLength (elements_ - 12) and length (elements_ - 4) to
+          // max(cur, idx+1) so the written element is live instead of a hole
+          // (e.g. `new Array(n)` then filled sequentially, richards' packet data).
+          // Branch-free select keeps it monotonic (a write below the watermark
+          // never shrinks the array).
+          MAdd* idxp1 = MAdd::NewWasm(alloc, idx, konstI32(1), MIRType::Int32);
+          cur->add(idxp1);
+          auto growField = [&](int32_t hdrOff) {
+            MAdd* hAddr =
+                MAdd::NewWasm(alloc, elemsPtr, konstI32(hdrOff), MIRType::Int32);
+            cur->add(hAddr);
+            MDefinition* old = loadAt(hAddr, 0, js::Scalar::Int32, MIRType::Int32);
+            MCompare* grow = MCompare::NewWasm(alloc, idxp1, old, JSOp::Gt,
+                                               MCompare::Compare_Int32);
+            cur->add(grow);
+            MWasmSelect* nv = MWasmSelect::New(alloc, idxp1, old, grow);
+            cur->add(nv);
+            storeAt(hAddr, 0, js::Scalar::Int32, nv);
+          };
+          growField(-12);  // initializedLength
+          growField(-4);   // length
+          fieldCache.clear();
+          objPtrMemo.clear();
+          push(val);
+          break;
+        }
+        case JSOp::SetProp:
+        case JSOp::StrictSetProp: {
+          // Mutating an own slot (fixed or dynamic). Stack: [recv, val] -> [val].
+          // Guard the shape, box the value to its raw NaN-boxed i64 Value, and
+          // store it. (Boxing makes int/object stores correct, not just doubles.)
+          auto rec = gWJShapeRec.find(WJInlineKey(fr.script, loff));
+          if (rec == gWJShapeRec.end() || rec->second.shape == 0) {
+            fprintf(stderr, "[ion-fe] SetProp@%u: no shape record\n", loff);
+            return false;
+          }
+          uint32_t recShape = rec->second.shape, foff = rec->second.off;
+          // Box to match the field's READ representation. getPropField reads a field
+          // observed as int (vty1) as a low32 int payload, so a store must use the
+          // int32-tagged Value (not a double Value, whose low32 is garbage). Use the
+          // SAME authoritative source the read does -- gWJFieldVty[(shape,offset)] --
+          // so write and read representations always agree (rec->second.vty as
+          // fallback). gWJPropByName must NOT be used here: it can disagree with the
+          // shape+offset field type and silently corrupt the field.
+          uint8_t setVty = rec->second.vty;
+          {
+            auto vit = gWJFieldVty.find((uint64_t(recShape) << 32) | foff);
+            if (vit != gWJFieldVty.end()) setVty = vit->second;
+          }
+          MDefinition* val = pop();
+          MDefinition* recv = pop();
+          MDefinition* objp = asObjPtr(recv);
+          if (!ensureGuard(objp, recShape)) return false;
+          uint32_t fo;
+          MDefinition* base = fieldBase(objp, foff, &fo);
+          storeAt(base, fo, js::Scalar::Int64,
+                  setVty == 1 ? boxForStoreInt(val) : boxForStore(val));
+          // Heap mutated: drop cached field values (conservative). Re-reads reload.
+          fieldCache.clear();
+          objPtrMemo.clear();
+          push(val);
+          break;
+        }
+        case JSOp::GetGName:
+        case JSOp::GetName: {
+          // A global read used as a VALUE (richards' STATE_*/ID_*/KIND_* numeric
+          // constants) is baked as a constant (de-facto-const globals). A global
+          // that is an object/function is left as a 0.0 placeholder: it is the
+          // callee of an inlined call, resolved statically at the Call. (FUTURE:
+          // a global-shape guard to deopt if a baked global is ever reassigned.)
+          bool baked = false;
+          if (JSContext* cx = js::TlsContext.get()) {
+            if (js::NativeObject* g = cx->global()) {
+              js::PropertyName* nm = fr.script->getName(pc);
+              mozilla::Maybe<js::PropertyInfo> prop = g->lookupPure(js::NameToId(nm));
+              if (prop.isSome() && prop->isDataProperty()) {
+                JS::Value gv = g->getSlot(prop->slot());
+                if (gv.isInt32()) { push(konst(double(gv.toInt32()))); baked = true; }
+                else if (gv.isDouble()) { push(konst(gv.toDouble())); baked = true; }
+                else if (gv.isObject()) {
+                  // A function/object global -> bake its boxed object Value so it
+                  // is available as a non-inlined call's callee. (Baked raw ptr:
+                  // de-facto-const tenured globals in richards; FUTURE: guard.)
+                  uint32_t p = uint32_t(uintptr_t(&gv.toObject()));
+                  MConstant* c = MConstant::NewInt64(
+                      alloc, (int64_t(kWJTagObject) << 32) | int64_t(uint64_t(p)));
+                  cur->add(c);
+                  boxedVty[c] = 3;
+                  push(c);
+                  baked = true;
+                }
+              }
+            }
+          }
+          if (!baked) push(konst(0.0));  // unresolved -> placeholder
+          break;
+        }
+        case JSOp::Undefined:
+          // Placeholder for an inlined call's `this`/callee (popped at the Call).
+          push(konst(0.0));
+          break;
+        case JSOp::Null: {
+          // null as a BOXED i64 Value (tag kWJTagNull, payload 0), so it has the
+          // same representation as object/reference fields. A local that holds a
+          // field load on one path and `null` on another (e.g. richards'
+          // `packet = this.queue ... else packet = null`) then merges to a uniform
+          // i64 phi instead of degrading to MIRType::Value (which has no wasm
+          // local). asObjPtr extracts low32==0 so reference/null compares stay i32.
+          MConstant* n = MConstant::NewInt64(alloc, int64_t(kWJTagNull) << 32);
+          cur->add(n);
+          boxedVty[n] = 3;
+          push(n);
+          break;
+        }
+        case JSOp::Swap: {
+          MDefinition* a = pop();
+          MDefinition* b = pop();
+          push(a);
+          push(b);
+          break;
+        }
+        case JSOp::Call:
+        case JSOp::CallContent:
+        case JSOp::CallIgnoresRv: {
+          uint32_t argc = GET_ARGC(pc);
+          std::vector<MDefinition*> cargs(argc, nullptr);
+          for (uint32_t i = 0; i < argc; i++) cargs[argc - 1 - i] = pop();
+          MDefinition* thisv = pop();      // this (receiver for methods)
+          MDefinition* calleeDef = pop();  // callee placeholder
+          // Method polymorphic dispatch: guard the receiver shape, inline each
+          // observed task type's body (richards' megamorphic task.run).
+          auto moit = methodOffOf.find(calleeDef);
+          if (moit != methodOffOf.end()) {
+            auto mit = gWJMethodPoly.find(WJInlineKey(fr.script, moit->second));
+            if (mit != gWJMethodPoly.end() && mit->second.n >= 1) {
+              if (!emitMethodDispatch(mit->second, thisv, cargs, argc, fr.depth)) {
+                return false;
+              }
+              break;
+            }
+          }
+          // Free-function monomorphic inline.
+          JSScript* cs = WJResolveInlineCallee(fr.script, loff, argc);
+          if (!cs) {
+            // Can't inline (no recorded callee). If this is a FREE function call
+            // (calleeDef is the real callee Value, not a method receiver), emit a
+            // non-inlined call instead of bailing the whole function.
+            bool isMethod = methodOffOf.find(calleeDef) != methodOffOf.end();
+            if (!isMethod && calleeDef->type() == MIRType::Int64) {
+              if (!emitNonInlinedCall(calleeDef, thisv, cargs, argc)) return false;
+              break;
+            }
+            fprintf(stderr, "[ion-fe] Call@%u: callee not inlinable\n", loff);
+            return false;
+          }
+          JSFunction* cf = cs->function();
+          WJFrameDesc cfr;
+          cfr.script = cs;
+          cfr.start = cs->code();
+          cfr.end = cs->codeEnd();
+          cfr.nargs = cf ? cf->nargs() : argc;
+          cfr.nfixed = cs->nfixed();
+          cfr.slotBase = nextSlotBase;
+          cfr.offBase = nextOffBase;
+          cfr.thisDef = thisv;
+          cfr.isInline = true;
+          cfr.depth = fr.depth + 1;
+          if (cfr.slotBase + cfr.nargs + cfr.nfixed + 1 > info.nlocals()) {
+            fprintf(stderr, "[ion-fe] inline slot overflow\n");
+            return false;
+          }
+          nextSlotBase += cfr.nargs + cfr.nfixed + 1;
+          nextOffBase += uint32_t(cfr.end - cfr.start) + 1;
+          uint32_t crvalIdx = cfr.slotBase + cfr.nargs + cfr.nfixed;
+          if (!buildFrame(cfr, cargs)) return false;
+          // buildFrame left cur = the callee's return-continuation and restored
+          // curStk to this frame's stack; the rval slot holds the (boxed) return.
+          MDefinition* cret = cur->getSlot(info.localSlot(crvalIdx));
+          boxedVty[cret] = 2;  // inline return is a boxed i64 -> unbox lazily
+          push(cret);
+          break;
+        }
+        case JSOp::JumpTarget:
+        case JSOp::LoopHead:
+        case JSOp::Nop:
+        case JSOp::NopIsAssignOp:
+        case JSOp::NopDestructuring:
+          break;
+        default:
+          fprintf(stderr, "[ion-fe] unsupported op %s\n", js::CodeName(op));
+          return false;
+      }
+      pc += len;
+    }
+
+    // --- Inline-frame return continuation ---
+    if (fr.isInline) {
+      MBasicBlock* cont = nullptr;
+      uint32_t nEdges = 0;
+      auto addRet = [&](MBasicBlock* b, uint32_t succ) -> bool {
+        if (!cont) {
+          cont = MBasicBlock::New(graph, info, b, MBasicBlock::NORMAL);
+          if (!cont) return false;
+          cont->setLoopDepth(loopDepth);
+          graph.addBlock(cont);
+        } else {
+          if (!cont->addPredecessor(alloc, b)) return false;
+        }
+        b->lastIns()->initSuccessor(succ, cont);
+        nEdges++;
+        return true;
+      };
+      for (const WJPendEdge& e : retEdges) {
+        if (!addRet(e.block, e.successor)) return false;
+      }
+      if (cur) {  // fell off the end without an explicit return
+        MGoto* g = MGoto::New(alloc, nullptr);
+        cur->end(g);
+        if (!addRet(cur, MGoto::TargetIndex)) return false;
+      }
+      if (!cont) return false;  // callee has no reachable return
+      cur = cont;
+      curStk = savedStk;  // restore caller's operand stack
+      // The continuation joins multiple branches only when there was >1 return
+      // edge; dominance breaks there, so the CSE state no longer holds. A single
+      // straight-line return keeps the (linear) CSE state for the caller.
+      if (nEdges > 1) invalidateCSE();
+    }
+    return true;
+  };
+
+  WJFrameDesc top;
+  top.script = script;
+  top.start = start;
+  top.end = end;
+  top.slotBase = 0;
+  top.nargs = nargs;
+  top.nfixed = nfixed;
+  top.offBase = 0;
+  top.thisDef = topThisDef;
+  top.isInline = false;
+  top.depth = 0;
+  std::vector<MDefinition*> noArgs;
+  return buildFrame(top, noArgs);
+}
+
+
+// Populate gWJShapeRec / gWJInlineCallee for `script` by reading its Baseline ICs
+// (CacheIR) directly -- the same data source real Ion's WarpOracle uses. This is
+// DECOUPLED from whether the WJ JIT compiled the function, so even complex hot fns
+// (richards schedule) that the WJ JIT skips still get shape/field/callee data
+// (they always run in the Baseline interpreter, which fills CacheIR ICs). Existing
+// runtime records are not clobbered. Each IC stub is one observed shape/callee way.
+static void WJReadBaselineICs(JSScript* script) {
+  using namespace js::jit;
+  bool dbg = getenv("GECKO_WJVS_ORACLE_DBG") != nullptr;
+  if (!script->hasJitScript()) {
+    if (dbg) fprintf(stderr, "[oracle] %s:%u NO JitScript\n",
+                     script->filename() ? script->filename() : "?",
+                     uint32_t(script->lineno()));
+    return;
+  }
+  JitScript* jitScript = script->jitScript();
+  jsbytecode* start = script->code();
+  jsbytecode* end = script->codeEnd();
+  for (jsbytecode* pc = start; pc < end; pc += GetBytecodeLength(pc)) {
+    JSOp op = JSOp(*pc);
+    bool isProp = (op == JSOp::GetProp || op == JSOp::SetProp ||
+                   op == JSOp::StrictSetProp);
+    bool isCall = (op == JSOp::Call || op == JSOp::CallContent ||
+                   op == JSOp::CallIgnoresRv);
+    bool isElem = (op == JSOp::GetElem || op == JSOp::SetElem ||
+                   op == JSOp::StrictSetElem);
+    if (!isProp && !isCall && !isElem) continue;
+    uint32_t pcOff = uint32_t(pc - start);
+    ICEntry& entry = jitScript->icEntryFromPCOffset(pcOff);
+    // Guard against a binary-search mismatch (NDEBUG drops the internal assert).
+    if (jitScript->fallbackStubForICEntry(&entry)->pcOffset() != pcOff) continue;
+    if (dbg) {
+      fprintf(stderr, "[oracle] %s:%u off=%u op=%s firstStubFallback=%d\n",
+              script->filename() ? script->filename() : "?",
+              uint32_t(script->lineno()), pcOff, js::CodeName(op),
+              entry.firstStub()->isFallback());
+    }
+    for (ICStub* s = entry.firstStub(); s && !s->isFallback();
+         s = s->maybeNext()) {
+      ICCacheIRStub* cir = s->toCacheIRStub();
+      const CacheIRStubInfo* info = cir->stubInfo();
+      CacheIRReader reader(info->code(), info->code() + info->codeLength());
+      uint32_t shape = 0, foff = 0, calleeFn = 0;
+      bool haveShape = false, haveOff = false;
+      int recvObjId = -1, loadObjId = -1;
+      JSObject* holderObj = nullptr;
+      while (reader.more()) {
+        CacheOp cop = reader.readOp();
+        if (dbg && pcOff >= 55 && pcOff <= 72) {
+          fprintf(stderr, "[oracle]   off=%u cop=%s\n", pcOff,
+                  CacheIRCodeName(cop));
+        }
+        switch (cop) {
+          case CacheOp::GuardShape: {
+            uint32_t oid = reader.objOperandId().id();
+            uint32_t shp = uint32_t(info->getStubRawWord(cir, reader.stubOffset()));
+            // Only the FIRST GuardShape (the receiver). A proto/method load also
+            // guards the holder shape -- ignore that one.
+            if (recvObjId < 0) {
+              recvObjId = int(oid);
+              shape = shp;
+              haveShape = true;
+            }
+            break;
+          }
+          case CacheOp::LoadFixedSlotResult: {
+            loadObjId = int(reader.objOperandId().id());
+            foff = uint32_t(info->getStubRawInt32(cir, reader.stubOffset()));
+            haveOff = true;
+            break;
+          }
+          case CacheOp::LoadDynamicSlotResult: {
+            loadObjId = int(reader.objOperandId().id());
+            foff = uint32_t(info->getStubRawInt32(cir, reader.stubOffset())) |
+                   kWJDynSlot;
+            haveOff = true;
+            break;
+          }
+          case CacheOp::StoreFixedSlot: {
+            loadObjId = int(reader.objOperandId().id());
+            foff = uint32_t(info->getStubRawInt32(cir, reader.stubOffset()));
+            haveOff = true;
+            reader.skip(CacheIROpInfos[size_t(cop)].argLength - 2);
+            break;
+          }
+          case CacheOp::StoreDynamicSlot: {
+            loadObjId = int(reader.objOperandId().id());
+            foff = uint32_t(info->getStubRawInt32(cir, reader.stubOffset())) |
+                   kWJDynSlot;
+            haveOff = true;
+            reader.skip(CacheIROpInfos[size_t(cop)].argLength - 2);
+            break;
+          }
+          case CacheOp::LoadObject: {
+            reader.objOperandId();  // result id
+            holderObj = reinterpret_cast<JSObject*>(
+                info->getStubRawWord(cir, reader.stubOffset()));
+            break;
+          }
+          case CacheOp::GuardSpecificFunction: {
+            reader.objOperandId();
+            calleeFn = uint32_t(info->getStubRawWord(cir, reader.stubOffset()));
+            reader.skip(CacheIROpInfos[size_t(cop)].argLength - 2);
+            break;
+          }
+          default:
+            reader.skip(CacheIROpInfos[size_t(cop)].argLength);
+            break;
+        }
+      }
+      // Only record own-slot accesses (slot loaded from the shape-guarded
+      // receiver). A proto/method load reads from a different (holder) object --
+      // skip it so the FE's method-call idiom + polymorphic dispatch still fire.
+      if (isProp && haveShape && haveOff && loadObjId == recvObjId) {
+        // typeData is unpopulated in the portable-baseline build, so take the vty
+        // observed for this (shape, offset) by any wj-compiled function; fall back
+        // to typeData, else 2 (bail).
+        uint8_t vty = 2;
+        auto vit = gWJFieldVty.find((uint64_t(shape) << 32) | foff);
+        if (vit != gWJFieldVty.end()) {
+          vty = vit->second;
+        } else {
+          switch (cir->typeData().type()) {
+            case JSVAL_TYPE_INT32: vty = 1; break;
+            case JSVAL_TYPE_DOUBLE: vty = 0; break;
+            case JSVAL_TYPE_OBJECT:
+            case JSVAL_TYPE_NULL: vty = 3; break;
+            default: vty = 2; break;
+          }
+        }
+        // Still unknown -> read the field's value type from a live sample instance
+        // of this shape (validated), so unobserved fields are still unboxed.
+        if (vty == 2) {
+          auto sit = gWJShapeSample.find(shape);
+          if (sit != gWJShapeSample.end()) {
+            js::NativeObject* so =
+                reinterpret_cast<js::NativeObject*>(uintptr_t(sit->second));
+            if (so && uint32_t(uintptr_t(so->shape())) == shape) {  // still valid
+              uint32_t slot = (foff & kWJDynSlot)
+                                  ? (((foff & ~kWJDynSlot) / 8) + so->numFixedSlots())
+                                  : ((foff - 16) / 8);
+              if (slot < so->slotSpan()) {
+                JS::Value fv = so->getSlot(slot);
+                if (fv.isInt32()) vty = 1;
+                else if (fv.isDouble()) vty = 0;
+                else if (fv.isObject() || fv.isNull()) vty = 3;
+                if (vty != 2) gWJFieldVty[(uint64_t(shape) << 32) | foff] = vty;
+              }
+            }
+          }
+        }
+        uint64_t key = WJInlineKey(script, pcOff);
+        if (dbg) fprintf(stderr, "[oracle]   -> shape=%#x off=%#x vty=%u rawtype=%#x\n",
+                         shape, foff, vty, uint32_t(cir->typeData().type()));
+        if (gWJShapeRec.find(key) == gWJShapeRec.end()) {
+          gWJShapeRec[key] = WJShapeRec{shape, foff, vty};
+        }
+        // Index by property name for cold-site (fallback-IC) resolution.
+        jsbytecode* spc = script->offsetToPC(pcOff);
+        uint32_t nameLow = uint32_t(uintptr_t(script->getName(spc)));
+        auto pit = gWJPropByName.find(nameLow);
+        if (pit == gWJPropByName.end()) {
+          gWJPropByName[nameLow] = WJPropRec{shape, foff, vty, false};
+        } else if (pit->second.shape != shape || pit->second.off != foff) {
+          pit->second.ambig = true;  // same name on different layouts
+        }
+      } else if (isProp && haveShape && haveOff && holderObj &&
+                 holderObj->is<js::NativeObject>()) {
+        // Proto-property load (method): read the function from the holder slot and
+        // record (recvShape -> methodFn) so the FE's polymorphic dispatch can
+        // inline each receiver type's method. Each stub is one observed way.
+        js::NativeObject& nh = holderObj->as<js::NativeObject>();
+        uint32_t slot = (foff & kWJDynSlot)
+                            ? (((foff & ~kWJDynSlot) / 8) + nh.numFixedSlots())
+                            : ((foff - 16) / 8);
+        if (slot < nh.slotSpan()) {
+          JS::Value mv = nh.getSlot(slot);
+          if (mv.isObject() && mv.toObject().is<JSFunction>()) {
+            uint32_t fnLow = uint32_t(uintptr_t(&mv.toObject()));
+            WJMethodPolyRec& m = gWJMethodPoly[WJInlineKey(script, pcOff)];
+            bool seen = false;
+            for (uint8_t i = 0; i < m.n; i++) {
+              if (m.shapes[i] == shape) { seen = true; break; }
+            }
+            if (!seen && m.n < 4) {
+              m.shapes[m.n] = shape;
+              m.fns[m.n] = fnLow;
+              m.n++;
+            }
+            if (dbg) {
+              fprintf(stderr,
+                      "[oracle]   method-poly off=%u shape=%#x fn=%#x (n=%u)\n",
+                      pcOff, shape, fnLow, m.n);
+            }
+          }
+        }
+      }
+      if (isElem && haveShape) {
+        // Dense element access: record the array shape (the FE shape-guards then
+        // loads elements_[index] directly). Skip typed-array/other element ICs
+        // (no plain GuardShape+dense pattern -> haveShape stays from the recv).
+        uint64_t key = WJInlineKey(script, pcOff);
+        if (gWJElemShape.find(key) == gWJElemShape.end()) {
+          gWJElemShape[key] = shape;
+        }
+      }
+      if (isCall && calleeFn) WJRecordInlineCallee(script, pcOff, calleeFn);
+    }
+  }
+}
+
+// Read Baseline ICs for `script` and (depth-bounded) for every inlinable callee
+// in its call graph, so the Ion FE has shape/field/callee data for the whole
+// inline tree even when the WJ JIT compiled none of them.
+static void WJReadICsRecursive(JSScript* script, int depth) {
+  if (depth > kWJInlineMaxDepth) return;
+  WJReadBaselineICs(script);
+  jsbytecode* start = script->code();
+  jsbytecode* end = script->codeEnd();
+  auto recurse = [&](uint32_t fnLow) {
+    JSFunction* fun = reinterpret_cast<JSFunction*>(uintptr_t(fnLow));
+    if (fun && fun->isInterpreted() && fun->baseScript() &&
+        fun->baseScript()->hasBytecode()) {
+      WJReadICsRecursive(fun->baseScript()->asJSScript(), depth + 1);
+    }
+  };
+  for (jsbytecode* pc = start; pc < end; pc += GetBytecodeLength(pc)) {
+    JSOp op = JSOp(*pc);
+    uint32_t off = uint32_t(pc - start);
+    if (op == JSOp::Call || op == JSOp::CallContent ||
+        op == JSOp::CallIgnoresRv) {
+      auto it = gWJInlineCallee.find(WJInlineKey(script, off));
+      if (it != gWJInlineCallee.end()) {
+        for (uint8_t w = 0; w < it->second.n; w++) recurse(it->second.fns[w]);
+      }
+    } else if (op == JSOp::GetProp) {
+      // Method-load site: recurse into each polymorphic dispatch target.
+      auto mit = gWJMethodPoly.find(WJInlineKey(script, off));
+      if (mit != gWJMethodPoly.end()) {
+        for (uint8_t w = 0; w < mit->second.n; w++) recurse(mit->second.fns[w]);
+      }
+    }
+  }
+}
+
+// Front-end test: compile one real JSScript (straight-line numeric) through the
+// full bytecode->MIR->OptimizeMIR->wasm pipeline, call it with args parsed from
+// GECKO_WJVS_IONFE_ARGS ("a,b,..."), and print the result. Gated GECKO_WJVS_IONFE
+// (=target lineno). Verifies the FRONT-END produces correct, runnable wasm.
+static void WJIonFrontendTest(JSScript* script) {
+  using namespace js::jit;
+  JSFunction* fun = script->function();
+  if (!fun) return;
+  uint32_t nargs = fun->nargs();
+  uint32_t nfixed = script->nfixed();
+  // Seed shape/field/callee data from Baseline ICs (the decoupled oracle), so the
+  // FE works on functions the WJ JIT never compiled (e.g. richards schedule).
+  WJReadICsRecursive(script, 1);
+  fprintf(stderr, "[ion-fe] compiling %s:%u nargs=%u nfixed=%u\n",
+          script->filename() ? script->filename() : "?",
+          uint32_t(script->lineno()), nargs, nfixed);
+  if (getenv("GECKO_WJVS_IONFE_DUMP")) {
+    jsbytecode* st = script->code();
+    jsbytecode* en = script->codeEnd();
+    for (jsbytecode* p = st; p < en; p += GetBytecodeLength(p)) {
+      JSOp o = JSOp(*p);
+      int tgt = -1;
+      if (o == JSOp::Goto || o == JSOp::JumpIfFalse || o == JSOp::JumpIfTrue ||
+          o == JSOp::And || o == JSOp::Or || o == JSOp::Coalesce) {
+        tgt = int(int64_t(p - st) + GET_JUMP_OFFSET(p));
+      }
+      fprintf(stderr, "  %4d: %s%s", int(p - st), js::CodeName(o),
+              o == JSOp::LoopHead ? " [LOOPHEAD]" : "");
+      if (tgt >= 0) fprintf(stderr, " -> %d", tgt);
+      fprintf(stderr, "\n");
+    }
+  }
+  fflush(stderr);
+
+  LifoAlloc lifo(TempAllocator::PreferredLifoChunkSize,
+                 js::BackgroundMallocArena);
+  TempAllocator alloc(&lifo);
+  JitContext jitContext;
+  // Slots: this frame's args + locals + rval, plus a slot range for every
+  // inlined callee frame in the call graph (see WJCountInlineSlots).
+  CompileInfo compileInfo(nargs + nfixed + 1 + WJCountInlineSlots(script, 1));
+  MIRGraph graph(&alloc);
+  JitCompileOptions options;
+  MIRGenerator mirGen(nullptr, options, &alloc, &graph, &compileInfo,
+                      IonOptimizations.get(OptimizationLevel::Wasm), nullptr);
+
+  MBasicBlock* entry =
+      MBasicBlock::New(graph, compileInfo, nullptr, MBasicBlock::NORMAL);
+  if (!entry) return;
+  graph.addBlock(entry);
+
+  // Classify args: one used as a `GetArg k; GetProp` receiver is an object
+  // pointer (i32); the rest are numeric (f64). Also find the first GetProp's
+  // pcOff so the call can pass a real captured receiver for arg0.
+  uint32_t objArgMask = 0;
+  uint32_t firstGetPropOff = UINT32_MAX;
+  {
+    jsbytecode* st = script->code();
+    jsbytecode* en = script->codeEnd();
+    // A local is an "object local" if it is ever a GetProp receiver (GetLocal m;
+    // GetProp, or the method idiom GetLocal m; Dup; GetProp). An arg is an object
+    // pointer if it is a GetProp receiver directly, OR is copied into an object
+    // local (GetArg k; SetLocal m) -- the common `var c = head; ... c.next` cursor.
+    std::unordered_set<uint32_t> objLocals;
+    std::unordered_map<uint32_t, uint32_t> localFromArg;  // local <- arg
+    jsbytecode* prev = nullptr;
+    jsbytecode* prev2 = nullptr;
+    for (jsbytecode* p = st; p < en; p += GetBytecodeLength(p)) {
+      JSOp o = JSOp(*p);
+      if (o == JSOp::GetProp) {
+        if (firstGetPropOff == UINT32_MAX) firstGetPropOff = uint32_t(p - st);
+        if (prev && JSOp(*prev) == JSOp::GetArg) {
+          objArgMask |= (1u << GET_ARGNO(prev));
+        } else if (prev && JSOp(*prev) == JSOp::GetLocal) {
+          objLocals.insert(GET_LOCALNO(prev));
+        } else if (prev && JSOp(*prev) == JSOp::Dup && prev2 &&
+                   JSOp(*prev2) == JSOp::GetArg) {
+          objArgMask |= (1u << GET_ARGNO(prev2));
+        } else if (prev && JSOp(*prev) == JSOp::Dup && prev2 &&
+                   JSOp(*prev2) == JSOp::GetLocal) {
+          objLocals.insert(GET_LOCALNO(prev2));
+        }
+      } else if (o == JSOp::SetLocal && prev && JSOp(*prev) == JSOp::GetArg) {
+        localFromArg[GET_LOCALNO(p)] = GET_ARGNO(prev);
+      }
+      prev2 = prev;
+      prev = p;
+    }
+    for (uint32_t m : objLocals) {
+      auto it = localFromArg.find(m);
+      if (it != localFromArg.end()) objArgMask |= (1u << it->second);
+    }
+  }
+
+  // Detect a method that reads `this` (FunctionThis/GlobalThis). If so, `this` is
+  // passed as an extra trailing object param (i32 pointer) -- NOT a CompileInfo
+  // slot, since it is accessed via the thisDef operand.
+  bool useThis = false;
+  for (jsbytecode* p = script->code(); p < script->codeEnd();
+       p += GetBytecodeLength(p)) {
+    JSOp o = JSOp(*p);
+    if (o == JSOp::FunctionThis || o == JSOp::GlobalThis) { useThis = true; break; }
+  }
+
+  std::vector<MWasmParameter*> argParams(nargs ? nargs : 1, nullptr);
+  for (uint32_t i = 0; i < nargs; i++) {
+    MIRType ty = (objArgMask & (1u << i)) ? MIRType::Int32 : MIRType::Double;
+    argParams[i] = MWasmParameter::New(alloc, ABIArg(), ty);
+    entry->add(argParams[i]);
+  }
+  MWasmParameter* thisParam = nullptr;
+  if (useThis) {
+    thisParam = MWasmParameter::New(alloc, ABIArg(), MIRType::Int32);
+    entry->add(thisParam);
+  }
+  MWasmParameter* instance =
+      MWasmParameter::New(alloc, ABIArg(InstanceReg), MIRType::Pointer);
+  entry->add(instance);
+
+  // Full wasm param list = normal args, then `this` (if used). The backend binds
+  // these to param locals 0..paramCount-1 in this order.
+  std::vector<MWasmParameter*> paramList(argParams.begin(),
+                                         argParams.begin() + nargs);
+  if (useThis) paramList.push_back(thisParam);
+  uint32_t paramCount = uint32_t(paramList.size());
+
+  if (!WJIonBuildMIR(script, mirGen, alloc, graph, compileInfo, entry, instance,
+                     argParams.data(), nargs, nfixed, thisParam)) {
+    fprintf(stderr, "[ion-fe] BUILD MIR bailed\n");
+    return;
+  }
+  fprintf(stderr, "[ion-fe] MIR built (%zu blocks), optimizing...\n",
+          graph.numBlocks());
+  fflush(stderr);
+  if (getenv("GECKO_WJVS_IONFE_NOOPT")) {
+    fprintf(stderr, "[ion-fe] skipping OptimizeMIR (NOOPT)\n");
+  } else if (!OptimizeMIR(&mirGen)) {
+    fprintf(stderr, "[ion-fe] OptimizeMIR FAILED\n");
+    return;
+  }
+  fprintf(stderr, "[ion-fe] optimized, blocks=%zu\n", graph.numBlocks());
+
+  if (getenv("GECKO_WJVS_IONFE_DUMP")) {
+    // Custom dump (JS_JITSPEW is off in NDEBUG): per-block loop depth + counts
+    // of the nodes the property-access optimization targets. WasmLoads/compares
+    // sitting at loopDepth 0 means GVN/LICM hoisted them out of the loop.
+    uint32_t totLoad = 0, loopLoad = 0, totCmp = 0, loopCmp = 0;
+    for (ReversePostorderIterator b = graph.rpoBegin(); b != graph.rpoEnd();
+         b++) {
+      uint32_t ld = b->loopDepth();
+      uint32_t nLoad = 0, nCmp = 0, nAdd = 0, nPhi = 0;
+      for (MPhiIterator p = b->phisBegin(); p != b->phisEnd(); p++) nPhi++;
+      for (MInstructionIterator it = b->begin(); it != b->end(); it++) {
+        if (it->isWasmLoad()) nLoad++;
+        else if (it->isCompare()) nCmp++;
+        else if (it->isAdd()) nAdd++;
+      }
+      totLoad += nLoad; totCmp += nCmp;
+      if (ld > 0) { loopLoad += nLoad; loopCmp += nCmp; }
+      fprintf(stderr,
+              "  [blk %u] loopDepth=%u phis=%u load=%u cmp=%u add=%u\n",
+              b->id(), ld, nPhi, nLoad, nCmp, nAdd);
+    }
+    fprintf(stderr,
+            "[ion-fe] node summary: wasmLoad total=%u inLoop=%u | "
+            "compare total=%u inLoop=%u\n",
+            totLoad, loopLoad, totCmp, loopCmp);
+    fflush(stderr);
+  }
+
+  Bytes out;
+  Encoder e(out);
+  const uint8_t kF64 = uint8_t(TypeCode::F64);
+  if (!e.writeFixedU32(MagicNumber) ||
+      !e.writeFixedU32(EncodingVersionModule)) {
+    return;
+  }
+  size_t s;
+  // Type: (param... ) -> f64, each param i32 (object) or f64 (numeric).
+  if (!e.startSection(SectionId::Type, &s) || !e.writeVarU32(1) ||
+      !e.writeFixedU8(0x60) || !e.writeVarU32(paramCount)) {
+    return;
+  }
+  for (uint32_t i = 0; i < paramCount; i++) {
+    if (!e.writeFixedU8(WJWasmValType(paramList[i]->type()))) return;
+  }
+  if (!e.writeVarU32(1) || !e.writeFixedU8(kF64)) return;
+  e.finishSection(s);
+  // Import the guest linear memory as "m"."mem" so MWasmLoad can read objects.
+  int memId = wasmhost_guest_mem_objid();
+  bool sharedMem = memId >= 0 && wasmhost_guest_mem_shared() != 0;
+  if (memId < 0) {
+    fprintf(stderr, "[ion-fe] no guest memory to import\n");
+    return;
+  }
+  if (!e.startSection(SectionId::Import, &s) || !e.writeVarU32(1) ||
+      !e.writeBytes("m", 1) || !e.writeBytes("mem", 3) ||
+      !e.writeFixedU8(0x02)) {  // kind: memory
+    return;
+  }
+  if (sharedMem) {
+    if (!e.writeFixedU8(0x03) || !e.writeVarU32(1) || !e.writeVarU32(65536)) {
+      return;
+    }
+  } else {
+    if (!e.writeFixedU8(0x00) || !e.writeVarU32(0)) return;
+  }
+  e.finishSection(s);
+  if (!e.startSection(SectionId::Function, &s) || !e.writeVarU32(1) ||
+      !e.writeVarU32(0)) {
+    return;
+  }
+  e.finishSection(s);
+  if (!e.startSection(SectionId::Export, &s) || !e.writeVarU32(1) ||
+      !e.writeBytes("f", 1) || !e.writeFixedU8(0x00) || !e.writeVarU32(0)) {
+    return;
+  }
+  e.finishSection(s);
+  if (!e.startSection(SectionId::Code, &s) || !e.writeVarU32(1)) return;
+  size_t bodyOff;
+  if (!e.writePatchableVarU32(&bodyOff)) return;
+  size_t bodyStart = e.currentOffset();
+  if (!WJIonEmitBody(graph, e, paramList.data(), paramCount)) {
+    fprintf(stderr, "[ion-fe] EMIT BODY FAILED\n");
+    return;
+  }
+  e.patchVarU32(bodyOff, uint32_t(e.currentOffset() - bodyStart));
+  e.finishSection(s);
+
+  if (getenv("GECKO_WJVS_IONFE_DUMP")) {
+    if (FILE* f = fopen("/tmp/ionfe.wasm", "wb")) {
+      fwrite(out.begin(), 1, out.length(), f);
+      fclose(f);
+      fprintf(stderr, "[ion-fe] wrote /tmp/ionfe.wasm (%zu bytes)\n",
+              size_t(out.length()));
+      fflush(stderr);
+    }
+  }
+  int handle = wasmhost_compile(out.begin(), int(out.length()));
+  if (handle < 0) {
+    fprintf(stderr, "[ion-fe] HOST COMPILE FAILED (%zu bytes)\n",
+            size_t(out.length()));
+    return;
+  }
+  const int importIds[1] = {memId};
+  if (wasmhost_instantiate(handle, importIds, 1) != 0) {
+    fprintf(stderr, "[ion-fe] INSTANTIATE FAILED\n");
+    return;
+  }
+  // Build call args: object args get a captured live receiver pointer (passed
+  // as a double; the i32 param coerces it back); numeric args come from
+  // GECKO_WJVS_IONFE_ARGS in order.
+  double numArgs[16] = {0};
+  uint32_t nNum = 0;
+  if (const char* a = getenv("GECKO_WJVS_IONFE_ARGS")) {
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s", a);
+    char* tok = strtok(buf, ",");
+    while (tok && nNum < 16) {
+      numArgs[nNum++] = atof(tok);
+      tok = strtok(nullptr, ",");
+    }
+  }
+  uint32_t sampleRecv = 0;
+  if (firstGetPropOff != UINT32_MAX) {
+    auto it = gWJSampleRecv.find(WJInlineKey(script, firstGetPropOff));
+    if (it != gWJSampleRecv.end()) sampleRecv = it->second;
+  }
+  double callArgs[16] = {0};
+  uint32_t argc = paramCount, ni = 0;
+  for (uint32_t i = 0; i < nargs && i < 16; i++) {
+    if (objArgMask & (1u << i)) {
+      callArgs[i] = double(sampleRecv);
+    } else {
+      callArgs[i] = ni < nNum ? numArgs[ni] : 0.0;
+      ni++;
+    }
+  }
+  // `this` is the trailing param: pass the captured sample receiver.
+  if (useThis && nargs < 16) callArgs[nargs] = double(sampleRecv);
+  double result = wasmhost_call(handle, 0, callArgs, int(argc));
+  fprintf(stderr, "[ion-fe] RESULT = %.17g (args:", result);
+  for (uint32_t i = 0; i < argc; i++) fprintf(stderr, " %g", callArgs[i]);
+  fprintf(stderr, ")\n");
+  fflush(stderr);
+}
+
+// Compile `script` through the Ion pipeline with the PRODUCTION scratch ABI
+// ((f64 scratchPtr) -> f64 deopt; args/this from gWJScratch as boxed i64; result
+// to gWJScratch[kWJResultSlot]), then exercise it by staging a sample receiver and
+// calling it exactly like WasmJitRunCall does. Validates the integration ABI
+// end-to-end (gated GECKO_WJVS_IONSCRATCH = target lineno).
+// Compile `script` through the Ion pipeline with the production scratch ABI and
+// return the instantiated wasm handle (or -1 on any bail/failure). `quiet`
+// suppresses diagnostics for the hot install path. Shared by the scratch test +
+// the production install hook.
+static int WJIonCompileInstall(JSScript* script, bool quiet) {
+  using namespace js::jit;
+  JSFunction* fun = script->function();
+  if (!fun) return -1;
+  uint32_t nargs = fun->nargs();
+  uint32_t nfixed = script->nfixed();
+  WJReadICsRecursive(script, 1);
+  if (!quiet) {
+    fprintf(stderr, "[ion-scratch] compiling %s:%u nargs=%u\n",
+            script->filename() ? script->filename() : "?",
+            uint32_t(script->lineno()), nargs);
+    fflush(stderr);
+  }
+
+  LifoAlloc lifo(TempAllocator::PreferredLifoChunkSize, js::BackgroundMallocArena);
+  TempAllocator alloc(&lifo);
+  JitContext jitContext;
+  CompileInfo compileInfo(nargs + nfixed + 1 + WJCountInlineSlots(script, 1));
+  MIRGraph graph(&alloc);
+  JitCompileOptions options;
+  MIRGenerator mirGen(nullptr, options, &alloc, &graph, &compileInfo,
+                      IonOptimizations.get(OptimizationLevel::Wasm), nullptr);
+  MBasicBlock* entry =
+      MBasicBlock::New(graph, compileInfo, nullptr, MBasicBlock::NORMAL);
+  if (!entry) return -1;
+  graph.addBlock(entry);
+
+  MWasmParameter* scratchPtr =
+      MWasmParameter::New(alloc, ABIArg(), MIRType::Double);
+  entry->add(scratchPtr);
+  MWasmParameter* instance =
+      MWasmParameter::New(alloc, ABIArg(InstanceReg), MIRType::Pointer);
+  entry->add(instance);
+  MTruncateToInt32* scratchBase = MTruncateToInt32::New(alloc, scratchPtr);
+  entry->add(scratchBase);
+
+  auto loadScratch = [&](uint32_t off) -> MDefinition* {
+    wasm::MemoryAccessDesc acc(/*memoryIndex=*/0, js::Scalar::Int64, 8, off,
+                               wasm::TrapSiteDesc(), /*hugeMemory=*/false);
+    MWasmLoad* l = MWasmLoad::New(alloc, /*memoryBase=*/nullptr, scratchBase, acc,
+                                  MIRType::Int64);
+    entry->add(l);
+    return l;
+  };
+  std::vector<MDefinition*> scratchArgs(nargs ? nargs : 1, nullptr);
+  for (uint32_t i = 0; i < nargs; i++) scratchArgs[i] = loadScratch(i * 8);
+  bool useThis = false;
+  for (jsbytecode* p = script->code(); p < script->codeEnd();
+       p += GetBytecodeLength(p)) {
+    JSOp o = JSOp(*p);
+    if (o == JSOp::FunctionThis || o == JSOp::GlobalThis) { useThis = true; break; }
+  }
+  MDefinition* thisDef = useThis ? loadScratch(kWJThisOff) : nullptr;
+
+  if (!WJIonBuildMIR(script, mirGen, alloc, graph, compileInfo, entry, instance,
+                     /*argParams=*/nullptr, nargs, nfixed, thisDef,
+                     /*scratchResultBase=*/scratchBase, scratchArgs.data())) {
+    if (!quiet) fprintf(stderr, "[ion-scratch] BUILD bailed\n");
+    return -1;
+  }
+  // OptimizeMIR (GVN/LICM/AliasAnalysis/...) runs on every function. It requires
+  // a well-formed SSA graph where loop-header phis merge same-typed slots; that
+  // holds because ALL slots are uniform NaN-boxed i64 Values (see the slot init +
+  // boxForStore on every SetLocal/SetArg). GECKO_WJVS_NOOPT disables it.
+  if (!getenv("GECKO_WJVS_NOOPT") && !OptimizeMIR(&mirGen)) return -1;
+
+  Bytes out;
+  Encoder e(out);
+  const uint8_t kF64 = uint8_t(TypeCode::F64);
+  if (!e.writeFixedU32(MagicNumber) || !e.writeFixedU32(EncodingVersionModule)) {
+    return -1;
+  }
+  size_t s;
+  // Type 0 = body (f64)->f64; type 1 = wjhelp (f64,f64)->f64 (for non-inlined
+  // calls via WJH_IONCALL). wjhelp is imported as func 0 -> the body is func 1.
+  if (!e.startSection(SectionId::Type, &s) || !e.writeVarU32(2) ||
+      !e.writeFixedU8(0x60) || !e.writeVarU32(1) || !e.writeFixedU8(kF64) ||
+      !e.writeVarU32(1) || !e.writeFixedU8(kF64) ||
+      !e.writeFixedU8(0x60) || !e.writeVarU32(2) || !e.writeFixedU8(kF64) ||
+      !e.writeFixedU8(kF64) || !e.writeVarU32(1) || !e.writeFixedU8(kF64)) {
+    return -1;
+  }
+  e.finishSection(s);
+  int memId = wasmhost_guest_mem_objid();
+  bool sharedMem = memId >= 0 && wasmhost_guest_mem_shared() != 0;
+  if (memId < 0) return -1;
+  if (!e.startSection(SectionId::Import, &s) || !e.writeVarU32(2) ||
+      !e.writeBytes("m", 1) || !e.writeBytes("help", 4) || !e.writeFixedU8(0x00) ||
+      !e.writeVarU32(1) ||  // wjhelp: func import, type 1
+      !e.writeBytes("m", 1) || !e.writeBytes("mem", 3) || !e.writeFixedU8(0x02)) {
+    return -1;
+  }
+  if (sharedMem) {
+    if (!e.writeFixedU8(0x03) || !e.writeVarU32(1) || !e.writeVarU32(65536)) return -1;
+  } else {
+    if (!e.writeFixedU8(0x00) || !e.writeVarU32(0)) return -1;
+  }
+  e.finishSection(s);
+  if (!e.startSection(SectionId::Function, &s) || !e.writeVarU32(1) ||
+      !e.writeVarU32(0)) {
+    return -1;
+  }
+  e.finishSection(s);
+  if (!e.startSection(SectionId::Export, &s) || !e.writeVarU32(1) ||
+      !e.writeBytes("f", 1) || !e.writeFixedU8(0x00) || !e.writeVarU32(1)) {
+    return -1;  // export func index 1 (after the imported wjhelp at 0)
+  }
+  e.finishSection(s);
+  if (!e.startSection(SectionId::Code, &s) || !e.writeVarU32(1)) return -1;
+  size_t bodyOff;
+  if (!e.writePatchableVarU32(&bodyOff)) return -1;
+  size_t bodyStart = e.currentOffset();
+  MWasmParameter* params1[1] = {scratchPtr};
+  if (!WJIonEmitBody(graph, e, params1, 1)) {
+    if (!quiet) fprintf(stderr, "[ion-scratch] EMIT BODY FAILED\n");
+    return -1;
+  }
+  e.patchVarU32(bodyOff, uint32_t(e.currentOffset() - bodyStart));
+  e.finishSection(s);
+
+  int handle = wasmhost_compile(out.begin(), int(out.length()));
+  if (handle < 0) {
+    if (!quiet) fprintf(stderr, "[ion-scratch] HOST COMPILE FAILED (%zu bytes)\n",
+                        size_t(out.length()));
+    return -1;
+  }
+  const int importIds[2] = {-3, memId};  // -3 = wjhelp shim (bound by the bridge)
+  if (wasmhost_instantiate(handle, importIds, 2) != 0) {
+    if (!quiet) fprintf(stderr, "[ion-scratch] INSTANTIATE FAILED\n");
+    return -1;
+  }
+  return handle;
+}
+
+static void WJIonScratchTest(JSScript* script) {
+  using namespace js::jit;
+  JSFunction* fun = script->function();
+  if (!fun) return;
+  uint32_t nargs = fun->nargs();
+  int handle = WJIonCompileInstall(script, /*quiet=*/false);
+  if (handle < 0) return;
+  // Stage a sample receiver (boxed object Value) + object args, call via the
+  // scratch ABI, decode the result Value.
+  uint32_t sampleRecv = 0;
+  for (jsbytecode* p = script->code(); p < script->codeEnd();
+       p += GetBytecodeLength(p)) {
+    if (JSOp(*p) == JSOp::GetProp) {
+      auto it = gWJSampleRecv.find(WJInlineKey(script, uint32_t(p - script->code())));
+      if (it != gWJSampleRecv.end()) { sampleRecv = it->second; break; }
+    }
+  }
+  uint64_t boxedRecv = (uint64_t(kWJTagObject) << 32) | uint64_t(sampleRecv);
+  gWJScratch[kWJThisSlot] = boxedRecv;
+  for (uint32_t i = 0; i < nargs; i++) gWJScratch[i] = boxedRecv;
+  double ptr = double(uintptr_t(static_cast<void*>(gWJScratch)));
+  double deopt = wasmhost_call(handle, 0, &ptr, 1);
+  JS::Value rv = JS::Value::fromRawBits(gWJScratch[kWJResultSlot]);
+  fprintf(stderr, "[ion-scratch] deopt=%g sampleThis=%#x result=", deopt,
+          sampleRecv);
+  if (rv.isInt32()) {
+    fprintf(stderr, "%d\n", rv.toInt32());
+  } else if (rv.isDouble()) {
+    fprintf(stderr, "%.17g\n", rv.toDouble());
+  } else if (rv.isObject()) {
+    fprintf(stderr, "object\n");
+  } else {
+    fprintf(stderr, "bits=%#llx\n", (unsigned long long)gWJScratch[kWJResultSlot]);
+  }
+  fflush(stderr);
+}
+
 static bool WJCompile(JSScript* script, WasmJitEntry& entry) {
+  if (getenv("GECKO_WJVS_IONSMOKE")) {
+    static bool sRan = false;
+    if (!sRan) {
+      sRan = true;
+      WJIonSmokeTest();
+    }
+  }
+  if (getenv("GECKO_WJVS_IONBE")) {
+    static bool sRanBE = false;
+    if (!sRanBE) {
+      sRanBE = true;
+      WJIonBackendTest();
+    }
+  }
+  if (getenv("GECKO_WJVS_IONSMOKE")) {
+    static bool sRan = false;
+    if (!sRan) {
+      sRan = true;
+      WJIonSmokeTest();
+    }
+  }
+  if (const char* fe = getenv("GECKO_WJVS_IONFE")) {
+    // GECKO_WJVS_IONFE = the TRIGGER fn's lineno (fired once it compiles, after
+    // warm-up has filled ICs). GECKO_WJVS_IONFE_TARGET (optional) = the lineno
+    // of the fn to actually compile through the Ion path; its JSScript* is
+    // captured here when it first compiles. If unset, target == trigger.
+    static JSScript* sTargetScript = nullptr;
+    if (const char* tgt = getenv("GECKO_WJVS_IONFE_TARGET")) {
+      if (uint32_t(atoi(tgt)) == uint32_t(script->lineno())) {
+        sTargetScript = script;
+      }
+    }
+    if (uint32_t(atoi(fe)) == uint32_t(script->lineno())) {
+      static bool sRanFE = false;
+      if (!sRanFE) {
+        sRanFE = true;
+        if (getenv("GECKO_WJVS_IONSCRATCH")) {
+          WJIonScratchTest(sTargetScript ? sTargetScript : script);
+        } else {
+          WJIonFrontendTest(sTargetScript ? sTargetScript : script);
+        }
+      }
+    }
+  }
   if (getenv("GECKO_DEBUG_JIT")) {
     fprintf(stderr, "[wj-enter] WJCompile %s:%u len=%u\n",
             script->filename() ? script->filename() : "?",
@@ -8830,9 +11776,62 @@ static bool WJCompile(JSScript* script, WasmJitEntry& entry) {
   if (!sFinalizeReg) {
     if (JSContext* cx = js::TlsContext.get()) {
       JS_AddFinalizeCallback(cx, WJFinalizeCB, nullptr);
-      JS_AddExtraGCRootsTracer(cx, (JSTraceDataOp)WJTraceRoots, nullptr);  // Mode VS roots
+      JS_AddExtraGCRootsTracer(cx, (JSTraceDataOp)WJTraceRoots, nullptr);
       sFinalizeReg = true;
     }
+  }
+  // ION INTEGRATION (gated): try the reused-Ion pipeline (boxed model, full
+  // inlining + GVN/LICM) with the production scratch ABI. On success install it
+  // as the entry; WasmJitRunCall runs it, deopting to the interpreter on a guard
+  // miss. Functions the Ion FE can't fully build fall through to Mode V/VS.
+  // Delay Ion install until SOME field value types have been observed (by the
+  // Mode V/VS fallbacks / interpreter ICs), so boxed-i64 fields can instead load
+  // as typed i32/f64 -- the big perf lever (the boxed tag-dispatch unbox dominates
+  // the hot loop). GECKO_WJVS_IONINT_EAGER installs on the first compile (boxed).
+  bool ionHasLoop = false;
+  if (getenv("GECKO_WJVS_IONINT")) {
+    for (jsbytecode* pc = script->code(); pc < script->codeEnd();
+         pc += GetBytecodeLength(pc)) {
+      if (JSOp(*pc) == JSOp::LoopHead) { ionHasLoop = true; break; }
+    }
+  }
+  bool ionLog = getenv("GECKO_WJVS_IONINT_LOG") != nullptr;
+  if (getenv("GECKO_WJVS_IONINT")) {
+    // PBL -> Ion ONLY: no Mode V/VS baseline JIT (it's buggy + a net loss). A
+    // function runs in the portable baseline interpreter (which warms the same
+    // CacheIR ICs the Ion oracle reads) until Ion can compile it. Only loop-
+    // bearing functions are worth installing (cross-module call tax); the rest
+    // stay in PBL. Returning false here keeps the fn in PBL; WasmJitObserveCall
+    // retries (with backoff) so it tiers up once its ICs are warm.
+    // Bisection knob: GECKO_WJVS_IONINT_ONLY=<lineno> installs ONLY that one
+    // function (everything else stays PBL) so a hang/miscompile can be pinned.
+    const char* onlyLine = getenv("GECKO_WJVS_IONINT_ONLY");
+    if (onlyLine && uint32_t(atoi(onlyLine)) != uint32_t(script->lineno())) {
+      return false;
+    }
+    if (ionHasLoop || getenv("GECKO_WJVS_IONINT_ALL")) {
+      int h = WJIonCompileInstall(script, /*quiet=*/!ionLog);
+      if (ionLog) {
+        fprintf(stderr, "[ion-int] %s:%u loop=%d -> %s\n",
+                script->filename() ? script->filename() : "?",
+                uint32_t(script->lineno()), ionHasLoop,
+                h >= 0 ? "INSTALLED" : "ion-retry(stay PBL)");
+        fflush(stderr);
+      }
+      if (h >= 0) {
+        entry.handle = h;
+        entry.nargs = nargs;
+        entry.bcLen = script->length();  // ABA/validate key -- else WJValidateEntry
+                                         // resets to Cold every call -> recompile thrash
+        entry.modeVS = false;
+        entry.vsCapable = false;
+        entry.tableIdx = -1;
+        entry.isIon = true;
+        entry.state = WasmJitEntry::State::Compiled;
+        return true;
+      }
+    }
+    return false;  // not installed -> stay in PBL (no Mode V/VS fallback)
   }
   int memId = wasmhost_guest_mem_objid();
   if (memId < 0) return false;  // can't reach the guest memory object: no JIT
@@ -9129,8 +12128,34 @@ bool js::wasm::WasmJitObserveCall(JSScript* script) {
   if (!e) return false;
   if (e->state == WasmJitEntry::State::Compiled) return true;
   if (e->state == WasmJitEntry::State::Failed) return false;
-  if (!script->function() || script->isModule() || script->length() > 4096 ||
-      !WJCompile(script, *e)) {
+  if (!script->function() || script->isModule() || script->length() > 4096) {
+    e->state = WasmJitEntry::State::Failed;
+    return false;
+  }
+  if (getenv("GECKO_WJVS_IONINT")) {
+    // PBL -> Ion: stay in the interpreter (warming CacheIR ICs) and retry the Ion
+    // compile periodically until it succeeds. The Ion compile is EXPENSIVE
+    // (recursive IC read + MIR build + optimize + emit), so cap retries: a fn that
+    // keeps failing (e.g. its oracle data is wiped by richards' frequent GC before
+    // it can compile) gives up and just runs in PBL -- otherwise the repeated
+    // failed compiles dominate and sink the score below the interpreter.
+    // Initial warmup delay: run in PBL first so the fn's own CacheIR ICs (which
+    // WJReadICsRecursive reads) are warm -> the FIRST Ion attempt resolves shapes
+    // and succeeds. A cold first attempt fails, then the backoff outlasts the fn's
+    // remaining calls so it never retries warm -- which is what kept schedule off.
+    // Initial delay of 2 observes: a hot fn warms its OWN CacheIR ICs within its
+    // first call or two (richards' schedule does thousands of internal iterations
+    // per call), so 2 is enough for the first Ion attempt to resolve shapes -- and
+    // small enough that low-call-count fns (schedule is called only a few times,
+    // each doing the whole loop) still reach the attempt before the bench ends.
+    if (!e->ionWarmTried) { e->ionWarmTried = true; e->ionBackoff = 2; return false; }
+    if (e->ionBackoff > 0) { e->ionBackoff--; return false; }
+    if (WJCompile(script, *e)) return true;  // Ion installed -> route to wasm
+    if (++e->ionFails >= 6) { e->state = WasmJitEntry::State::Failed; return false; }
+    e->ionBackoff = 4u << e->ionFails;  // backoff between retries
+    return false;
+  }
+  if (!WJCompile(script, *e)) {
     e->state = WasmJitEntry::State::Failed;
     return false;
   }
@@ -9330,6 +12355,11 @@ int js::wasm::WasmJitRunCall(JSScript* script, uint64_t thisBits,
   // below, transparently to every caller (this is what makes cross-frame/non-leaf bailout
   // work: a call_indirect caller sees an ordinary return). No deopt code 3 reaches here.
   if (deopt != 0.0) {
+    if (e->isIon && getenv("GECKO_WJVS_IONINT_LOG")) {
+      fprintf(stderr, "[ion-deopt] %s:%u deopt=%g missSite=%d\n",
+              script->filename() ? script->filename() : "?",
+              uint32_t(script->lineno()), deopt, int(gWJMissSite));
+    }
     // On a GetProp shape-guard miss the wasm recorded the site + object; fill
     // the IC so the site loads inline next time. Then let the interpreter run.
     if (gWJMissSite != kWJNoMiss) {
@@ -9371,6 +12401,21 @@ int js::wasm::WasmJitRunCall(JSScript* script, uint64_t thisBits,
   e->consecDeopts = 0;  // a success breaks a deopt streak (not polymorphic)
   gWJTotalRuns++;
   if (e->modeVS) gWJRunsVS++; else gWJRunsV++;
+  // IONINT: a non-Ion fn (it fell back because its ICs were cold at first compile)
+  // recompiles ONCE after its ICs have warmed, to retry the Ion pipeline (which can
+  // now resolve shapes/fields/dispatch). This is the tier-up that lets the HOT
+  // functions (schedule, task.run) actually reach Ion instead of the fallback.
+  if (getenv("GECKO_WJVS_IONINT") && !e->isIon && !e->ionWarmTried &&
+      e->runs == 64) {
+    e->ionWarmTried = true;
+    e->state = WasmJitEntry::State::Cold;
+    e->handle = -1;
+    e->tableIdx = -1;
+    e->runs = 0;
+    e->deopts = 0;
+    *retBits = gWJScratch[kWJResultSlot];  // this call already ran; return its result
+    return 1;
+  }
   // METHOD_INLINING trigger: once a Mode VS function with calls has run enough for its
   // call ICs to warm (callees recorded in gWJInlineCallee), recompile it ONCE with leaf
   // inlining enabled. One-shot (triggeredInline) to avoid thrash.
@@ -13078,6 +16123,20 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
       if (!JS::Call(cx, thisv, a, JS::HandleValueArray(argv), &res)) return 1.0;
       gWJMissObj = a.asRawBits();
       WJFillIC(site);  // cache the callee's table index (if it is call_indirect-able)
+      break;
+    }
+    case WJH_IONCALL: {
+      // reused-Ion non-inlined call: a = callee fn (gWJHelpA); argc = gWJHelpB
+      // (raw); this in gWJScratch[kWJThisSlot]; args in gWJScratch[0..argc). Runs
+      // the callee in the interpreter; result -> res (stored to kWJResultSlot).
+      uint32_t argc = uint32_t(gWJHelpB);
+      JS::RootedValue thisv(cx, JS::Value::fromRawBits(gWJScratch[kWJThisSlot]));
+      JS::RootedValueVector argv(cx);
+      if (!argv.reserve(argc)) return 1.0;
+      for (uint32_t i = 0; i < argc; i++) {
+        argv.infallibleAppend(JS::Value::fromRawBits(gWJScratch[i]));
+      }
+      if (!JS::Call(cx, thisv, a, JS::HandleValueArray(argv), &res)) return 1.0;
       break;
     }
     case WJH_GETALIASED: {

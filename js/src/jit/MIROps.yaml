@@ -4985,6 +4985,12 @@
   gen_boilerplate: false
 #endif
 
+# reused-Ion (WJ) non-inlined call. Appended at the END so existing opcode enum
+# values are unchanged (no mass TU rebuild). Hand-emitted by the WJ backend
+# (marshal + wjhelp(WJH_IONCALL) + deopt check + result load); class in MIR-wasm.h.
+- name: WJIonCall
+  gen_boilerplate: false
+
 #ifdef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
 - name: AddDisposableResource
   operands:

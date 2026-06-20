@@ -585,6 +585,30 @@ class MWasmNeg : public MUnaryInstruction, public NoTypePolicy::Data {
   ALLOW_CLONE(MWasmNeg)
 };
 
+// reused-Ion (WJ JIT) non-inlined call. `callee` is the i64 boxed callee Value;
+// args/this are marshalled into gWJScratch by preceding stores; argc is baked.
+// The WJ backend hand-emits the call (wjhelp(WJH_IONCALL) or call_indirect) +
+// deopt check + result load. An effectful barrier (setGuard + Store(Any)) so the
+// optimizer never reorders/eliminates it or moves it past the arg-marshal stores.
+// Not lowered by the normal Ion backend (WJ has no LIR backend).
+class MWJIonCall : public MUnaryInstruction, public NoTypePolicy::Data {
+  uint32_t argc_;
+  MWJIonCall(MDefinition* callee, uint32_t argc)
+      : MUnaryInstruction(classOpcode, callee), argc_(argc) {
+    setResultType(MIRType::Int64);
+    setGuard();
+  }
+
+ public:
+  INSTRUCTION_HEADER(WJIonCall)
+  TRIVIAL_NEW_WRAPPERS
+  NAMED_OPERANDS((0, callee))
+  uint32_t argc() const { return argc_; }
+  AliasSet getAliasSet() const override {
+    return AliasSet::Store(AliasSet::Any);
+  }
+};
+
 // Machine-level bitwise AND/OR/XOR, avoiding all JS-level complexity embodied
 // in MBinaryBitwiseInstruction.
 class MWasmBinaryBitwise : public MBinaryInstruction,

@@ -104,6 +104,9 @@
 #include "gc/GCContext-inl.h"
 #include "gc/StableCellHasher-inl.h"
 #include "gc/StoreBuffer-inl.h"  // inline StoreBuffer::putWholeCell for the OBJSET object-store barrier
+#include "gc/Nursery.h"          // REWRITE: inline nursery bump-allocation
+#include "gc/Heap.h"             // gc::Arena::thingSize / AllocKind / NurseryCellHeader
+#include "gc/Allocator.h"        // gc::GetGCObjectKind
 #include "jit/JitScript-inl.h"  // PHASE F: JSScript::ensureHasJitScript
 #include "vm/Realm-inl.h"       // PHASE F: js::AutoRealm for safe JitScript creation
 #include "vm/ArrayBufferObject-inl.h"
@@ -2155,6 +2158,23 @@ static bool gWJSiteLen[kWJMaxSites];
 static constexpr uint32_t kWJFrameSlots = 8192;  // i64 slots (shared frame stack)
 static uint64_t gWJFrameMem[kWJFrameSlots];
 static uint32_t gWJFrameSP = 0;  // next free slot (top of the frame stack)
+// REWRITE step 1 (GC-safe slots): OBJECT-typed frame slots are spilled here across
+// allocating calls so a moving GC updates them in place (traced as Values by
+// WJTraceRoots). Only object/null-typed slots are spilled (tracked per-slot), so a
+// raw-double-bits slot is never traced as a bogus pointer.
+// Per-call-DEPTH spill regions (re-entrant): a compiled function spills its live
+// heap temps to gWJObjSpill[gWJCallDepth * kWJSpillStride ..]. A nested/recursive
+// compiled call runs at a deeper gWJCallDepth and spills to its OWN region, so it
+// can't clobber the caller's spilled pointers. Each frame zeroes its region on
+// reload, so every slot is either a live Value (a frame currently inside a nested
+// call) or 0.0 -- the whole array is always GC-trace-safe. kWJSpillStride caps the
+// live heap temps a frame may carry across a call; *8 must be a power of two so the
+// base address is computed with a cheap shift.
+static constexpr uint32_t kWJSpillStride = 128;  // *8 = 1024 = 2^10
+static constexpr uint32_t kWJSpillShift = 10;
+static constexpr uint32_t kWJSpillSlots = kWJSpillStride * 32;  // depths 0..31
+static uint64_t gWJObjSpill[kWJSpillSlots];
+static uint32_t gWJSpillTraceN = 0;  // high-water mark of spill slots in use
 // Helper operand scratch (read by wjhelp; written by the wasm before the call).
 static uint64_t gWJHelpA = 0, gWJHelpB = 0, gWJHelpC = 0;
 // Operation kinds dispatched by wjhelp.
@@ -2170,6 +2190,7 @@ enum WJHelperKind {
   WJH_POSTBARRIER,  // GC post-write barrier for an object-valued inline SetProp store
   WJH_RESUME,  // PHASE F: self-resume the bailing fn in PBL from gWJHelpA=script,gWJHelpB=basesp
   WJH_NEWOBJECT,  // ALLOC: create the object-literal/template object for this NewObject/NewInit site
+  WJH_NEWARRAY,   // ALLOC: create the dense array (NewArrayOperation) for this NewArray site (slow path)
   WJH_INITPROP,   // ALLOC: define a data property (constructor `this.x=v` / object literal); leaves obj
   WJH_IONCALL,   // reused-Ion non-inlined call: a=callee fn, gWJHelpB=argc, this/args in gWJScratch
   WJH_METHCALL,  // dynamic method call: gWJHelpA=PropertyName*, gWJHelpB=argc, recv in
@@ -8957,6 +8978,7 @@ static bool WJModeVSSupported(JSOp op) {
     case JSOp::JumpTarget: case JSOp::LoopHead: case JSOp::Pos: case JSOp::ToNumeric:
       return true;
     case JSOp::NewObject: case JSOp::NewInit: case JSOp::InitProp:
+    case JSOp::NewArray: case JSOp::InitElemArray:
       return WJVSInlineAlloc();  // INLINEALLOC (plan §8.3)
     default:
       return false;
@@ -9178,10 +9200,84 @@ static bool WJIonEmitValue(Encoder& e, WJIonBackend& be,
         if (!e.writeOp(Op::I64Const) || !e.writeVarS64(0)) return false;  // dummy i64
         return true;
       }
+      if (call->arithHelper() != 0) {
+        // Boxed binary-arith helper (string concat etc.): operand = boxed lhs ->
+        // gWJHelpA; boxed rhs was pre-stored to gWJHelpB by the builder. Call
+        // wjhelp(kind); nonzero result => threw => deopt; else load boxed result.
+        uint32_t kind = call->arithHelper() - 1;
+        if (!e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(helpA)) ||
+            !WJIonGetOperand(e, be, call->callee()) ||  // boxed lhs (i64)
+            !e.writeOp(Op::I64Store) || !e.writeVarU32(3) || !e.writeVarU32(0)) {
+          return false;
+        }
+        if (!e.writeOp(Op::F64Const) || !e.writeFixedF64(double(kind)) ||
+            !e.writeOp(Op::F64Const) || !e.writeFixedF64(0.0) ||
+            !e.writeOp(Op::Call) || !e.writeVarU32(kWJVSHelpIdx)) {
+          return false;
+        }
+        if (!e.writeOp(Op::F64Const) || !e.writeFixedF64(0.0) ||
+            !e.writeOp(Op::F64Ne) || !e.writeOp(Op::If) || !e.writeFixedU8(0x40)) {
+          return false;
+        }
+        if (!e.writeOp(Op::F64Const) || !e.writeFixedF64(1.0) ||
+            !e.writeOp(Op::Return) || !e.writeOp(Op::End)) {
+          return false;
+        }
+        if (!e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(resAddr)) ||
+            !e.writeOp(Op::I64Load) || !e.writeVarU32(3) || !e.writeVarU32(0)) {
+          return false;
+        }
+        return true;
+      }
       // GETPROP-helper mode: store the boxed receiver to gWJHelpA, then
       // wjhelp(WJH_GETPROP, propSite). A generic property load that keeps the
       // (possibly stateful) caller running compiled instead of deopt-restarting
       // on an off-shape receiver -- the dominant deltablue cost.
+      if (call->newObjectSite() != 0) {
+        // NewObject/NewInit SLOW path (nursery full): wjhelp(WJH_NEWOBJECT, site)
+        // creates the literal/template object -> result slot. No operand.
+        if (!e.writeOp(Op::F64Const) || !e.writeFixedF64(double(WJH_NEWOBJECT)) ||
+            !e.writeOp(Op::F64Const) ||
+            !e.writeFixedF64(double(call->newObjectSite())) ||
+            !e.writeOp(Op::Call) || !e.writeVarU32(kWJVSHelpIdx)) {
+          return false;
+        }
+        if (!e.writeOp(Op::F64Const) || !e.writeFixedF64(0.0) ||
+            !e.writeOp(Op::F64Ne) || !e.writeOp(Op::If) || !e.writeFixedU8(0x40)) {
+          return false;
+        }
+        if (!e.writeOp(Op::F64Const) || !e.writeFixedF64(1.0) ||
+            !e.writeOp(Op::Return) || !e.writeOp(Op::End)) {
+          return false;
+        }
+        if (!e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(resAddr)) ||
+            !e.writeOp(Op::I64Load) || !e.writeVarU32(3) || !e.writeVarU32(0)) {
+          return false;
+        }
+        return true;
+      }
+      if (call->newArraySite() != 0) {
+        // NewArray SLOW path (nursery full): wjhelp(WJH_NEWARRAY, site) -> result.
+        if (!e.writeOp(Op::F64Const) || !e.writeFixedF64(double(WJH_NEWARRAY)) ||
+            !e.writeOp(Op::F64Const) ||
+            !e.writeFixedF64(double(call->newArraySite())) ||
+            !e.writeOp(Op::Call) || !e.writeVarU32(kWJVSHelpIdx)) {
+          return false;
+        }
+        if (!e.writeOp(Op::F64Const) || !e.writeFixedF64(0.0) ||
+            !e.writeOp(Op::F64Ne) || !e.writeOp(Op::If) || !e.writeFixedU8(0x40)) {
+          return false;
+        }
+        if (!e.writeOp(Op::F64Const) || !e.writeFixedF64(1.0) ||
+            !e.writeOp(Op::Return) || !e.writeOp(Op::End)) {
+          return false;
+        }
+        if (!e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(resAddr)) ||
+            !e.writeOp(Op::I64Load) || !e.writeVarU32(3) || !e.writeVarU32(0)) {
+          return false;
+        }
+        return true;
+      }
       if (call->propSite() != 0) {
         if (!e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(helpA)) ||
             !WJIonGetOperand(e, be, call->callee()) ||  // boxed receiver (i64)
@@ -9863,6 +9959,9 @@ static uint32_t WJCountInlineSlots(JSScript* cs, int depth) {
       total += 1;  // logical-operator result slot (operand stack across a branch)
     } else if (op == JSOp::Goto) {
       total += 1;  // headroom for a ternary join slot (value carried over a Goto)
+    } else if (op == JSOp::NewObject || op == JSOp::NewInit ||
+               op == JSOp::NewArray) {
+      total += 1;  // INLINEALLOC nursery-bump scratch slot (fast/slow diamond merge)
     }
   }
   return total;
@@ -10005,6 +10104,64 @@ static bool WJIonBuildMIR(JSScript* script, js::jit::MIRGenerator& mir,
   // pre-existing typed values), so wiring them into consumers is a no-op for those
   // -- only genuinely boxed (i64) values trigger real unboxing.
   std::unordered_map<MDefinition*, uint8_t> boxedVty;
+  // REWRITE step 1: per-slot last-stored type (0 double / 1 int / 2 unknown / 3
+  // object|null) so an allocating call can spill the OBJECT slots (valid GC Values)
+  // to the traced gWJObjSpill and reload them GC-updated. Indexed by CompileInfo slot.
+  std::vector<uint8_t> slotVty(info.nslots(), 2);
+  // REWRITE: object-literal tracking for inline NewObject -> InitProp. Maps the
+  // inline-allocated object's def to its shape and the next init-slot index (handles
+  // nesting: each obj has its own counter, keyed by def).
+  std::unordered_map<MDefinition*, js::SharedShape*> litShape;
+  std::unordered_map<MDefinition*, uint32_t> litSlot;
+  // Defs that load the FUNCTION BEING COMPILED itself (a GetGName of its own name).
+  // A Call whose callee is one of these is self-recursion -- which this JIT cannot
+  // compile soundly (no per-frame GC-safe spill across the re-entry), so such a
+  // call bails the whole function to PBL. Catches recursion even when the self-call
+  // has no inline/callee record.
+  std::unordered_set<MDefinition*> selfRefDefs;
+  JSFunction* wjRootFn = script->function();
+  // SELF-RECURSION: the per-frame depth-indexed spill makes recursive re-entry
+  // correct for numeric/object recursion (validated: t_rec/t_rd5/t_c2c/gptR2 all
+  // pass). BUT inline NewObject/NewArray allocation inside a self-recursive function
+  // still corrupts under heavy real-GC pressure (splay's GeneratePayloadTree traps
+  // "unreachable"/OOB; helper alloc via GECKO_WJVS_NOINLINEALLOC is correct but not
+  // faster). So by DEFAULT bail any self-recursive function to PBL (correct). The
+  // full compile (with inline alloc) is available behind GECKO_WJVS_RECURSE for
+  // continued debugging of that GC corruption.
+  if (wjRootFn && wjRootFn->maybePartialExplicitName() &&
+      getenv("GECKO_WJVS_NORECURSE")) {
+    JSAtom* rootName = wjRootFn->maybePartialExplicitName();
+    for (jsbytecode* p = script->code(); p < script->codeEnd();
+         p += js::GetBytecodeLength(p)) {
+      JSOp o = JSOp(*p);
+      if ((o == JSOp::GetGName || o == JSOp::GetName ||
+           o == JSOp::GetBoundName) &&
+          script->getName(p) == rootName) {
+        if (WJIonLog())
+          fprintf(stderr, "[ion-fe] self-recursive fn -> bail (NORECURSE)\n");
+        return false;
+      }
+    }
+  }
+  // INLINEALLOC dense-array literal tracking: maps an inline-allocated NewArray
+  // def to its element capacity (so InitElemArray can store elements inline +
+  // bump initializedLength). Element[i] lives at objptr + 32 + i*8; the
+  // ObjectElements header is at objptr + 16 (flags@16, initLen@20, cap@24, len@28).
+  std::unordered_map<MDefinition*, uint32_t> litArrayCap;
+  auto classifyVty = [&](MDefinition* v) -> uint8_t {
+    if (v->type() == MIRType::Double) return 0;
+    if (v->type() == MIRType::Int32) return 1;
+    if (v->type() == MIRType::Int64) {
+      auto it = boxedVty.find(v);
+      return it != boxedVty.end() ? it->second : 2;
+    }
+    return 2;
+  };
+  auto setSlotTyped = [&](uint32_t slotIdx, MDefinition* v) {
+    cur->setSlot(slotIdx, boxForStore(v));
+    if (slotIdx < slotVty.size()) slotVty[slotIdx] = classifyVty(v);
+  };
+  (void)setSlotTyped;
   // Unbox a value to an f64 number.
   asNumber = [&](MDefinition* d) -> MDefinition* {
     if (d->type() == MIRType::Double) return d;
@@ -10365,12 +10522,24 @@ static bool WJIonBuildMIR(JSScript* script, js::jit::MIRGenerator& mir,
   // (splay's tree churn -- fresh nodes linked into older nodes). Skipped when `val`
   // is provably a number (no GC pointer). The helper itself re-checks
   // tenured(obj) && nursery(val), so a conservative call is always safe.
-  auto emitPostBarrier = [&](MDefinition* recv, MDefinition* val) {
-    // Gated default-OFF: a helper call per object store is a real perf cost and the
-    // working benches don't need it (their objects are tenured / no collected edges).
-    // Kept as infrastructure for allocation-churn code (splay) once a cheaper inline
-    // nursery-check barrier exists. GECKO_WJVS_POSTBARRIER enables it.
-    if (!getenv("GECKO_WJVS_POSTBARRIER")) return;
+  auto emitPostBarrier = [&](MDefinition* recv, MDefinition* val,
+                             bool isInit = false) {
+    // The barrier is REQUIRED for InitProp/InitElemArray on inline-allocated
+    // literals (isInit): an inline object can tenure during a nested allocating
+    // call/concat, then store a still-nursery field -> tenured<-nursery edge the
+    // minor GC must know about. For general SetProp/SetElem (isInit=false) the
+    // working benches create no such edges, and an unconditional barrier there
+    // regressed richards (~15x->~2x) + broke earley -> keep that opt-in.
+    if (!isInit && !getenv("GECKO_WJVS_POSTBARRIER")) return;
+    // Default-ON (required for correctness): inline allocation + recursion creates
+    // genuine tenured-obj <- nursery-value edges (an inline object tenures during a
+    // recursive call's GC, then stores the still-nursery returned subtree / rope into
+    // a field). Without the post-write barrier the minor GC never traces that edge ->
+    // the field target is collected -> "undefined" / "unreachable". The inline
+    // nursery-check fast path skips the helper for tenured<-tenured stores, so the
+    // cost on the (tenured) working benches is just a chunk-load + branch.
+    // GECKO_WJVS_NOPOSTBARRIER force-disables it (even for InitProp) for A-B.
+    if (getenv("GECKO_WJVS_NOPOSTBARRIER")) return;
     if (val->type() == MIRType::Double || val->type() == MIRType::Int32) return;
     if (val->type() == MIRType::Int64) {
       auto vit = boxedVty.find(val);
@@ -10399,9 +10568,21 @@ static bool WJIonBuildMIR(JSScript* script, js::jit::MIRGenerator& mir,
     MWrapInt64ToInt32* valHi =
         MWrapInt64ToInt32::New(alloc, val, /*bottomHalf=*/false);
     cur->add(valHi);
-    MCompare* isObj = MCompare::NewWasm(alloc, valHi,
-                                        konstI32(int32_t(uint32_t(kWJTagObject))),
-                                        JSOp::Eq, MCompare::Compare_Int32);
+    // A GC-pointer value (one whose low32 is a cell address to barrier) is an Object
+    // OR a String (rope). The old code only matched Object, so a string field store
+    // checked the OBJECT's storeBuffer instead of the string's -> the nursery rope
+    // edge was missed -> the rope was collected -> crash. Match both tags.
+    MCompare* isObjT = MCompare::NewWasm(alloc, valHi,
+                                         konstI32(int32_t(uint32_t(kWJTagObject))),
+                                         JSOp::Eq, MCompare::Compare_Int32);
+    cur->add(isObjT);
+    MCompare* isStrT = MCompare::NewWasm(alloc, valHi,
+                                         konstI32(int32_t(uint32_t(kWJTagString))),
+                                         JSOp::Eq, MCompare::Compare_Int32);
+    cur->add(isStrT);
+    MWasmBinaryBitwise* isObj =
+        MWasmBinaryBitwise::New(alloc, isObjT, isStrT, MIRType::Int32,
+                                MWasmBinaryBitwise::SubOpcode::Or);
     cur->add(isObj);
     MWrapInt64ToInt32* valLo =
         MWrapInt64ToInt32::New(alloc, val, /*bottomHalf=*/true);
@@ -10413,20 +10594,12 @@ static bool WJIonBuildMIR(JSScript* script, js::jit::MIRGenerator& mir,
                                 MIRType::Int32, MWasmBinaryBitwise::SubOpcode::And);
     cur->add(valChunk);
     MDefinition* valSB = loadAt(valChunk, sbOff, js::Scalar::Int32, MIRType::Int32);
-    MWasmBinaryBitwise* objChunk =
-        MWasmBinaryBitwise::New(alloc, objp, konstI32(int32_t(maskInv)),
-                                MIRType::Int32, MWasmBinaryBitwise::SubOpcode::And);
-    cur->add(objChunk);
-    MDefinition* objSB = loadAt(objChunk, sbOff, js::Scalar::Int32, MIRType::Int32);
-    MCompare* valNursery = MCompare::NewWasm(alloc, valSB, konstI32(0), JSOp::Ne,
-                                             MCompare::Compare_Int32);
-    cur->add(valNursery);
-    MCompare* objTenured = MCompare::NewWasm(alloc, objSB, konstI32(0), JSOp::Eq,
-                                             MCompare::Compare_Int32);
-    cur->add(objTenured);
-    MWasmBinaryBitwise* need = MWasmBinaryBitwise::New(
-        alloc, valNursery, objTenured, MIRType::Int32,
-        MWasmBinaryBitwise::SubOpcode::And);
+    // Barrier needed only if the stored value is a nursery cell (val storeBuffer!=0).
+    // The obj-tenured filter is left to the helper (it checks o->isTenured()), saving
+    // a chunk-load + compare per store; for splay's tenured tree the helper is rarely
+    // reached anyway. `need` is just the val-nursery predicate.
+    MCompare* need = MCompare::NewWasm(alloc, valSB, konstI32(0), JSOp::Ne,
+                                       MCompare::Compare_Int32);
     cur->add(need);
     MBasicBlock* helperB = MBasicBlock::New(graph, info, cur, MBasicBlock::NORMAL);
     MBasicBlock* skipB = MBasicBlock::New(graph, info, cur, MBasicBlock::NORMAL);
@@ -10827,6 +11000,110 @@ static bool WJIonBuildMIR(JSScript* script, js::jit::MIRGenerator& mir,
     push(res);
     return true;
   };
+  // GC-root EVERY live heap temporary (object/string/unknown) the frame holds --
+  // both numbered slots and abstract-stack entries -- across an allocating call,
+  // by spilling to the GC-traced gWJObjSpill and reloading the moved-in-place
+  // pointers afterward (preserving each value's boxedVty). Numbers (vty 0/1) never
+  // move so are skipped. Unlike spillObjectSlots (slots only, empty-stack only),
+  // this also covers stack temporaries -- required for a NON-inlined recursive
+  // call mid object-literal (splay's GeneratePayloadTree: the partially-built
+  // node is live on the stack across `f(d-1)`, which allocates heavily and moves
+  // it -> the "table index out of bounds" trap). Returns the spill descriptor.
+  struct WJSpillEnt {
+    uint32_t idx;        // slot index or stack index
+    uint8_t vty;
+    MDefinition* old;    // the pre-spill def (to transfer lit-literal tracking)
+  };
+  struct WJSpillSet {
+    std::vector<WJSpillEnt> slots;
+    std::vector<WJSpillEnt> stk;
+  };
+  // Transfer inline-literal tracking (litShape/litSlot/litArrayCap) from a spilled
+  // def to its reloaded replacement so a still-being-initialized object literal
+  // whose pointer was GC-rooted across a call is still recognized by InitProp/
+  // InitElemArray afterward.
+  auto transferLit = [&](MDefinition* oldD, MDefinition* newD) {
+    auto si = litShape.find(oldD);
+    if (si != litShape.end()) {
+      litShape[newD] = si->second;
+      litSlot[newD] = litSlot[oldD];
+    }
+    auto ai = litArrayCap.find(oldD);
+    if (ai != litArrayCap.end()) litArrayCap[newD] = ai->second;
+  };
+  // Runtime base address of THIS frame's spill region: gWJObjSpill +
+  // (gWJCallDepth << kWJSpillShift). gWJCallDepth is set by WasmJitRunCall before
+  // entering this function and is constant through its body (a nested call bumps it
+  // then restores it on return), so each call-nesting level gets a private region.
+  auto spillBaseDef = [&]() -> MDefinition* {
+    uint32_t depthAddr = uint32_t(uintptr_t(&gWJCallDepth));
+    MDefinition* depth =
+        loadAt(konstI32(int32_t(depthAddr)), 0, js::Scalar::Int32, MIRType::Int32);
+    MLsh* off = MLsh::New(alloc, depth, konstI32(int32_t(kWJSpillShift)),
+                          MIRType::Int32);
+    cur->add(off);
+    MAdd* base = MAdd::NewWasm(
+        alloc, off, konstI32(int32_t(uintptr_t(static_cast<void*>(gWJObjSpill)))),
+        MIRType::Int32);
+    cur->add(base);
+    return base;
+  };
+  // Spill every live heap temporary (object/string/unknown) the frame holds --
+  // both numbered slots and abstract-stack entries -- to this frame's gWJObjSpill
+  // region across an allocating call (string concat, recursive/non-inlined call),
+  // then reload the moved-in-place pointers afterward (preserving each value's
+  // boxedVty). Numbers (vty 0/1) never move so are skipped.
+  auto gcSpillAll = [&](int excludeSlot = -1) -> WJSpillSet {
+    WJSpillSet ss;
+    if (getenv("GECKO_WJVS_NOGCSPILL")) return ss;
+    auto spillWorthy = [&](MDefinition* sv) -> int {
+      if (sv->type() != MIRType::Int64) return -1;  // numbers/typed: don't move
+      auto vit = boxedVty.find(sv);
+      uint8_t v = vit != boxedVty.end() ? vit->second : uint8_t(2);
+      if (v == 0 || v == 1) return -1;  // boxed number Value -> doesn't move
+      return v;
+    };
+    MDefinition* base = spillBaseDef();
+    uint32_t k = 0;
+    for (uint32_t s = 0; s < slotVty.size() && k < kWJSpillStride; s++) {
+      if (int(s) == excludeSlot) continue;  // the alloc result slot -> don't spill
+      MDefinition* sv = cur->getSlot(s);
+      int v = spillWorthy(sv);
+      if (v < 0) continue;
+      storeAt(base, k * 8, js::Scalar::Int64, sv);
+      ss.slots.push_back({s, uint8_t(v), sv});
+      k++;
+    }
+    for (size_t i = 0; i < curStk->size() && k < kWJSpillStride; i++) {
+      MDefinition* sv = (*curStk)[i];
+      int v = spillWorthy(sv);
+      if (v < 0) continue;
+      storeAt(base, k * 8, js::Scalar::Int64, sv);
+      ss.stk.push_back({uint32_t(i), uint8_t(v), sv});
+      k++;
+    }
+    uint32_t hi = (kWJMaxCallDepth + 1) * kWJSpillStride;  // trace all depth regions
+    if (hi > gWJSpillTraceN) gWJSpillTraceN = hi;
+    return ss;
+  };
+  auto gcReloadAll = [&](const WJSpillSet& ss) {
+    if (getenv("GECKO_WJVS_NOGCSPILL")) return;
+    MConstant* zero = MConstant::NewInt64(alloc, 0);
+    cur->add(zero);
+    MDefinition* base = spillBaseDef();
+    uint32_t r = 0;
+    auto reloadOne = [&](uint8_t vty, MDefinition* old) -> MDefinition* {
+      MDefinition* rv = loadAt(base, r * 8, js::Scalar::Int64, MIRType::Int64);
+      boxedVty[rv] = vty;
+      transferLit(old, rv);
+      storeAt(base, r * 8, js::Scalar::Int64, zero);  // zero -> trace-safe when dead
+      r++;
+      return rv;
+    };
+    for (auto& p : ss.slots) cur->setSlot(p.idx, reloadOne(p.vty, p.old));
+    for (auto& p : ss.stk) (*curStk)[p.idx] = reloadOne(p.vty, p.old);
+    invalidateCSE();  // objects may have moved -> drop field/ptr memos
+  };
   // Non-inlined call (like real Ion: inline what you can, call the rest). Marshal
   // this/args (boxed i64) into gWJScratch, then MWJIonCall(callee) which the
   // backend lowers to wjhelp(WJH_IONCALL) (the interpreter runs the callee) +
@@ -10841,15 +11118,55 @@ static bool WJIonBuildMIR(JSScript* script, js::jit::MIRGenerator& mir,
     }
     storeAt(konstI32(int32_t(scratchAddr)), kWJThisOff, js::Scalar::Int64,
             boxForStore(thisv ? thisv : konst(0.0)));
-    MWJIonCall* call = MWJIonCall::New(alloc, boxForStore(callee), argc);
+    // The callee runs arbitrary JS -> may allocate + move this frame's live
+    // nursery objects/strings held in wasm locals. GC-root them across the call
+    // (per-frame spill region, so a recursive callee can't clobber it).
+    MDefinition* calleeBoxed = boxForStore(callee);
+    WJSpillSet ss = gcSpillAll();
+    MWJIonCall* call = MWJIonCall::New(alloc, calleeBoxed, argc);
     cur->add(call);
     boxedVty[call] = 2;  // result is a boxed Value
+    gcReloadAll(ss);
     push(call);
     return true;
   };
   // `new callee(args)`: marshal args to gWJScratch, then wjhelp(WJH_CONSTRUCT) which
   // does JS::Construct and returns the new object. Lets a hot fn that constructs
   // (splay's `new Node`, deltablue's ctors) compile instead of bailing on JSOp::New.
+  // REWRITE step 1: spill OBJECT-typed live slots to the traced gWJObjSpill across an
+  // allocating call, reload after, so a moving GC updates the pointers (the JIT holds
+  // them in untraced wasm locals otherwise -> stale -> the t_ctor/splay-churn bug).
+  // Only object/null slots (slotVty==3) are spilled: they are valid GC Values, so
+  // tracing them is safe (a raw-double slot is never traced). Returns the spilled slot
+  // list for reload. Operand stack must be empty (statement-level alloc) -- caller
+  // ensures this for constructs (the result is the only stack effect).
+  auto spillObjectSlots = [&]() -> std::vector<uint32_t> {
+    std::vector<uint32_t> spilled;
+    if (getenv("GECKO_WJVS_NOGCSPILL")) return spilled;
+    MDefinition* base = spillBaseDef();  // per-call-depth region (re-entrant)
+    for (uint32_t s = 0; s < slotVty.size() && spilled.size() < kWJSpillStride; s++) {
+      if (slotVty[s] != 3) continue;  // only object/null slots
+      MDefinition* sv = cur->getSlot(s);
+      if (sv->type() != MIRType::Int64) continue;  // must be a boxed Value
+      storeAt(base, uint32_t(spilled.size()) * 8, js::Scalar::Int64, sv);
+      spilled.push_back(s);
+    }
+    uint32_t hi = (kWJMaxCallDepth + 1) * kWJSpillStride;
+    if (hi > gWJSpillTraceN) gWJSpillTraceN = hi;
+    return spilled;
+  };
+  auto reloadObjectSlots = [&](const std::vector<uint32_t>& spilled) {
+    if (getenv("GECKO_WJVS_NOGCSPILL")) return;
+    MConstant* zero = MConstant::NewInt64(alloc, 0);
+    cur->add(zero);
+    MDefinition* base = spillBaseDef();
+    for (uint32_t i = 0; i < spilled.size(); i++) {
+      MDefinition* rv = loadAt(base, i * 8, js::Scalar::Int64, MIRType::Int64);
+      boxedVty[rv] = 3;
+      cur->setSlot(spilled[i], rv);
+      storeAt(base, i * 8, js::Scalar::Int64, zero);  // zero -> trace-safe when dead
+    }
+  };
   auto emitConstructCall = [&](MDefinition* callee,
                                std::vector<MDefinition*>& cargs,
                                uint32_t argc) -> bool {
@@ -10858,16 +11175,16 @@ static bool WJIonBuildMIR(JSScript* script, js::jit::MIRGenerator& mir,
       storeAt(konstI32(int32_t(scratchAddr)), i * 8, js::Scalar::Int64,
               boxForStore(cargs[i]));
     }
+    // GC-root live object slots across the (allocating) construct.
+    std::vector<uint32_t> spilled = curStk->empty() ? spillObjectSlots()
+                                                     : std::vector<uint32_t>();
     MWJIonCall* call = MWJIonCall::New(alloc, boxForStore(callee), argc);
     call->setConstruct();
     cur->add(call);
     boxedVty[call] = 3;  // result is a fresh object Value
-    // NOTE (latent): a construct ALLOCATES -> may GC-move objects, so cached field
-    // values / unboxed pointers held across it are technically stale (like SetProp).
-    // Clearing fieldCache/objPtrMemo here is correct but cost richards ~10% with no
-    // demonstrated bench fix (splay's deeper issue is the JIT holding non-GC-rooted
-    // pointers across the construct, which a cache-clear does NOT fix), so left as-is
-    // to preserve the flagship; revisit with the GC-rooting rewrite.
+    reloadObjectSlots(spilled);
+    fieldCache.clear();
+    objPtrMemo.clear();
     push(call);
     return true;
   };
@@ -11009,8 +11326,8 @@ static bool WJIonBuildMIR(JSScript* script, js::jit::MIRGenerator& mir,
           break;
         }
         case JSOp::SetArg:
-          cur->setSlot(info.localSlot(fr.slotBase + GET_ARGNO(pc)),
-                       boxForStore(curStk->back()));
+          setSlotTyped(info.localSlot(fr.slotBase + GET_ARGNO(pc)),
+                       curStk->back());
           break;
         case JSOp::GetLocal: {
           MDefinition* v = cur->getSlot(
@@ -11020,8 +11337,8 @@ static bool WJIonBuildMIR(JSScript* script, js::jit::MIRGenerator& mir,
           break;
         }
         case JSOp::SetLocal:
-          cur->setSlot(info.localSlot(fr.slotBase + fr.nargs + GET_LOCALNO(pc)),
-                       boxForStore(curStk->back()));
+          setSlotTyped(info.localSlot(fr.slotBase + fr.nargs + GET_LOCALNO(pc)),
+                       curStk->back());
           break;
         case JSOp::GetAliasedVar: {
           // Read a closed-over variable inline (hoistable -- the key to navier's
@@ -11172,11 +11489,38 @@ static bool WJIonBuildMIR(JSScript* script, js::jit::MIRGenerator& mir,
           push(konst(d));
           break;
         }
-        case JSOp::Add:
+        case JSOp::Add: {
+          // String concat: if either operand is a string (boxedVty==4), route to
+          // the boxed WJH_ADD helper (full js::AddValues semantics). The concat
+          // itself runs at interpreter speed but lets string-touching functions
+          // compile (so their object/array allocation gets the inline-alloc win).
+          MDefinition* rtop = curStk->size() >= 1 ? (*curStk)[curStk->size() - 1] : nullptr;
+          MDefinition* ltop = curStk->size() >= 2 ? (*curStk)[curStk->size() - 2] : nullptr;
+          auto isStr = [&](MDefinition* d) {
+            auto it = boxedVty.find(d);
+            return it != boxedVty.end() && it->second == 4;
+          };
+          if ((rtop && isStr(rtop)) || (ltop && isStr(ltop))) {
+            MDefinition* b = boxForStore(pop());
+            MDefinition* a = boxForStore(pop());
+            uint32_t helpBAddr = uint32_t(uintptr_t(&gWJHelpB));
+            storeAt(konstI32(int32_t(helpBAddr)), 0, js::Scalar::Int64, b);
+            // js::AddValues allocates a rope and may move this frame's live
+            // nursery objects/strings -- GC-root them across the helper call.
+            WJSpillSet ss = gcSpillAll();
+            MWJIonCall* mc = MWJIonCall::New(alloc, a, 0);
+            mc->setArithHelper(WJH_ADD + 1);
+            cur->add(mc);
+            boxedVty[mc] = 4;  // string concat result is a string
+            gcReloadAll(ss);
+            push(mc);
+            break;
+          }
           binF64([](TempAllocator& a, MDefinition* l, MDefinition* r) -> MInstruction* {
             return MAdd::NewWasm(a, l, r, MIRType::Double);
           });
           break;
+        }
         case JSOp::Sub:
           binF64([](TempAllocator& a, MDefinition* l, MDefinition* r) -> MInstruction* {
             return MSub::NewWasm(a, l, r, MIRType::Double, /*preserveNaN=*/true);
@@ -11760,6 +12104,12 @@ static bool WJIonBuildMIR(JSScript* script, js::jit::MIRGenerator& mir,
                     push(v);
                   }
                   baked = true;
+                  // Mark a load of the function being compiled itself, so a Call
+                  // through it is detected as (unsupported) self-recursion.
+                  if (wjRootFn &&
+                      &gv.toObject() == reinterpret_cast<JSObject*>(wjRootFn)) {
+                    selfRefDefs.insert(curStk->back());
+                  }
                 }
               }
             }
@@ -11784,11 +12134,351 @@ static bool WJIonBuildMIR(JSScript* script, js::jit::MIRGenerator& mir,
           push(n);
           break;
         }
+        case JSOp::String: {
+          // A string-literal constant as a boxed i64 Value (tag kWJTagString,
+          // payload = JSString*). Script strings are atoms/permanent (never
+          // nursery-allocated), so the pointer is GC-stable and safe to embed.
+          // boxedVty=4 marks it a string so JSOp::Add routes to the concat helper.
+          JSString* str = fr.script->getString(pc);
+          int64_t bits = int64_t((uint64_t(kWJTagString) << 32) |
+                                 uint32_t(uintptr_t(str)));
+          MConstant* n = MConstant::NewInt64(alloc, bits);
+          cur->add(n);
+          boxedVty[n] = 4;
+          push(n);
+          break;
+        }
         case JSOp::Swap: {
           MDefinition* a = pop();
           MDefinition* b = pop();
           push(a);
           push(b);
+          break;
+        }
+        case JSOp::NewObject:
+        case JSOp::NewInit: {
+          // REWRITE: INLINE nursery bump-allocation of the object literal/template
+          // (the perf lever for alloc-bound benches -- makes allocation faster under
+          // JIT than the interpreter's NewObjectOperation). Fast path: bump the
+          // nursery position + init the object inline; slow path (nursery full):
+          // wjhelp(WJH_NEWOBJECT). Only inline when we have a static shape with no
+          // dynamic slots; else fall to the helper.
+          JSContext* ncx = js::TlsContext.get();
+          js::SharedShape* shp = nullptr;
+          if (ncx && op == JSOp::NewObject) {
+            shp = fr.script->getShape(pc);
+          }
+          auto emitHelperNew = [&]() -> bool {
+            uint32_t s = gWJSiteCount++;
+            if (s == 0) s = gWJSiteCount++;
+            if (s >= kWJMaxSites) return false;
+            gWJSites[s].script = fr.script;
+            gWJSites[s].pcOff = loff;
+            MConstant* dummy = MConstant::NewInt64(alloc, 0);
+            cur->add(dummy);
+            MWJIonCall* mc = MWJIonCall::New(alloc, dummy, 0);
+            mc->setNewObjectSite(s);
+            cur->add(mc);
+            boxedVty[mc] = 3;
+            push(mc);
+            return true;
+          };
+          uint32_t nfixed = shp ? shp->numFixedSlots() : 0;
+          uint32_t slotSpan = shp ? shp->slotSpan() : 0;
+          if (!shp || getenv("GECKO_WJVS_NOINLINEALLOC") || slotSpan > nfixed) {
+            if (!emitHelperNew()) return false;
+            break;
+          }
+          js::gc::AllocKind akind = js::gc::GetGCObjectKind(nfixed);
+          uint32_t objSize = uint32_t(js::gc::Arena::thingSize(akind));
+          uint32_t hdrSize = uint32_t(sizeof(js::gc::NurseryCellHeader));
+          uint32_t total = hdrSize + objSize;
+          js::gc::AllocSite* asite =
+              ncx->zone()->unknownAllocSite(JS::TraceKind::Object);
+          uint32_t hdrVal = uint32_t(uintptr_t(asite)) |
+                            uint32_t(JS::TraceKind::Object);
+          uint32_t shapePtr = uint32_t(uintptr_t(shp));
+          uint32_t slotsSent = uint32_t(uintptr_t(js::emptyObjectSlots));
+          uint32_t elemsSent = uint32_t(uintptr_t(js::emptyObjectElements));
+          uint32_t posAddr =
+              uint32_t(uintptr_t(ncx->nursery().addressOfPosition()));
+          uint32_t endOff =
+              uint32_t(js::Nursery::offsetOfCurrentEndFromPosition());
+          int64_t undefBits = int64_t(uint64_t(kWJTagUndefined) << 32);
+          MDefinition* pos =
+              loadAt(konstI32(int32_t(posAddr)), 0, js::Scalar::Int32, MIRType::Int32);
+          MDefinition* end = loadAt(konstI32(int32_t(posAddr)), endOff,
+                                    js::Scalar::Int32, MIRType::Int32);
+          MAdd* newPos =
+              MAdd::NewWasm(alloc, pos, konstI32(int32_t(total)), MIRType::Int32);
+          cur->add(newPos);
+          MCompare* fits = MCompare::NewWasm(alloc, newPos, end, JSOp::Le,
+                                             MCompare::Compare_UInt32);
+          cur->add(fits);
+          uint32_t tmp = nextSlotBase++;
+          if (tmp >= info.nlocals()) return false;
+          // GC-root live heap temporaries across the allocation: the SLOW path
+          // (nursery full -> wjhelp(WJH_NEWOBJECT)) allocates and can move every
+          // nursery object/string this frame holds in a wasm local. Spill them
+          // before the diamond and reload after the join (excluding `tmp`, which
+          // receives the fresh object). Without this, an object built while the
+          // nursery is near-full (heavy GC, e.g. splay's payload trees) reads a
+          // moved-away field/arg as garbage -> "unreachable"/OOB.
+          WJSpillSet allocSS = gcSpillAll(int(tmp));
+          MBasicBlock* fastB = MBasicBlock::New(graph, info, cur, MBasicBlock::NORMAL);
+          MBasicBlock* slowB = MBasicBlock::New(graph, info, cur, MBasicBlock::NORMAL);
+          if (!fastB || !slowB) return false;
+          fastB->setLoopDepth(loopDepth);
+          slowB->setLoopDepth(loopDepth);
+          graph.addBlock(fastB);
+          graph.addBlock(slowB);
+          cur->end(MTest::New(alloc, fits, fastB, slowB));
+          std::vector<WJPendEdge> nedges;
+          cur = fastB;
+          {
+            storeAt(konstI32(int32_t(posAddr)), 0, js::Scalar::Int32, newPos);
+            storeAt(pos, 0, js::Scalar::Int32, konstI32(int32_t(hdrVal)));
+            MAdd* obj =
+                MAdd::NewWasm(alloc, pos, konstI32(int32_t(hdrSize)), MIRType::Int32);
+            cur->add(obj);
+            storeAt(obj, 0, js::Scalar::Int32, konstI32(int32_t(shapePtr)));
+            storeAt(obj, 8, js::Scalar::Int32, konstI32(int32_t(slotsSent)));
+            storeAt(obj, 12, js::Scalar::Int32, konstI32(int32_t(elemsSent)));
+            MConstant* uc = MConstant::NewInt64(alloc, undefBits);
+            cur->add(uc);
+            for (uint32_t i = 0; i < slotSpan; i++) {
+              storeAt(obj, 16 + i * 8, js::Scalar::Int64, uc);
+            }
+            MDefinition* objv = boxObj(obj);
+            cur->setSlot(info.localSlot(tmp), objv);
+            MGoto* go = MGoto::New(alloc, nullptr);
+            cur->end(go);
+            nedges.push_back({cur, MGoto::TargetIndex});
+          }
+          cur = slowB;
+          {
+            uint32_t s = gWJSiteCount++;
+            if (s == 0) s = gWJSiteCount++;
+            if (s >= kWJMaxSites) return false;
+            gWJSites[s].script = fr.script;
+            gWJSites[s].pcOff = loff;
+            MConstant* dummy = MConstant::NewInt64(alloc, 0);
+            cur->add(dummy);
+            MWJIonCall* mc = MWJIonCall::New(alloc, dummy, 0);
+            mc->setNewObjectSite(s);
+            cur->add(mc);
+            cur->setSlot(info.localSlot(tmp), mc);
+            MGoto* go = MGoto::New(alloc, nullptr);
+            cur->end(go);
+            nedges.push_back({cur, MGoto::TargetIndex});
+          }
+          MBasicBlock* njoin = nullptr;
+          for (const WJPendEdge& e : nedges) {
+            if (!njoin) {
+              njoin = MBasicBlock::New(graph, info, e.block, MBasicBlock::NORMAL);
+              if (!njoin) return false;
+              njoin->setLoopDepth(loopDepth);
+              graph.addBlock(njoin);
+            } else if (!njoin->addPredecessor(alloc, e.block)) {
+              return false;
+            }
+            e.block->lastIns()->initSuccessor(e.successor, njoin);
+          }
+          if (!njoin) return false;
+          cur = njoin;
+          gcReloadAll(allocSS);  // reload GC-moved live temporaries (incl. invalidateCSE)
+          MDefinition* result = cur->getSlot(info.localSlot(tmp));
+          boxedVty[result] = 3;
+          if (tmp < slotVty.size()) slotVty[tmp] = 3;
+          litShape[result] = shp;
+          litSlot[result] = 0;
+          push(result);
+          break;
+        }
+        case JSOp::NewArray: {
+          // INLINE nursery bump-alloc of a dense array literal (splay's [0..9]).
+          // Mirrors NewObject: fast path bumps the nursery + writes the cell
+          // header, shape, empty slots, inline-elements pointer, and the
+          // ObjectElements header; slow path = wjhelp(WJH_NEWARRAY). The element
+          // values are written by the following InitElemArray ops.
+          uint32_t count = GET_UINT32(pc);
+          JSContext* ncx = js::TlsContext.get();
+          js::SharedShape* ashp =
+              ncx ? js::GlobalObject::getArrayShapeWithDefaultProto(ncx) : nullptr;
+          auto emitHelperArr = [&]() -> bool {
+            uint32_t s = gWJSiteCount++;
+            if (s == 0) s = gWJSiteCount++;
+            if (s >= kWJMaxSites) return false;
+            gWJSites[s].script = fr.script;
+            gWJSites[s].pcOff = loff;
+            MConstant* dummy = MConstant::NewInt64(alloc, 0);
+            cur->add(dummy);
+            MWJIonCall* mc = MWJIonCall::New(alloc, dummy, 0);
+            mc->setNewArraySite(s);
+            cur->add(mc);
+            boxedVty[mc] = 3;
+            push(mc);
+            return true;
+          };
+          if (!ashp || count == 0 || getenv("GECKO_WJVS_NOINLINEALLOC")) {
+            if (!emitHelperArr()) return false;
+            break;
+          }
+          js::gc::AllocKind akind = js::gc::GetGCArrayKind(count);
+          uint32_t capacity =
+              uint32_t(js::gc::GetGCKindSlots(akind)) - 2u;  // VALUES_PER_HEADER
+          uint32_t objSize = uint32_t(js::gc::Arena::thingSize(akind));
+          uint32_t hdrSize = uint32_t(sizeof(js::gc::NurseryCellHeader));
+          uint32_t total = hdrSize + objSize;
+          js::gc::AllocSite* asite =
+              ncx->zone()->unknownAllocSite(JS::TraceKind::Object);
+          uint32_t hdrVal =
+              uint32_t(uintptr_t(asite)) | uint32_t(JS::TraceKind::Object);
+          uint32_t shapePtr = uint32_t(uintptr_t(ashp));
+          uint32_t slotsSent = uint32_t(uintptr_t(js::emptyObjectSlots));
+          uint32_t posAddr =
+              uint32_t(uintptr_t(ncx->nursery().addressOfPosition()));
+          uint32_t endOff = uint32_t(js::Nursery::offsetOfCurrentEndFromPosition());
+          MDefinition* pos = loadAt(konstI32(int32_t(posAddr)), 0,
+                                    js::Scalar::Int32, MIRType::Int32);
+          MDefinition* end = loadAt(konstI32(int32_t(posAddr)), endOff,
+                                    js::Scalar::Int32, MIRType::Int32);
+          MAdd* newPos =
+              MAdd::NewWasm(alloc, pos, konstI32(int32_t(total)), MIRType::Int32);
+          cur->add(newPos);
+          MCompare* fits = MCompare::NewWasm(alloc, newPos, end, JSOp::Le,
+                                             MCompare::Compare_UInt32);
+          cur->add(fits);
+          uint32_t tmp = nextSlotBase++;
+          if (tmp >= info.nlocals()) return false;
+          // GC-root live heap temporaries across the array allocation (the obj
+          // being built is live on the stack when its `array` field is allocated).
+          WJSpillSet allocSS = gcSpillAll(int(tmp));
+          MBasicBlock* fastB =
+              MBasicBlock::New(graph, info, cur, MBasicBlock::NORMAL);
+          MBasicBlock* slowB =
+              MBasicBlock::New(graph, info, cur, MBasicBlock::NORMAL);
+          if (!fastB || !slowB) return false;
+          fastB->setLoopDepth(loopDepth);
+          slowB->setLoopDepth(loopDepth);
+          graph.addBlock(fastB);
+          graph.addBlock(slowB);
+          cur->end(MTest::New(alloc, fits, fastB, slowB));
+          std::vector<WJPendEdge> nedges;
+          cur = fastB;
+          {
+            storeAt(konstI32(int32_t(posAddr)), 0, js::Scalar::Int32, newPos);
+            storeAt(pos, 0, js::Scalar::Int32, konstI32(int32_t(hdrVal)));
+            MAdd* obj =
+                MAdd::NewWasm(alloc, pos, konstI32(int32_t(hdrSize)), MIRType::Int32);
+            cur->add(obj);
+            storeAt(obj, 0, js::Scalar::Int32, konstI32(int32_t(shapePtr)));
+            storeAt(obj, 8, js::Scalar::Int32, konstI32(int32_t(slotsSent)));
+            MAdd* elems =
+                MAdd::NewWasm(alloc, obj, konstI32(32), MIRType::Int32);
+            cur->add(elems);
+            storeAt(obj, 12, js::Scalar::Int32, elems);
+            // ObjectElements header: flags=FIXED, initializedLength=0,
+            // capacity, length=count.
+            storeAt(obj, 16, js::Scalar::Int32, konstI32(1));
+            storeAt(obj, 20, js::Scalar::Int32, konstI32(0));
+            storeAt(obj, 24, js::Scalar::Int32, konstI32(int32_t(capacity)));
+            storeAt(obj, 28, js::Scalar::Int32, konstI32(int32_t(count)));
+            MDefinition* objv = boxObj(obj);
+            cur->setSlot(info.localSlot(tmp), objv);
+            MGoto* go = MGoto::New(alloc, nullptr);
+            cur->end(go);
+            nedges.push_back({cur, MGoto::TargetIndex});
+          }
+          cur = slowB;
+          {
+            uint32_t s = gWJSiteCount++;
+            if (s == 0) s = gWJSiteCount++;
+            if (s >= kWJMaxSites) return false;
+            gWJSites[s].script = fr.script;
+            gWJSites[s].pcOff = loff;
+            MConstant* dummy = MConstant::NewInt64(alloc, 0);
+            cur->add(dummy);
+            MWJIonCall* mc = MWJIonCall::New(alloc, dummy, 0);
+            mc->setNewArraySite(s);
+            cur->add(mc);
+            cur->setSlot(info.localSlot(tmp), mc);
+            MGoto* go = MGoto::New(alloc, nullptr);
+            cur->end(go);
+            nedges.push_back({cur, MGoto::TargetIndex});
+          }
+          MBasicBlock* njoin = nullptr;
+          for (const WJPendEdge& e : nedges) {
+            if (!njoin) {
+              njoin = MBasicBlock::New(graph, info, e.block, MBasicBlock::NORMAL);
+              if (!njoin) return false;
+              njoin->setLoopDepth(loopDepth);
+              graph.addBlock(njoin);
+            } else if (!njoin->addPredecessor(alloc, e.block)) {
+              return false;
+            }
+            e.block->lastIns()->initSuccessor(e.successor, njoin);
+          }
+          if (!njoin) return false;
+          cur = njoin;
+          gcReloadAll(allocSS);  // reload GC-moved live temporaries (incl. invalidateCSE)
+          MDefinition* result = cur->getSlot(info.localSlot(tmp));
+          boxedVty[result] = 3;
+          if (tmp < slotVty.size()) slotVty[tmp] = 3;
+          litArrayCap[result] = capacity;
+          push(result);
+          break;
+        }
+        case JSOp::InitElemArray: {
+          // ARRAY[index] = val on a freshly inline-allocated dense array. Stack:
+          // [arr, val] -> [arr]. index is the operand; the parser guarantees
+          // index == current initializedLength, so we bump initLen to index+1.
+          uint32_t index = GET_UINT32(pc);
+          MDefinition* val = pop();
+          MDefinition* arrb = curStk->back();  // array stays on the stack
+          auto ait = litArrayCap.find(arrb);
+          if (ait == litArrayCap.end() || index >= ait->second) {
+            if (WJIonLog())
+              fprintf(stderr, "[ion-fe] InitElemArray@%u: not an inline array\n", loff);
+            return false;
+          }
+          MDefinition* arrp = asObjPtr(arrb);
+          storeAt(arrp, 32 + index * 8, js::Scalar::Int64,
+                  val->type() == MIRType::Int32 ? boxForStoreInt(val)
+                                                : boxForStore(val));
+          storeAt(arrp, 20, js::Scalar::Int32, konstI32(int32_t(index + 1)));
+          emitPostBarrier(arrb, val, /*isInit=*/true);
+          break;
+        }
+        case JSOp::InitProp:
+        case JSOp::InitLockedProp:
+        case JSOp::InitHiddenProp: {
+          // obj.<name> = val on a freshly inline-allocated literal. Stack: [obj, val]
+          // -> [obj]. Properties are initialized in declaration order == slot order, so
+          // the Nth InitProp for this obj writes fixed slot N (litSlot counter, per-obj
+          // for nesting). Only handles objects from inline NewObject (litShape known).
+          MDefinition* val = pop();
+          MDefinition* objb = curStk->back();  // obj stays on the stack (below val)
+          auto lsit = litShape.find(objb);
+          if (lsit == litShape.end()) {
+            if (WJIonLog()) fprintf(stderr, "[ion-fe] InitProp@%u: not an inline literal\n", loff);
+            return false;
+          }
+          js::SharedShape* lshp = lsit->second;
+          uint32_t slot = litSlot[objb]++;
+          if (slot >= lshp->numFixedSlots()) return false;
+          uint32_t foff = 16 + slot * 8;  // fixed slot byte offset
+          uint8_t setVty = 2;
+          {
+            auto vit = gWJFieldVty.find((uint64_t(uintptr_t(lshp)) << 32) | foff);
+            if (vit != gWJFieldVty.end()) setVty = vit->second;
+          }
+          MDefinition* objp = asObjPtr(objb);
+          storeAt(objp, foff, js::Scalar::Int64,
+                  setVty == 1 ? boxForStoreInt(val) : boxForStore(val));
+          emitPostBarrier(objb, val, /*isInit=*/true);
+          // NOTE: do NOT clear fieldCache/objPtrMemo -- InitProp doesn't GC and the
+          // obj's identity is stable; keep litShape/litSlot valid for the next InitProp.
           break;
         }
         case JSOp::New:
@@ -11838,6 +12528,41 @@ static bool WJIonBuildMIR(JSScript* script, js::jit::MIRGenerator& mir,
           }
           // Free-function monomorphic inline.
           JSScript* cs = WJResolveInlineCallee(fr.script, loff, argc);
+          // SELF-RECURSION: a call to the function being compiled (the root, or any
+          // inlined-frame ancestor). Don't INLINE it (2^depth expansion -> slot
+          // overflow); emit a non-inlined self-call instead. Re-entering the same
+          // compiled wasm is safe because emitNonInlinedCall GC-roots the caller's
+          // live objects in this frame's private (depth-indexed) spill region. Detect
+          // via the resolved/observed callee script and the self-ref GName def (the
+          // recursive call often has no inline record -> cs is null).
+          {
+            JSScript* calleeScript = cs;
+            if (!calleeScript) {
+              auto it = gWJInlineCallee.find(WJInlineKey(fr.script, loff));
+              if (it != gWJInlineCallee.end() && it->second.n >= 1 &&
+                  WJGuestPtrOk(it->second.fns[0])) {
+                JSFunction* f =
+                    reinterpret_cast<JSFunction*>(uintptr_t(it->second.fns[0]));
+                if (f && f->isInterpreted() && f->baseScript() &&
+                    f->baseScript()->hasBytecode()) {
+                  calleeScript = f->baseScript()->asJSScript();
+                }
+              }
+            }
+            bool isSelf = (calleeScript &&
+                           (calleeScript == fr.script || calleeScript == script)) ||
+                          selfRefDefs.count(calleeDef);
+            if (isSelf) {
+              bool isMethod = methodOffOf.find(calleeDef) != methodOffOf.end();
+              if (!isMethod && calleeDef->type() == MIRType::Int64) {
+                if (!emitNonInlinedCall(calleeDef, thisv, cargs, argc)) return false;
+                break;
+              }
+              // self-recursive method/odd-callee: can't handle -> bail.
+              if (WJIonLog()) fprintf(stderr, "[ion-fe] self-recursion (method) -> bail\n");
+              return false;
+            }
+          }
           if (!cs) {
             // Can't inline (no recorded callee). If this is a FREE function call
             // (calleeDef is the real callee Value, not a method receiver), emit a
@@ -12939,10 +13664,18 @@ static bool WJCompile(JSScript* script, WasmJitEntry& entry) {
   // as typed i32/f64 -- the big perf lever (the boxed tag-dispatch unbox dominates
   // the hot loop). GECKO_WJVS_IONINT_EAGER installs on the first compile (boxed).
   bool ionHasLoop = false;
+  bool ionHasAlloc = false;
   if (getenv("GECKO_WJVS_IONINT")) {
     for (jsbytecode* pc = script->code(); pc < script->codeEnd();
          pc += GetBytecodeLength(pc)) {
-      if (JSOp(*pc) == JSOp::LoopHead) { ionHasLoop = true; break; }
+      JSOp o = JSOp(*pc);
+      if (o == JSOp::LoopHead) ionHasLoop = true;
+      // Allocation-heavy non-loop functions (e.g. splay's recursive
+      // GeneratePayloadTree) are worth compiling: inline nursery alloc is ~7x the
+      // interpreter's NewObjectOperation, which dominates these.
+      if (o == JSOp::NewObject || o == JSOp::NewInit || o == JSOp::NewArray) {
+        ionHasAlloc = true;
+      }
     }
   }
   bool ionLog = getenv("GECKO_WJVS_IONINT_LOG") != nullptr;
@@ -12963,7 +13696,7 @@ static bool WJCompile(JSScript* script, WasmJitEntry& entry) {
     if (maxLine && uint32_t(script->lineno()) > uint32_t(atoi(maxLine))) {
       return false;  // bisection: only compile functions up to this source line
     }
-    if (ionHasLoop || getenv("GECKO_WJVS_IONINT_ALL")) {
+    if (ionHasLoop || ionHasAlloc || getenv("GECKO_WJVS_IONINT_ALL")) {
       int h = WJIonCompileInstall(script, /*quiet=*/!ionLog);
       if (ionLog) {
         fprintf(stderr, "[ion-int] %s:%u loop=%d -> %s\n",
@@ -13502,6 +14235,7 @@ int js::wasm::WasmJitRunCall(JSScript* script, uint64_t thisBits,
   double ptr = double(uintptr_t(static_cast<void*>(gWJScratch)));
   if (gWJCallDepth >= kWJMaxCallDepth) return 0;  // too deep -> interpreter
   gWJCallDepth++;
+  uint32_t spillDepth = uint32_t(gWJCallDepth);  // region this callee spills into
   WasmJitEntry* savedCur = gWJCurEntry;
   // Set the env for GetAliasedVar reads; restore on exit so a nested entry can't
   // leave a stale env for this frame. Root the saved value across the wasm call:
@@ -13513,6 +14247,17 @@ int js::wasm::WasmJitRunCall(JSScript* script, uint64_t thisBits,
   gWJCurEnv = savedEnv;
   gWJCurEntry = savedCur;
   gWJCallDepth--;
+  if (deopt != 0.0) {
+    // The callee may have spilled live objects into its per-depth gWJObjSpill
+    // region (GC-rooting them across a nested allocating call) and then DEOPTED
+    // before the matching reload+zero -- leaving stale object pointers there that
+    // WJTraceRoots would later trace and crash on. Clean its region now. (On a
+    // successful return the function already zeroed its own region via reload.)
+    if (spillDepth * kWJSpillStride + kWJSpillStride <= kWJSpillSlots) {
+      uint64_t* region = &gWJObjSpill[spillDepth * kWJSpillStride];
+      for (uint32_t i = 0; i < kWJSpillStride; i++) region[i] = 0;
+    }
+  }
   if (deopt == 2.0) {
     // Mode VS helper threw: exception pending on cx; the wasm already ran (and may
     // have mutated). Do NOT restart -- propagate. (Not counted as a deopt.)
@@ -17178,6 +17923,15 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
       res.setObject(*obj);
       break;
     }
+    case WJH_NEWARRAY: {
+      // ALLOC: dense array for this NewArray site (nursery-full slow path).
+      JSScript* sc = gWJSites[site].script;
+      jsbytecode* apc = sc->offsetToPC(gWJSites[site].pcOff);
+      JSObject* arr = js::NewArrayOperation(cx, GET_UINT32(apc));
+      if (!arr) return 1.0;
+      res.setObject(*arr);
+      break;
+    }
     case WJH_INITPROP: {
       // ALLOC: define a data property on obj=a with value=b (constructor field-init / literal).
       // Leaves the object on the stack (InitProp's no-pop-of-obj semantics).
@@ -17468,6 +18222,18 @@ extern "C" EMSCRIPTEN_KEEPALIVE void WJTraceRoots(JSTracer* trc, void*) {
   JS::TraceRoot(trc, reinterpret_cast<JS::Value*>(&gWJHelpA), "wjhelpA");
   JS::TraceRoot(trc, reinterpret_cast<JS::Value*>(&gWJHelpB), "wjhelpB");
   JS::TraceRoot(trc, reinterpret_cast<JS::Value*>(&gWJHelpC), "wjhelpC");
+  // Spill regions are indexed by call depth; only depths [0..gWJCallDepth] can hold
+  // a LIVE spill at GC time (deeper frames have returned, shallower are this call's
+  // ancestors). Tracing only the active depth range -- instead of the whole array --
+  // keeps GC-tracing cost proportional to nesting depth (richards GCs often at
+  // shallow depth, so this avoids scanning thousands of always-zero slots per GC).
+  if (gWJSpillTraceN) {
+    uint32_t spillHi = (uint32_t(gWJCallDepth) + 1) * kWJSpillStride;
+    if (spillHi > kWJSpillSlots) spillHi = kWJSpillSlots;
+    for (uint32_t i = 0; i < spillHi; i++) {
+      JS::TraceRoot(trc, reinterpret_cast<JS::Value*>(&gWJObjSpill[i]), "wjspill");
+    }
+  }
   if (gWJCurEnv) JS::TraceRoot(trc, &gWJCurEnv, "wjcurenv");
 }
 

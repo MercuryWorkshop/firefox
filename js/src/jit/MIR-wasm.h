@@ -609,6 +609,14 @@ class MWJIonCall : public MUnaryInstruction, public NoTypePolicy::Data {
                               // receiver -> gWJHelpA; stored value pre-stored to
                               // gWJHelpB by the builder; wjhelp(WJH_POSTBARRIER, 0).
                               // No result; never deopts.
+  uint32_t newObjectSite_ = 0;  // nonzero: NewObject/NewInit SLOW path -- no operand;
+                                // wjhelp(WJH_NEWOBJECT, site) -> object Value result.
+  uint32_t newArraySite_ = 0;   // nonzero: NewArray SLOW path -- no operand;
+                                // wjhelp(WJH_NEWARRAY, site) -> array Value result.
+  uint32_t arithHelper_ = 0;    // nonzero: boxed binary-arith helper (the WJH_* kind,
+                                // +1 so 0 means unset). operand = boxed lhs -> gWJHelpA;
+                                // boxed rhs pre-stored to gWJHelpB by the builder.
+                                // wjhelp(kind) -> boxed Value result (e.g. string concat).
   MWJIonCall(MDefinition* callee, uint32_t argc)
       : MUnaryInstruction(classOpcode, callee), argc_(argc) {
     setResultType(MIRType::Int64);
@@ -630,6 +638,12 @@ class MWJIonCall : public MUnaryInstruction, public NoTypePolicy::Data {
   void setSetPropSite(uint32_t s) { setPropSite_ = s; }
   bool isPostBarrier() const { return postBarrier_; }
   void setPostBarrier() { postBarrier_ = true; }
+  uint32_t newObjectSite() const { return newObjectSite_; }
+  void setNewObjectSite(uint32_t s) { newObjectSite_ = s; }
+  uint32_t newArraySite() const { return newArraySite_; }
+  void setNewArraySite(uint32_t s) { newArraySite_ = s; }
+  uint32_t arithHelper() const { return arithHelper_; }
+  void setArithHelper(uint32_t kindPlus1) { arithHelper_ = kindPlus1; }
   AliasSet getAliasSet() const override {
     return AliasSet::Store(AliasSet::Any);
   }

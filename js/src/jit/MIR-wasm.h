@@ -593,6 +593,22 @@ class MWasmNeg : public MUnaryInstruction, public NoTypePolicy::Data {
 // Not lowered by the normal Ion backend (WJ has no LIR backend).
 class MWJIonCall : public MUnaryInstruction, public NoTypePolicy::Data {
   uint32_t argc_;
+  uint32_t methName_ = 0;  // 0: IONCALL (callee operand). nonzero: METHCALL
+                           // (dynamic recv[name]; this low32 is the PropertyName*;
+                           // the callee operand is then an unused dummy).
+  uint32_t propSite_ = 0;  // nonzero: GETPROP-helper mode. The operand is the
+                           // boxed receiver; lowering stores it to gWJHelpA and
+                           // calls wjhelp(WJH_GETPROP, propSite_) -- a generic
+                           // property load that NEVER deopt-restarts the caller.
+  bool construct_ = false;  // true: `new callee(args)` -> wjhelp(WJH_CONSTRUCT)
+                            // (callee operand -> gWJHelpA, args in gWJScratch).
+  uint32_t setPropSite_ = 0;  // nonzero: SETPROP-helper. operand = boxed receiver
+                              // -> gWJHelpA; val pre-stored to gWJHelpB by the
+                              // builder; wjhelp(WJH_SETPROP, setPropSite_).
+  bool postBarrier_ = false;  // true: GC post-write barrier. operand = boxed
+                              // receiver -> gWJHelpA; stored value pre-stored to
+                              // gWJHelpB by the builder; wjhelp(WJH_POSTBARRIER, 0).
+                              // No result; never deopts.
   MWJIonCall(MDefinition* callee, uint32_t argc)
       : MUnaryInstruction(classOpcode, callee), argc_(argc) {
     setResultType(MIRType::Int64);
@@ -604,6 +620,16 @@ class MWJIonCall : public MUnaryInstruction, public NoTypePolicy::Data {
   TRIVIAL_NEW_WRAPPERS
   NAMED_OPERANDS((0, callee))
   uint32_t argc() const { return argc_; }
+  uint32_t methName() const { return methName_; }
+  void setMethName(uint32_t n) { methName_ = n; }
+  uint32_t propSite() const { return propSite_; }
+  void setPropSite(uint32_t s) { propSite_ = s; }
+  bool isConstruct() const { return construct_; }
+  void setConstruct() { construct_ = true; }
+  uint32_t setPropSite() const { return setPropSite_; }
+  void setSetPropSite(uint32_t s) { setPropSite_ = s; }
+  bool isPostBarrier() const { return postBarrier_; }
+  void setPostBarrier() { postBarrier_ = true; }
   AliasSet getAliasSet() const override {
     return AliasSet::Store(AliasSet::Any);
   }

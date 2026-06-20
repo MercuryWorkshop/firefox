@@ -12,6 +12,18 @@
 #include "mozilla/webrender/RenderThread.h"
 #include "mozilla/widget/CompositorWidget.h"
 
+#if defined(__EMSCRIPTEN__)
+// NB: do NOT #include <emscripten/html5.h> here -- it defines DOM_KEY_LOCATION_*
+// macros that collide with mozilla::dom::KeyboardEventBinding's enum of the same
+// names (pulled in transitively). Declare just the two canvas-size entry points.
+extern "C" {
+int emscripten_get_canvas_element_size(const char* target, int* width,
+                                       int* height);
+int emscripten_set_canvas_element_size(const char* target, int width,
+                                       int height);
+}
+#endif
+
 namespace mozilla::wr {
 
 extern LazyLogModule gRenderThreadLog;
@@ -60,6 +72,25 @@ bool RenderCompositorOGL::BeginFrame() {
     gfxCriticalNote << "Failed to make render context current, can't draw.";
     return false;
   }
+
+#if defined(__EMSCRIPTEN__)
+  // The default framebuffer (FB0) is the transferred OffscreenCanvas (#screen)
+  // owned by this Renderer thread. The main thread CANNOT resize a transferred
+  // OffscreenCanvas, so when the chrome window resizes (gpu_present -> widget
+  // Resize -> GetClientSize) the canvas would otherwise stay at its initial size
+  // and the scene would render clipped / mispositioned. Resize it here, on the
+  // owning thread, to the current widget size before drawing. (Cheap no-op when
+  // unchanged; the #glout present canvas is CSS-sized to the viewport so the
+  // resized frame displays 1:1.)
+  {
+    const auto sz = GetBufferSize();
+    int cw = 0, ch = 0;
+    emscripten_get_canvas_element_size("#screen", &cw, &ch);
+    if ((cw != sz.width || ch != sz.height) && sz.width > 0 && sz.height > 0) {
+      emscripten_set_canvas_element_size("#screen", sz.width, sz.height);
+    }
+  }
+#endif
 
   mGL->fBindFramebuffer(LOCAL_GL_FRAMEBUFFER, mGL->GetDefaultFramebuffer());
 

@@ -37,6 +37,7 @@
 #include "jit/JitFrames.h"
 #include "jit/JitScript.h"
 #include "jit/JSJitFrameIter.h"
+#include "jit/TrialInlining.h"
 #include "jit/VMFunctions.h"
 #include "proxy/DeadObjectProxy.h"
 #include "proxy/DOMProxy.h"
@@ -900,6 +901,10 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
   }
 
     ICCacheIRStub* cstub = stub->toCacheIRStub();
+    // Count optimized-stub executions (the baseline JIT does this in generated
+    // code; PBL otherwise leaves it 0). Trial inlining gates on this count, so
+    // without it inlining either never fires or must use an unsound 0 threshold.
+    cstub->incrementEnteredCount();
     const CacheIRStubInfo* stubInfo = cstub->stubInfo();
     CacheIRReader cacheIRReader(stubInfo);
     uint64_t retValue = 0;
@@ -5935,6 +5940,18 @@ static EnvironmentObject& getEnvironmentFromCoordinate(
 
 #define NEXT_IC() icEntry++
 
+// JS->wasm JIT (Warp) needs CacheIR type feedback, but PBL's inline int/number
+// arith & compare fast-paths bypass the IC, leaving it cold so Warp bails. Gate
+// each fast-path on an optimized stub already existing: until one does, fall
+// through to the IC (which attaches it on first execution); after, fast-path as
+// before. Self-limiting (one IC execution per site), no stranding, and both
+// jit-on/off arms behave identically so timings stay comparable.
+#if defined(__EMSCRIPTEN__)
+#  define WJ_ICWARM(entry) (!(entry)->firstStub()->isFallback())
+#else
+#  define WJ_ICWARM(entry) true
+#endif
+
 #define INVOKE_IC(kind, hasarg2)                                             \
   ctx.sp_ = sp;                                                              \
   frame->interpreterPC() = pc;                                               \
@@ -5973,7 +5990,8 @@ PBIResult PortableBaselineInterpret(
     JSObject* envChain, Value* ret, jsbytecode* pc, ImmutableScriptData* isd,
     jsbytecode* restartEntryPC, BaselineFrame* restartFrame,
     StackVal* restartEntryFrame, PBIResult restartCode,
-    const uint64_t* osrLocals, uint32_t osrNLocals) {
+    const uint64_t* osrLocals, uint32_t osrNLocals,
+    const uint64_t* osrStack, uint32_t osrStackDepth) {
 #define RESTART(code)                                                 \
   if (!IsRestart) {                                                   \
     TRACE_PRINTF("Restarting (code %d sp %p fp %p)\n", int(code), sp, \
@@ -6077,6 +6095,14 @@ PBIResult PortableBaselineInterpret(
       // local i lives at unaliasedLocal(i) = valueSlot(i) = (Value*)frame-(i+1), which after
       // `sp = frame; sp -= nfixed` is sp[nfixed-1-i] (the local order is reversed vs sp[]).
       sp[nfixed - 1 - i] = StackVal(Value::fromRawBits(osrLocals[i]));
+    }
+  }
+  // JS->wasm JIT resume: also seed the expression stack (osrStack[0]=bottom ..
+  // [depth-1]=top) so we can resume mid-expression (e.g. a guard inside a
+  // GetProp, where the receiver is already on the stack). Inert when null.
+  if (osrStack) {
+    for (uint32_t i = 0; i < osrStackDepth; i++) {
+      PUSH(StackVal(Value::fromRawBits(osrStack[i])));
     }
   }
   ret->setUndefined();
@@ -6277,7 +6303,7 @@ PBIResult PortableBaselineInterpret(
       }
       CASE(Neg) {
         Value v = VIRTSP(0).asValue();
-        if (v.isInt32()) {
+        if (v.isInt32() && WJ_ICWARM(icEntry)) {
           int32_t i = v.toInt32();
           if (i != 0 && i != INT32_MIN) {
             VIRTSPWRITE(0, StackVal(Int32Value(-i)));
@@ -6285,7 +6311,7 @@ PBIResult PortableBaselineInterpret(
             END_OP(Neg);
           }
         }
-        if (v.isNumber()) {
+        if (v.isNumber() && WJ_ICWARM(icEntry)) {
           VIRTSPWRITE(0, StackVal(NumberValue(-v.toNumber())));
           NEXT_IC();
           END_OP(Neg);
@@ -6295,7 +6321,7 @@ PBIResult PortableBaselineInterpret(
 
       CASE(Inc) {
         Value v = VIRTSP(0).asValue();
-        if (v.isInt32()) {
+        if (v.isInt32() && WJ_ICWARM(icEntry)) {
           int32_t i = v.toInt32();
           if (i != INT32_MAX) {
             VIRTSPWRITE(0, StackVal(Int32Value(i + 1)));
@@ -6303,7 +6329,7 @@ PBIResult PortableBaselineInterpret(
             END_OP(Inc);
           }
         }
-        if (v.isNumber()) {
+        if (v.isNumber() && WJ_ICWARM(icEntry)) {
           VIRTSPWRITE(0, StackVal(NumberValue(v.toNumber() + 1)));
           NEXT_IC();
           END_OP(Inc);
@@ -6312,7 +6338,7 @@ PBIResult PortableBaselineInterpret(
       }
       CASE(Dec) {
         Value v = VIRTSP(0).asValue();
-        if (v.isInt32()) {
+        if (v.isInt32() && WJ_ICWARM(icEntry)) {
           int32_t i = v.toInt32();
           if (i != INT32_MIN) {
             VIRTSPWRITE(0, StackVal(Int32Value(i - 1)));
@@ -6320,7 +6346,7 @@ PBIResult PortableBaselineInterpret(
             END_OP(Dec);
           }
         }
-        if (v.isNumber()) {
+        if (v.isNumber() && WJ_ICWARM(icEntry)) {
           VIRTSPWRITE(0, StackVal(NumberValue(v.toNumber() - 1)));
           NEXT_IC();
           END_OP(Dec);
@@ -6330,7 +6356,7 @@ PBIResult PortableBaselineInterpret(
 
       CASE(BitNot) {
         Value v = VIRTSP(0).asValue();
-        if (v.isInt32()) {
+        if (v.isInt32() && WJ_ICWARM(icEntry)) {
           int32_t i = v.toInt32();
           VIRTSPWRITE(0, StackVal(Int32Value(~i)));
           NEXT_IC();
@@ -6340,9 +6366,9 @@ PBIResult PortableBaselineInterpret(
       }
 
       CASE(ToNumeric) {
-        if (VIRTSP(0).asValue().isNumeric()) {
+        if (VIRTSP(0).asValue().isNumeric() && WJ_ICWARM(icEntry)) {
           NEXT_IC();
-        } else if (HybridICs) {
+        } else if (HybridICs && WJ_ICWARM(icEntry)) {
           SYNCSP();
           MutableHandleValue val = SPHANDLEMUT(0);
           PUSH_EXIT_FRAME();
@@ -6351,6 +6377,8 @@ PBIResult PortableBaselineInterpret(
           }
           NEXT_IC();
         } else {
+          // Cold IC: route through the UnaryArith IC so it attaches a stub for
+          // the JS->wasm JIT (otherwise this op stays cold and Warp bails).
           goto generic_unary;
         }
         END_OP(ToNumeric);
@@ -6503,7 +6531,7 @@ PBIResult PortableBaselineInterpret(
         if (HybridICs) {
           Value v0 = VIRTSP(0).asValue();
           Value v1 = VIRTSP(1).asValue();
-          if (v0.isInt32() && v1.isInt32()) {
+          if (v0.isInt32() && v1.isInt32() && WJ_ICWARM(icEntry)) {
             int64_t lhs = v1.toInt32();
             int64_t rhs = v0.toInt32();
             int64_t result = lhs + rhs;
@@ -6514,7 +6542,7 @@ PBIResult PortableBaselineInterpret(
               END_OP(Add);
             }
           }
-          if (v0.isNumber() && v1.isNumber()) {
+          if (v0.isNumber() && v1.isNumber() && WJ_ICWARM(icEntry)) {
             double lhs = v1.toNumber();
             double rhs = v0.toNumber();
             VIRTPOP();
@@ -6522,7 +6550,13 @@ PBIResult PortableBaselineInterpret(
             NEXT_IC();
             END_OP(Add);
           }
-
+          // Numeric but cold: route through the IC so it attaches a stub (the
+          // JS->wasm JIT needs the feedback). Non-numeric (string concat etc.)
+          // uses the generic op directly: attaching a string-concat stub would
+          // invoke the native MacroAssembler, which traps in this build.
+          if (v0.isNumber() && v1.isNumber()) {
+            goto generic_binary;
+          }
           MutableHandleValue lhs = SPHANDLEMUT(1);
           MutableHandleValue rhs = SPHANDLEMUT(0);
           MutableHandleValue result = SPHANDLEMUT(1);
@@ -6543,7 +6577,7 @@ PBIResult PortableBaselineInterpret(
         if (HybridICs) {
           Value v0 = VIRTSP(0).asValue();
           Value v1 = VIRTSP(1).asValue();
-          if (v0.isInt32() && v1.isInt32()) {
+          if (v0.isInt32() && v1.isInt32() && WJ_ICWARM(icEntry)) {
             int64_t lhs = v1.toInt32();
             int64_t rhs = v0.toInt32();
             int64_t result = lhs - rhs;
@@ -6554,7 +6588,7 @@ PBIResult PortableBaselineInterpret(
               END_OP(Sub);
             }
           }
-          if (v0.isNumber() && v1.isNumber()) {
+          if (v0.isNumber() && v1.isNumber() && WJ_ICWARM(icEntry)) {
             double lhs = v1.toNumber();
             double rhs = v0.toNumber();
             VIRTPOP();
@@ -6563,18 +6597,7 @@ PBIResult PortableBaselineInterpret(
             END_OP(Add);
           }
 
-          MutableHandleValue lhs = SPHANDLEMUT(1);
-          MutableHandleValue rhs = SPHANDLEMUT(0);
-          MutableHandleValue result = SPHANDLEMUT(1);
-          {
-            PUSH_EXIT_FRAME();
-            if (!SubOperation(cx, lhs, rhs, result)) {
-              GOTO_ERROR();
-            }
-          }
-          VIRTPOP();
-          NEXT_IC();
-          END_OP(Sub);
+          goto generic_binary;
         }
         goto generic_binary;
       }
@@ -6583,7 +6606,7 @@ PBIResult PortableBaselineInterpret(
         if (HybridICs) {
           Value v0 = VIRTSP(0).asValue();
           Value v1 = VIRTSP(1).asValue();
-          if (v0.isInt32() && v1.isInt32()) {
+          if (v0.isInt32() && v1.isInt32() && WJ_ICWARM(icEntry)) {
             int64_t lhs = v1.toInt32();
             int64_t rhs = v0.toInt32();
             int64_t product = lhs * rhs;
@@ -6596,7 +6619,7 @@ PBIResult PortableBaselineInterpret(
               END_OP(Mul);
             }
           }
-          if (v0.isNumber() && v1.isNumber()) {
+          if (v0.isNumber() && v1.isNumber() && WJ_ICWARM(icEntry)) {
             double lhs = v1.toNumber();
             double rhs = v0.toNumber();
             VIRTPOP();
@@ -6605,18 +6628,7 @@ PBIResult PortableBaselineInterpret(
             END_OP(Mul);
           }
 
-          MutableHandleValue lhs = SPHANDLEMUT(1);
-          MutableHandleValue rhs = SPHANDLEMUT(0);
-          MutableHandleValue result = SPHANDLEMUT(1);
-          {
-            PUSH_EXIT_FRAME();
-            if (!MulOperation(cx, lhs, rhs, result)) {
-              GOTO_ERROR();
-            }
-          }
-          VIRTPOP();
-          NEXT_IC();
-          END_OP(Mul);
+          goto generic_binary;
         }
         goto generic_binary;
       }
@@ -6624,7 +6636,7 @@ PBIResult PortableBaselineInterpret(
         if (HybridICs) {
           Value v0 = VIRTSP(0).asValue();
           Value v1 = VIRTSP(1).asValue();
-          if (v0.isNumber() && v1.isNumber()) {
+          if (v0.isNumber() && v1.isNumber() && WJ_ICWARM(icEntry)) {
             double lhs = v1.toNumber();
             double rhs = v0.toNumber();
             VIRTPOP();
@@ -6633,18 +6645,7 @@ PBIResult PortableBaselineInterpret(
             END_OP(Div);
           }
 
-          MutableHandleValue lhs = SPHANDLEMUT(1);
-          MutableHandleValue rhs = SPHANDLEMUT(0);
-          MutableHandleValue result = SPHANDLEMUT(1);
-          {
-            PUSH_EXIT_FRAME();
-            if (!DivOperation(cx, lhs, rhs, result)) {
-              GOTO_ERROR();
-            }
-          }
-          VIRTPOP();
-          NEXT_IC();
-          END_OP(Div);
+          goto generic_binary;
         }
         goto generic_binary;
       }
@@ -6652,7 +6653,7 @@ PBIResult PortableBaselineInterpret(
         if (HybridICs) {
           Value v0 = VIRTSP(0).asValue();
           Value v1 = VIRTSP(1).asValue();
-          if (v0.isInt32() && v1.isInt32()) {
+          if (v0.isInt32() && v1.isInt32() && WJ_ICWARM(icEntry)) {
             int64_t lhs = v1.toInt32();
             int64_t rhs = v0.toInt32();
             if (lhs > 0 && rhs > 0) {
@@ -6663,7 +6664,7 @@ PBIResult PortableBaselineInterpret(
               END_OP(Mod);
             }
           }
-          if (v0.isNumber() && v1.isNumber()) {
+          if (v0.isNumber() && v1.isNumber() && WJ_ICWARM(icEntry)) {
             double lhs = v1.toNumber();
             double rhs = v0.toNumber();
             VIRTPOP();
@@ -6672,18 +6673,7 @@ PBIResult PortableBaselineInterpret(
             END_OP(Mod);
           }
 
-          MutableHandleValue lhs = SPHANDLEMUT(1);
-          MutableHandleValue rhs = SPHANDLEMUT(0);
-          MutableHandleValue result = SPHANDLEMUT(1);
-          {
-            PUSH_EXIT_FRAME();
-            if (!ModOperation(cx, lhs, rhs, result)) {
-              GOTO_ERROR();
-            }
-          }
-          VIRTPOP();
-          NEXT_IC();
-          END_OP(Mod);
+          goto generic_binary;
         }
         goto generic_binary;
       }
@@ -6691,7 +6681,7 @@ PBIResult PortableBaselineInterpret(
         if (HybridICs) {
           Value v0 = VIRTSP(0).asValue();
           Value v1 = VIRTSP(1).asValue();
-          if (v0.isNumber() && v1.isNumber()) {
+          if (v0.isNumber() && v1.isNumber() && WJ_ICWARM(icEntry)) {
             double lhs = v1.toNumber();
             double rhs = v0.toNumber();
             VIRTPOP();
@@ -6700,18 +6690,7 @@ PBIResult PortableBaselineInterpret(
             END_OP(Pow);
           }
 
-          MutableHandleValue lhs = SPHANDLEMUT(1);
-          MutableHandleValue rhs = SPHANDLEMUT(0);
-          MutableHandleValue result = SPHANDLEMUT(1);
-          {
-            PUSH_EXIT_FRAME();
-            if (!PowOperation(cx, lhs, rhs, result)) {
-              GOTO_ERROR();
-            }
-          }
-          VIRTPOP();
-          NEXT_IC();
-          END_OP(Pow);
+          goto generic_binary;
         }
         goto generic_binary;
       }
@@ -6719,7 +6698,7 @@ PBIResult PortableBaselineInterpret(
         if (HybridICs) {
           Value v0 = VIRTSP(0).asValue();
           Value v1 = VIRTSP(1).asValue();
-          if (v0.isInt32() && v1.isInt32()) {
+          if (v0.isInt32() && v1.isInt32() && WJ_ICWARM(icEntry)) {
             int32_t lhs = v1.toInt32();
             int32_t rhs = v0.toInt32();
             VIRTPOP();
@@ -6734,7 +6713,7 @@ PBIResult PortableBaselineInterpret(
         if (HybridICs) {
           Value v0 = VIRTSP(0).asValue();
           Value v1 = VIRTSP(1).asValue();
-          if (v0.isInt32() && v1.isInt32()) {
+          if (v0.isInt32() && v1.isInt32() && WJ_ICWARM(icEntry)) {
             int32_t lhs = v1.toInt32();
             int32_t rhs = v0.toInt32();
             VIRTPOP();
@@ -6749,7 +6728,7 @@ PBIResult PortableBaselineInterpret(
         if (HybridICs) {
           Value v0 = VIRTSP(0).asValue();
           Value v1 = VIRTSP(1).asValue();
-          if (v0.isInt32() && v1.isInt32()) {
+          if (v0.isInt32() && v1.isInt32() && WJ_ICWARM(icEntry)) {
             int32_t lhs = v1.toInt32();
             int32_t rhs = v0.toInt32();
             VIRTPOP();
@@ -6764,7 +6743,7 @@ PBIResult PortableBaselineInterpret(
         if (HybridICs) {
           Value v0 = VIRTSP(0).asValue();
           Value v1 = VIRTSP(1).asValue();
-          if (v0.isInt32() && v1.isInt32()) {
+          if (v0.isInt32() && v1.isInt32() && WJ_ICWARM(icEntry)) {
             // Unsigned to avoid undefined behavior on left-shift overflow
             // (see comment in BitLshOperation in Interpreter.cpp).
             uint32_t lhs = uint32_t(v1.toInt32());
@@ -6782,7 +6761,7 @@ PBIResult PortableBaselineInterpret(
         if (HybridICs) {
           Value v0 = VIRTSP(0).asValue();
           Value v1 = VIRTSP(1).asValue();
-          if (v0.isInt32() && v1.isInt32()) {
+          if (v0.isInt32() && v1.isInt32() && WJ_ICWARM(icEntry)) {
             int32_t lhs = v1.toInt32();
             int32_t rhs = v0.toInt32();
             VIRTPOP();
@@ -6798,7 +6777,7 @@ PBIResult PortableBaselineInterpret(
         if (HybridICs) {
           Value v0 = VIRTSP(0).asValue();
           Value v1 = VIRTSP(1).asValue();
-          if (v0.isInt32() && v1.isInt32()) {
+          if (v0.isInt32() && v1.isInt32() && WJ_ICWARM(icEntry)) {
             uint32_t lhs = uint32_t(v1.toInt32());
             int32_t rhs = v0.toInt32();
             VIRTPOP();
@@ -6842,14 +6821,14 @@ PBIResult PortableBaselineInterpret(
         if (HybridICs) {
           Value v0 = VIRTSP(0).asValue();
           Value v1 = VIRTSP(1).asValue();
-          if (v0.isInt32() && v1.isInt32()) {
+          if (v0.isInt32() && v1.isInt32() && WJ_ICWARM(icEntry)) {
             bool result = v0.toInt32() == v1.toInt32();
             VIRTPOP();
             VIRTSPWRITE(0, StackVal(BooleanValue(result)));
             NEXT_IC();
             END_OP(Eq);
           }
-          if (v0.isNumber() && v1.isNumber()) {
+          if (v0.isNumber() && v1.isNumber() && WJ_ICWARM(icEntry)) {
             double lhs = v1.toNumber();
             double rhs = v0.toNumber();
             bool result = lhs == rhs;
@@ -6858,7 +6837,7 @@ PBIResult PortableBaselineInterpret(
             NEXT_IC();
             END_OP(Eq);
           }
-          if (v0.isNumber() && v1.isNumber()) {
+          if (v0.isNumber() && v1.isNumber() && WJ_ICWARM(icEntry)) {
             bool result = v0.toNumber() == v1.toNumber();
             VIRTPOP();
             VIRTSPWRITE(0, StackVal(BooleanValue(result)));
@@ -6873,14 +6852,14 @@ PBIResult PortableBaselineInterpret(
         if (HybridICs) {
           Value v0 = VIRTSP(0).asValue();
           Value v1 = VIRTSP(1).asValue();
-          if (v0.isInt32() && v1.isInt32()) {
+          if (v0.isInt32() && v1.isInt32() && WJ_ICWARM(icEntry)) {
             bool result = v0.toInt32() != v1.toInt32();
             VIRTPOP();
             VIRTSPWRITE(0, StackVal(BooleanValue(result)));
             NEXT_IC();
             END_OP(Ne);
           }
-          if (v0.isNumber() && v1.isNumber()) {
+          if (v0.isNumber() && v1.isNumber() && WJ_ICWARM(icEntry)) {
             double lhs = v1.toNumber();
             double rhs = v0.toNumber();
             bool result = lhs != rhs;
@@ -6889,7 +6868,7 @@ PBIResult PortableBaselineInterpret(
             NEXT_IC();
             END_OP(Ne);
           }
-          if (v0.isNumber() && v1.isNumber()) {
+          if (v0.isNumber() && v1.isNumber() && WJ_ICWARM(icEntry)) {
             bool result = v0.toNumber() != v1.toNumber();
             VIRTPOP();
             VIRTSPWRITE(0, StackVal(BooleanValue(result)));
@@ -6904,14 +6883,14 @@ PBIResult PortableBaselineInterpret(
         if (HybridICs) {
           Value v0 = VIRTSP(0).asValue();
           Value v1 = VIRTSP(1).asValue();
-          if (v0.isInt32() && v1.isInt32()) {
+          if (v0.isInt32() && v1.isInt32() && WJ_ICWARM(icEntry)) {
             bool result = v1.toInt32() < v0.toInt32();
             VIRTPOP();
             VIRTSPWRITE(0, StackVal(BooleanValue(result)));
             NEXT_IC();
             END_OP(Lt);
           }
-          if (v0.isNumber() && v1.isNumber()) {
+          if (v0.isNumber() && v1.isNumber() && WJ_ICWARM(icEntry)) {
             double lhs = v1.toNumber();
             double rhs = v0.toNumber();
             bool result = lhs < rhs;
@@ -6930,14 +6909,14 @@ PBIResult PortableBaselineInterpret(
         if (HybridICs) {
           Value v0 = VIRTSP(0).asValue();
           Value v1 = VIRTSP(1).asValue();
-          if (v0.isInt32() && v1.isInt32()) {
+          if (v0.isInt32() && v1.isInt32() && WJ_ICWARM(icEntry)) {
             bool result = v1.toInt32() <= v0.toInt32();
             VIRTPOP();
             VIRTSPWRITE(0, StackVal(BooleanValue(result)));
             NEXT_IC();
             END_OP(Le);
           }
-          if (v0.isNumber() && v1.isNumber()) {
+          if (v0.isNumber() && v1.isNumber() && WJ_ICWARM(icEntry)) {
             double lhs = v1.toNumber();
             double rhs = v0.toNumber();
             bool result = lhs <= rhs;
@@ -6956,14 +6935,14 @@ PBIResult PortableBaselineInterpret(
         if (HybridICs) {
           Value v0 = VIRTSP(0).asValue();
           Value v1 = VIRTSP(1).asValue();
-          if (v0.isInt32() && v1.isInt32()) {
+          if (v0.isInt32() && v1.isInt32() && WJ_ICWARM(icEntry)) {
             bool result = v1.toInt32() > v0.toInt32();
             VIRTPOP();
             VIRTSPWRITE(0, StackVal(BooleanValue(result)));
             NEXT_IC();
             END_OP(Gt);
           }
-          if (v0.isNumber() && v1.isNumber()) {
+          if (v0.isNumber() && v1.isNumber() && WJ_ICWARM(icEntry)) {
             double lhs = v1.toNumber();
             double rhs = v0.toNumber();
             bool result = lhs > rhs;
@@ -6982,14 +6961,14 @@ PBIResult PortableBaselineInterpret(
         if (HybridICs) {
           Value v0 = VIRTSP(0).asValue();
           Value v1 = VIRTSP(1).asValue();
-          if (v0.isInt32() && v1.isInt32()) {
+          if (v0.isInt32() && v1.isInt32() && WJ_ICWARM(icEntry)) {
             bool result = v1.toInt32() >= v0.toInt32();
             VIRTPOP();
             VIRTSPWRITE(0, StackVal(BooleanValue(result)));
             NEXT_IC();
             END_OP(Ge);
           }
-          if (v0.isNumber() && v1.isNumber()) {
+          if (v0.isNumber() && v1.isNumber() && WJ_ICWARM(icEntry)) {
             double lhs = v1.toNumber();
             double rhs = v0.toNumber();
             bool result = lhs >= rhs;
@@ -7897,6 +7876,18 @@ PBIResult PortableBaselineInterpret(
               TRACE_PRINTF("missed fastpath: routed to wasm-jit via IC\n");
               break;
             }
+            // Experimental (GECKO_WJ_COLDCALL): during the caller's warm-up
+            // window, route calls through the IC so each call-site IC accumulates
+            // entered-count for trial inlining. Gated off by default (it slows
+            // warmup and inlining doesn't yet fire).
+            {
+              static int sWJCallIC = -1;
+              if (sWJCallIC < 0) sWJCallIC = getenv("GECKO_WJ_COLDCALL") ? 1 : 0;
+              if (sWJCallIC && !constructing &&
+                  frame->script()->getWarmUpCount() < 4096) {
+                break;
+              }
+            }
 #endif
 
             // Fast-path: function, interpreted, has JitScript, same realm, no
@@ -8364,6 +8355,22 @@ PBIResult PortableBaselineInterpret(
         // heavily) accumulates warm-up and gets observed for compilation -- otherwise a
         // call-count-only gate leaves the hottest function stuck in the interpreter.
         frame->script()->incWarmUpCounter();
+        // Experimental (GECKO_WJ_COLDCALL): drive trial inlining like production's
+        // baseline warmup hook so WarpBuilder could inline dispatch. Off by
+        // default -- it does not yet inline under PBL (timing/IC-population), so
+        // it only adds warmup cost; kept gated for future work.
+        {
+          static int sWJTI = -1;
+          if (sWJTI < 0) sWJTI = getenv("GECKO_WJ_COLDCALL") ? 1 : 0;
+          uint32_t wc = frame->script()->getWarmUpCount();
+          if (sWJTI && wc && (wc % 256) == 0 && wc <= 256 * 12 &&
+              frame->script()->hasJitScript()) {
+            PUSH_EXIT_FRAME();
+            if (!jit::DoTrialInlining(cx, frame)) {
+              GOTO_ERROR();
+            }
+          }
+        }
 #endif
         COUNT_COVERAGE_PC(pc);
         END_OP(LoopHead);
@@ -9446,7 +9453,8 @@ bool PortableBaselineTrampoline(JSContext* cx, size_t argc, Value* argv,
 bool WasmJitResumeViaPBL(JSContext* cx, JSScript* script, uint64_t thisBits,
                          const Value* args, uint32_t argc, JSObject* envChain,
                          const uint64_t* osrLocals, uint32_t nLocals,
-                         uint32_t pcOff, uint64_t* retBits) {
+                         uint32_t pcOff, uint64_t* retBits,
+                         const uint64_t* osrStack, uint32_t osrStackDepth) {
   JSFunction* fun = script->function();
   if (!fun) return false;
   // Enter the function's realm: the resumed frame's realm must equal cx->realm() (the normal
@@ -9488,8 +9496,7 @@ bool WasmJitResumeViaPBL(JSContext* cx, JSScript* script, uint64_t thisBits,
   Value result;
   PBIResult ret = PortableBaselineInterpret<false, kHybridICsInterp>(
       cx, state, stack, sp, envChain, &result, pc, isd, nullptr, nullptr,
-      nullptr, PBIResult::Ok, osrLocals, nLocals);
-  fprintf(stderr, "[resume] post-PBL ret=%d\n", int(ret)); fflush(stderr);
+      nullptr, PBIResult::Ok, osrLocals, nLocals, osrStack, osrStackDepth);
   if (ret == PBIResult::Error || ret == PBIResult::UnwindError) return false;
   *retBits = result.asRawBits();
   return true;

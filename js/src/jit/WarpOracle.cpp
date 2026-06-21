@@ -1029,14 +1029,29 @@ AbortReasonOr<Ok> WarpScriptOracle::maybeInlineIC(WarpOpSnapshotList& snapshots,
             fallbackStub->enteredCount(), CodeName(loc.getOp()),
             script_->filename(), line, column.oneOriginValue());
 
+    if (getenv("GECKO_WJ_COLDDIAG2")) {
+      fprintf(stderr, "[wj-cold2] %s:%u op=%s depth=%u scriptWarmup=%u fbEntered=%u\n",
+              script_->filename() ? script_->filename() : "?",
+              unsigned(script_->lineno()), CodeName(loc.getOp()),
+              unsigned(icScript_->depth()),
+              unsigned(script_->jitScript()->warmUpCount()),
+              unsigned(fallbackStub->enteredCount()));
+    }
     // If the fallback stub was used but there's no optimized stub, use an IC.
     if (fallbackStub->enteredCount() != 0) {
       return Ok();
     }
 
-    // Cold IC. Bailout to collect information.
-    if (!AddOpSnapshot<WarpBailout>(alloc_, snapshots, offset)) {
-      return abort(AbortReason::Alloc);
+    // Cold IC. Normally bail out so Baseline can collect information. But under
+    // the portable baseline interpreter the scripted-call fast path bypasses the
+    // call IC, so a call IC stays cold forever -- bailing would make every
+    // scripted call (e.g. richards' dispatch) uncompilable. For invoke ops skip
+    // the bailout and let WarpBuilder emit a generic call (always correct).
+    static int wjColdCall = getenv("GECKO_WJ_COLDCALL") ? 1 : 0;
+    if (!(loc.isInvokeOp() && wjColdCall)) {
+      if (!AddOpSnapshot<WarpBailout>(alloc_, snapshots, offset)) {
+        return abort(AbortReason::Alloc);
+      }
     }
     return Ok();
   }
@@ -1347,7 +1362,10 @@ AbortReasonOr<bool> WarpScriptOracle::maybeInlineCall(
   // We can speculatively inline scripts while they're in blinterp,
   // but by the time we actually Ion-compile the outer script, the
   // callee should have at least reached baseline.
-  if (!targetScript->hasBaselineScript()) {
+  // Under JS_CODEGEN_NONE (the JS->wasm JIT) there is no baseline JIT -- the
+  // portable baseline interpreter populates the ICScript instead -- so this
+  // check would block all inlining. Bypass it for our path.
+  if (!targetScript->hasBaselineScript() && !getenv("GECKO_WJ_COLDCALL")) {
     return false;
   }
 
@@ -1357,9 +1375,13 @@ AbortReasonOr<bool> WarpScriptOracle::maybeInlineCall(
                                      TrialInliningState::MonomorphicInlined);
 
   ICScript* icScript = nullptr;
-  if (isTrialInlined) {
+  if (isTrialInlined && !getenv("GECKO_WJ_COLDCALL")) {
     icScript = inlineData->icScript;
   } else {
+    // Under the JS->wasm JIT (PBL): the trial-inlined ICScript is never executed
+    // (PBL only runs the standalone callee), so its ICs are cold and the inlined
+    // body would bail. Use the callee's warm standalone ICScript instead -- same
+    // structure (the inline one is a clone of it), but populated.
     JitScript* jitScript = targetScript->jitScript();
     icScript = jitScript->icScript();
   }

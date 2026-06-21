@@ -3623,6 +3623,12 @@ bool WarpBuilder::buildIC(BytecodeLocation loc, CacheKind kind,
 bool WarpBuilder::buildBailoutForColdIC(BytecodeLocation loc, CacheKind kind) {
   MOZ_ASSERT(loc.opHasIC());
 
+  if (getenv("GECKO_WJ_COLDDIAG")) {
+    fprintf(stderr, "[wj-cold] %s:%u op=%s cacheKind=%d\n",
+            script_->filename() ? script_->filename() : "?",
+            unsigned(script_->lineno()), CodeName(loc.getOp()), int(kind));
+  }
+
   MBail* bail = MBail::New(alloc(), BailoutKind::FirstExecution);
   current->add(bail);
   current->setAlwaysBails();

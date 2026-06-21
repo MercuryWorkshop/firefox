@@ -29,6 +29,12 @@ bool DoTrialInlining(JSContext* cx, BaselineFrame* frame) {
   RootedScript script(cx, frame->script());
   ICScript* icScript = frame->icScript();
   bool isRecursive = icScript->depth() > 0;
+  if (getenv("GECKO_WJ_TIDIAG")) {
+    fprintf(stderr, "[wj-ti-enter] %s:%u canIon=%d nICEntries=%u depth=%u\n",
+            script->filename() ? script->filename() : "?",
+            unsigned(script->lineno()), script->canIonCompile() ? 1 : 0,
+            unsigned(icScript->numICEntries()), unsigned(icScript->depth()));
+  }
 
 #ifdef JS_CACHEIR_SPEW
   if (cx->spewer().enabled(cx, script, SpewChannel::CacheIRHealthReport)) {
@@ -61,7 +67,7 @@ bool DoTrialInlining(JSContext* cx, BaselineFrame* frame) {
   }
 #endif
 
-  if (!script->canIonCompile()) {
+  if (!script->canIonCompile() && !getenv("GECKO_WJ_COLDCALL")) {
     return true;
   }
 
@@ -697,6 +703,17 @@ TrialInliningDecision TrialInliner::getInliningDecision(JSScript* targetScript,
   }
 #endif
 
+  bool wjD = getenv("GECKO_WJ_TIDIAG") != nullptr;
+  if (wjD) {
+    fprintf(stderr,
+            "[wj-dec] target=%s:%u entryCnt=%u thr=%u len=%u small=%d canInline=%d\n",
+            targetScript->filename() ? targetScript->filename() : "?",
+            unsigned(targetScript->lineno()), unsigned(stub->enteredCount()),
+            unsigned(JitOptions.inliningEntryThreshold),
+            unsigned(targetScript->length()),
+            JitOptions.isSmallFunction(targetScript) ? 1 : 0,
+            canInline(cx(), targetScript, script_, loc) ? 1 : 0);
+  }
   if (!canInline(cx(), targetScript, script_, loc)) {
     return TrialInliningDecision::NoInline;
   }
@@ -745,9 +762,15 @@ TrialInliningDecision TrialInliner::getInliningDecision(JSScript* targetScript,
 
   // Decide between trial inlining or monomorphic inlining.
   if (!ShouldUseMonomorphicInlining(targetScript)) {
+    if (wjD) fprintf(stderr, "[wj-dec2] target=%s:%u DECIDE=Inline\n",
+                     targetScript->filename() ? targetScript->filename() : "?",
+                     unsigned(targetScript->lineno()));
     return TrialInliningDecision::Inline;
   }
 
+  if (wjD) fprintf(stderr, "[wj-dec2] target=%s:%u DECIDE=Mono\n",
+                   targetScript->filename() ? targetScript->filename() : "?",
+                   unsigned(targetScript->lineno()));
   JitSpewIndent spewIndent(JitSpew_WarpTrialInlining);
   JitSpew(JitSpew_WarpTrialInlining, "SUCCESS: Inlined monomorphically");
   return TrialInliningDecision::MonomorphicInline;
@@ -808,7 +831,14 @@ ICScript* TrialInliner::createInlinedICScript(JSScript* targetScript,
 
 bool TrialInliner::maybeInlineCall(ICEntry& entry, ICFallbackStub* fallback,
                                    BytecodeLocation loc) {
+  bool wjDiag = getenv("GECKO_WJ_TIDIAG") != nullptr;
   ICCacheIRStub* stub = maybeSingleStub(entry);
+  if (wjDiag) {
+    fprintf(stderr, "[wj-ti] %s:%u op=%s singleStub=%d nOpt=%u\n",
+            script_->filename() ? script_->filename() : "?",
+            unsigned(script_->lineno()), CodeName(loc.getOp()), stub ? 1 : 0,
+            unsigned(fallback->numOptimizedStubs()));
+  }
   if (!stub) {
 #ifdef JS_JITSPEW
     if (fallback->numOptimizedStubs() > 1) {

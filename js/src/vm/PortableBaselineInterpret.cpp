@@ -115,6 +115,19 @@ using namespace js::jit;
 // constant, but may become configurable in the future.
 static const bool kHybridICsInterp = PBL_HYBRID_ICS_DEFAULT;
 
+// JS->wasm JIT deopt resume: the correct runtime enclosing environment for the
+// frame being resumed (set by WasmJitResumeViaPBL right before re-entering PBL,
+// consumed by the function prologue). Avoids the canonical
+// script->function()->environment() being used for a re-instantiated closure.
+// Single-threaded shell; cleared on consume so nested frames don't inherit it.
+static JSObject* gPBLResumeEnclosingEnv = nullptr;
+// When true, the resumed frame was pushed with the CAPTURED deopt-time frame env
+// (gWJResumeEnvPtr -- the actual env at the deopt, including any own CallObject
+// the JIT already created/populated). The prologue must KEEP it and NOT re-run
+// InitFunctionEnvironmentObjects (which would discard live mid-function env state
+// -> navier wrong values). Cleared on consume.
+static bool gPBLResumeKeepEnv = false;
+
 // Whether to compile interpreter dispatch loops using computed gotos
 // or direct switches.
 #if !defined(__wasi__) && !defined(TRACE_INTERP)
@@ -6116,14 +6129,33 @@ PBIResult PortableBaselineInterpret(
 
   if (CalleeTokenIsFunction(frame->calleeToken())) {
     JSFunction* func = CalleeTokenToFunction(frame->calleeToken());
-    frame->setEnvironmentChain(func->environment());
-    if (func->needsFunctionEnvironmentObjects()) {
-      PUSH_EXIT_FRAME();
-      if (!js::InitFunctionEnvironmentObjects(cx, frame)) {
-        GOTO_ERROR();
+    // JS->wasm JIT deopt resume: the calleeToken is the CANONICAL script
+    // function, whose environment() is wrong/null for a re-instantiated closure.
+    // When the resume supplies the correct runtime enclosing env, use it as the
+    // base (then InitFunctionEnvironmentObjects builds the own CallObject from it,
+    // exactly like a normal call); otherwise fall back to func->environment().
+    JSObject* resumeEnclosingEnv = gPBLResumeEnclosingEnv;
+    bool keepEnv = gPBLResumeKeepEnv;
+    gPBLResumeEnclosingEnv = nullptr;  // consume: only the resumed frame uses it
+    gPBLResumeKeepEnv = false;
+    if (keepEnv) {
+      // Resume that captured the deopt-time frame env (pushed as envChain): keep
+      // it exactly -- it already holds the function's own CallObject (if any) with
+      // the live mid-function state. Re-creating would discard that state.
+    } else {
+      if (resumeEnclosingEnv) {
+        frame->setEnvironmentChain(resumeEnclosingEnv);
+      } else {
+        frame->setEnvironmentChain(func->environment());
       }
-      TRACE_PRINTF("callee is func %p; created environment object: %p\n", func,
-                   frame->environmentChain());
+      if (func->needsFunctionEnvironmentObjects()) {
+        PUSH_EXIT_FRAME();
+        if (!js::InitFunctionEnvironmentObjects(cx, frame)) {
+          GOTO_ERROR();
+        }
+        TRACE_PRINTF("callee is func %p; created environment object: %p\n", func,
+                     frame->environmentChain());
+      }
     }
   }
 
@@ -9454,7 +9486,8 @@ bool WasmJitResumeViaPBL(JSContext* cx, JSScript* script, uint64_t thisBits,
                          const Value* args, uint32_t argc, JSObject* envChain,
                          const uint64_t* osrLocals, uint32_t nLocals,
                          uint32_t pcOff, uint64_t* retBits,
-                         const uint64_t* osrStack, uint32_t osrStackDepth) {
+                         const uint64_t* osrStack, uint32_t osrStackDepth,
+                         JSObject* enclosingEnv, bool keepFrameEnv) {
   JSFunction* fun = script->function();
   if (!fun) return false;
   // Enter the function's realm: the resumed frame's realm must equal cx->realm() (the normal
@@ -9494,9 +9527,13 @@ bool WasmJitResumeViaPBL(JSContext* cx, JSScript* script, uint64_t thisBits,
   jsbytecode* pc = script->code() + pcOff;
   ImmutableScriptData* isd = script->immutableScriptData();
   Value result;
+  gPBLResumeEnclosingEnv = enclosingEnv;
+  gPBLResumeKeepEnv = keepFrameEnv;
   PBIResult ret = PortableBaselineInterpret<false, kHybridICsInterp>(
       cx, state, stack, sp, envChain, &result, pc, isd, nullptr, nullptr,
       nullptr, PBIResult::Ok, osrLocals, nLocals, osrStack, osrStackDepth);
+  gPBLResumeEnclosingEnv = nullptr;
+  gPBLResumeKeepEnv = false;
   if (ret == PBIResult::Error || ret == PBIResult::UnwindError) return false;
   *retBits = result.asRawBits();
   return true;

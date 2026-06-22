@@ -44,6 +44,11 @@ bool WJEmitTrampoline(Encoder& e);
 // Returns 0 if the pool is full (caller bails the compile).
 uintptr_t WJInternConstant(uint64_t valueBits);
 
+// Intern a Shape* for a GuardShape: returns the byte address of a GC-traced pool
+// slot holding the (relocatable) shape pointer. The emitted guard loads the slot
+// at runtime so a GC-moved shape doesn't cause a permanent deopt. 0 if pool full.
+uintptr_t WJInternShape(uintptr_t shapeBits);
+
 // wjhelp() helper kinds (the f64 first argument to the imported "m"."help").
 enum WJHelpKind : int {
   WJH_RESUME = 1,   // deopt: rebuild a PBL frame from gWJResume* and run from pc
@@ -61,23 +66,65 @@ enum WJHelpKind : int {
   WJH_CREATETHIS = 10,    // scratch[0]=callee, scratch[1]=newTarget -> result=this
   WJH_CONSTRUCT = 11,     // gWJCallCallee + scratch[0..argc-1] args + this@kWJThisSlot
                           // + gWJConstructNewTarget -> InternalConstructWithProvidedThis
+  WJH_POSTBARRIER = 12,   // gWJHelpObj = container -> jit::PostWriteBarrier (store buffer)
+  WJH_PREBARRIER = 13,    // gWJHelpVal = old value -> gc::ValuePreWriteBarrier (incremental mark)
 };
 
+// Compile-time-baked address of the current zone's needs-marking-barrier flag
+// (zone->addressOfNeedsMarkingBarrier()). The emitted pre-write-barrier fast path
+// loads + tests this; it's 0 except during an incremental GC slice. Set by
+// WJWarpCompile. Single-zone shell, so one address suffices.
+extern uintptr_t gWJMarkBarrierAddr;
+
+// Boxed ObjectValue bits of the realm's global lexical environment, refreshed
+// each WJWarpCompile. MFunctionEnvironment bakes this for top-level-scoped
+// functions (whose canonical JSFunction has no compile-time environment).
+extern uint64_t gWJGlobalLexEnvVal;
+
+// Raw pointer to the currently-executing JIT function's environment object. Set
+// (to the runtime closure's environment) right before EVERY JIT invocation --
+// the entry path (WasmJitRunCall's envChain) and the fast inter-JIT call_indirect
+// (callee->environment()). MFunctionEnvironment loads this at function entry,
+// giving the CORRECT runtime environment even for closures (unlike a baked one).
+extern uint32_t gWJCurrentEnv;
+
 // Resume state buffer (WASMJIT_REARCH_PLAN.md §4.1). On a guard miss the emitted
-// code boxes the MResumePoint's live values [this, args, locals, stack] into
-// gWJResumeVals, sets gWJResumePc / gWJResumeStackDepth, and calls wjhelp(WJH_RESUME),
-// which reconstructs a PBL frame and continues. Traced by WJTraceRoots.
+// code boxes the resume point's live values [this, args, locals, stack] into
+// gWJResumeVals and calls wjhelp(WJH_RESUME), which reconstructs PBL frame(s) and
+// continues. Traced by WJTraceRoots.
+//
+// MULTI-FRAME (inline bailout): a deopt inside an INLINED callee must rebuild the
+// whole inline frame chain. gWJResumeNFrames is the chain length; index 0 is the
+// INNERMOST (deopt) frame, the last is the OUTERMOST (compiled function). Each
+// frame's per-frame state is in the arrays below at index i; its boxed values
+// start at gWJResumeVals[gWJResumeValsOff[i]] laid out [this, args.., locals..,
+// stack..]. WJH_RESUME runs them innermost->outermost, threading each frame's
+// return into the next outer frame's call-result stack slot. nFrames==1 is the
+// ordinary (non-inlined) single-frame resume.
+static constexpr uint32_t kWJMaxResumeFrames = 16;
 extern uint64_t gWJResumeVals[];
-extern uint32_t gWJResumePc;
-extern uint32_t gWJResumeStackDepth;
-// Self-contained resume context (set by the emitted deopt code, so a function
-// resumes correctly regardless of how it was entered -- RunCall, fast-call, or a
-// pure wasm->wasm call_indirect). Script ptr is baked; env is the resume point's
-// environment-chain operand; nargs/nlocals are compile-time constants.
-extern uint32_t gWJResumeScriptPtr;  // JSScript* as i32 (wasm32)
-extern uint32_t gWJResumeEnvPtr;     // JSObject* env chain as i32
-extern uint32_t gWJResumeNArgs;
-extern uint32_t gWJResumeNLocals;
+extern uint32_t gWJResumeNFrames;
+extern uint32_t gWJResumePc[];          // resume bytecode offset, per frame
+extern uint32_t gWJResumeStackDepth[];  // expr-stack depth, per frame
+extern uint32_t gWJResumeScriptPtr[];   // JSScript* (i32), per frame
+extern uint32_t gWJResumeEnvPtr[];      // JSObject* env chain (i32), per frame
+// The function's ENCLOSING (captured) environment for the resumed frame -- i.e.
+// the closure's environment() = gWJCurrentEnv at entry (snapshotted to envLocal).
+// WJH_RESUME passes it so the PBL prologue sets up the frame env from the CORRECT
+// runtime enclosing scope, not the CANONICAL script->function()->environment()
+// (wrong/null for a re-instantiated closure -> navier/earley crash). Per frame; 0
+// = unknown (PBL falls back to func->environment()). Only the outermost frame
+// (this compiled fn) has it; inlined frames keep 0.
+extern uint32_t gWJResumeEnclosingEnv[];
+// Debug (GECKO_WJ_DEOPTHIST): per-MIR-op deopt counter. The emitted deopt path
+// increments gWJDeoptByOp[curOp]; WJH_RESUME periodically prints the histogram so
+// we can see WHICH guard kind deopts most (MIRDUMP is unreliable for nondeterm-
+// inistically-compiled fns like navier's). Indexed by MDefinition::Opcode.
+static constexpr uint32_t kWJNumOps = 700;
+extern uint32_t gWJDeoptByOp[];
+extern uint32_t gWJResumeNArgs[];       // per frame
+extern uint32_t gWJResumeNLocals[];     // per frame
+extern uint32_t gWJResumeValsOff[];     // start index into gWJResumeVals, per frame
 // Call boundary: callee + argc for wjhelp(WJH_CALL).
 extern uint64_t gWJCallCallee;
 extern uint32_t gWJCallArgc;
@@ -112,7 +159,7 @@ uint32_t WJAllocCallSite();
 // gWJRootSP, makes the call, restores gWJRootSP, then reloads the (GC-updated)
 // values. WJTraceRoots traces [0, gWJRootSP). A stack discipline handles nested
 // JIT->JIT calls. Defined in WasmJitRuntime.cpp.
-static constexpr uint32_t kWJCallRootsSize = 262144;
+static constexpr uint32_t kWJCallRootsSize = 1048576;
 extern uint64_t gWJCallRoots[];
 extern uint32_t gWJRootSP;
 

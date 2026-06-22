@@ -176,11 +176,15 @@ static int AssembleAndInstall(MIRGenerator& mirGen, MIRGraph& graph,
   e.patchVarU32(trampOff, uint32_t(e.currentOffset() - trampStart));
   e.finishSection(s);
 
-  if (getenv("GECKO_WJWARP_DUMP")) {
-    if (FILE* f = fopen("/tmp/wbjit.wasm", "wb")) {
+  if (getenv("GECKO_WJWARP_DUMP") || getenv("GECKO_WJ_WASMDUMP")) {
+    JSScript* dscript = mirGen.outerInfo().script();
+    char path[128];
+    snprintf(path, sizeof(path), "/tmp/wbjit_%u.wasm",
+             dscript ? dscript->lineno() : 0);
+    if (FILE* f = fopen(path, "wb")) {
       fwrite(out.begin(), 1, out.length(), f);
       fclose(f);
-      fprintf(stderr, "[wb-compile] wrote /tmp/wbjit.wasm (%zu bytes)\n",
+      fprintf(stderr, "[wb-compile] wrote %s (%zu bytes)\n", path,
               size_t(out.length()));
     }
   }
@@ -202,9 +206,22 @@ static int AssembleAndInstall(MIRGenerator& mirGen, MIRGraph& graph,
 int WJWarpCompile(JSContext* cx, JSScript* script, uint32_t* nargsOut,
                   uint32_t* nlocalsOut, int* tblSlotOut) {
   bool dump = getenv("GECKO_WJWARP_DUMP");
-  // Bisection: GECKO_WJ_SKIPLINE=N bails the function defined at line N.
+  // Bake the zone's needs-marking-barrier flag address for the emitted pre-write
+  // barrier fast path (single-zone shell -> one stable address).
+  js::wasm::gWJMarkBarrierAddr =
+      uintptr_t(script->zone()->addressOfNeedsMarkingBarrier());
+  js::wasm::gWJGlobalLexEnvVal =
+      JS::ObjectValue(cx->global()->lexicalEnvironment()).asRawBits();
+  // Bisection: GECKO_WJ_SKIPLINE=N[,M,...] bails the functions at those lines.
   if (const char* sl = getenv("GECKO_WJ_SKIPLINE")) {
-    if (uint32_t(atoi(sl)) == uint32_t(script->lineno())) return -1;
+    uint32_t ln = uint32_t(script->lineno());
+    const char* p = sl;
+    while (*p) {
+      uint32_t v = uint32_t(atoi(p));
+      if (v == ln) return -1;
+      while (*p && *p != ',') p++;
+      if (*p == ',') p++;
+    }
   }
   RootedScript scriptRoot(cx, script);
 

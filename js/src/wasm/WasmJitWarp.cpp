@@ -166,6 +166,10 @@ static int AssembleAndInstall(MIRGenerator& mirGen, MIRGraph& graph,
   size_t bodyStart = e.currentOffset();
   if (!WJEmitBody(mirGen, graph, nargs, /*useThis=*/true, snapshot, e)) {
     if (dump) fprintf(stderr, "[wb-compile] WJEmitBody bailed (unsupported node)\n");
+    static int cdbg = getenv("GECKO_WJ_CDBG") ? 1 : 0;
+    if (cdbg)
+      fprintf(stderr, "[wj-cdbg] BAIL line=%u reason=%s\n",
+              js::wasm::gWJBailLine, js::wasm::gWJBailReason);
     return -1;
   }
   e.patchVarU32(bodyOff, uint32_t(e.currentOffset() - bodyStart));
@@ -195,7 +199,14 @@ static int AssembleAndInstall(MIRGenerator& mirGen, MIRGraph& graph,
   if (wasmhost_instantiate(handle, importIds, 3) != 0) return -1;
   // Register this function in the shared table at a dense slot, so other JIT'd
   // functions can call_indirect it. -1 if the table is full (slow path only).
-  int slot = (gWJNextTblSlot < kWJTableSize) ? gWJNextTblSlot++ : -1;
+  // REUSE an existing slot (*tblSlotOut >= 0 on a deopt-storm RECOMPILE): callers'
+  // polymorphic call ICs cache (funPtr -> tblSlot), and the funPtr is unchanged
+  // across a recompile, so the new module MUST take over the same slot -- else the
+  // cached ICs call_indirect the stale slot (old/garbage module -> deltablue wrong
+  // results). On the first compile *tblSlotOut is -1 -> allocate a fresh slot.
+  int slot = (*tblSlotOut >= 0)
+                 ? *tblSlotOut
+                 : ((gWJNextTblSlot < kWJTableSize) ? gWJNextTblSlot++ : -1);
   if (slot >= 0) (void)wasmhost_jit_table_set(handle, slot);
   *tblSlotOut = slot;
   return handle;
@@ -212,6 +223,17 @@ int WJWarpCompile(JSContext* cx, JSScript* script, uint32_t* nargsOut,
       uintptr_t(script->zone()->addressOfNeedsMarkingBarrier());
   js::wasm::gWJGlobalLexEnvVal =
       JS::ObjectValue(cx->global()->lexicalEnvironment()).asRawBits();
+  // Inline nursery bump-allocation params (for the GECKO_WJ_INLINEALLOC path):
+  // the zone's nursery position_ address (loaded/bumped at runtime) and the
+  // catch-all-alloc-site object cell header word. Stable per zone.
+  {
+    jit::CompileZone* cz = jit::CompileRealm::get(cx->realm())->zone();
+    js::wasm::gWJNurseryPosAddr = uintptr_t(cz->addressOfNurseryPosition());
+    js::gc::AllocSite* site = cz->catchAllAllocSite(
+        JS::TraceKind::Object, js::gc::CatchAllAllocSite::Optimized);
+    js::wasm::gWJObjHeaderWord =
+        js::gc::NurseryCellHeader::MakeValue(site, JS::TraceKind::Object);
+  }
   // Bisection: GECKO_WJ_SKIPLINE=N[,M,...] bails the functions at those lines.
   if (const char* sl = getenv("GECKO_WJ_SKIPLINE")) {
     uint32_t ln = uint32_t(script->lineno());
@@ -292,7 +314,8 @@ int WJWarpCompile(JSContext* cx, JSScript* script, uint32_t* nargsOut,
   }
 
   uint32_t nargs = script->function() ? script->function()->nargs() : 0;
-  *tblSlotOut = -1;
+  // NB: *tblSlotOut is IN/OUT -- a >=0 value on entry is a preferred slot to REUSE
+  // (deopt-storm recompile keeps the same slot so cached call ICs stay valid).
   int handle = AssembleAndInstall(mirGen, graph, nargs, snapshot, tblSlotOut, dump);
   if (handle < 0) {
     if (dump) fprintf(stderr, "[wb-compile] assemble/host-compile failed\n");

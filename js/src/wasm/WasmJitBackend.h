@@ -68,13 +68,36 @@ enum WJHelpKind : int {
                           // + gWJConstructNewTarget -> InternalConstructWithProvidedThis
   WJH_POSTBARRIER = 12,   // gWJHelpObj = container -> jit::PostWriteBarrier (store buffer)
   WJH_PREBARRIER = 13,    // gWJHelpVal = old value -> gc::ValuePreWriteBarrier (incremental mark)
+  WJH_PROPIC = 14,        // prop-IC miss: scratch[0]=obj, site arg -> get gWJPropKey[site],
+                          // fill gWJPropShape/Off[site], result -> scratch[kWJResultSlot]
+  WJH_SETPROPIC = 15,     // set-prop-IC miss: scratch[0]=obj, scratch[1]=value, site arg
+                          // -> fill gWJPropShape/Off[site] (writable own data prop) + store
+  WJH_NEWPLAIN = 16,      // gWJNewShapeSlot(pool idx)/gWJNewAux(allocKind)/gWJNewHeap
+                          // -> NewPlainObjectOptimizedFallback; result -> kWJResultSlot
+  WJH_NEWARROBJ = 17,     // gWJNewShapeSlot/gWJNewAux(length)/gWJNewHeap
+                          // -> NewArrayObjectOptimizedFallback
+  WJH_NEWARR = 18,        // gWJNewAux(length) -> NewArrayOperation (NewArray/DynamicLength)
 };
+
+// Allocation-helper staging (non-GC ints; the shape is in the traced shape pool).
+extern uint32_t gWJNewShapeSlot;  // gWJShapePool index of the template shape
+extern uint32_t gWJNewAux;        // allocKind (NewPlainObject) or array length
+extern uint32_t gWJNewHeap;       // gc::Heap (0=Default nursery)
 
 // Compile-time-baked address of the current zone's needs-marking-barrier flag
 // (zone->addressOfNeedsMarkingBarrier()). The emitted pre-write-barrier fast path
 // loads + tests this; it's 0 except during an incremental GC slice. Set by
 // WJWarpCompile. Single-zone shell, so one address suffices.
 extern uintptr_t gWJMarkBarrierAddr;
+
+// Inline nursery bump-allocation params (baked in WJWarpCompile; read by the
+// backend at emit time, emitted as immediates). gWJNurseryPosAddr = address of
+// the zone's nursery position_ (the emitted code loads/bumps/stores it);
+// gWJObjHeaderWord = NurseryCellHeader::MakeValue(catchAllAllocSite, Object) for
+// the cell header. The rest (header size, currentEnd offset, thingSize,
+// emptyObjectSlots/Elements) are compile-time constants the backend computes.
+extern uintptr_t gWJNurseryPosAddr;
+extern uintptr_t gWJObjHeaderWord;
 
 // Boxed ObjectValue bits of the realm's global lexical environment, refreshed
 // each WJWarpCompile. MFunctionEnvironment bakes this for top-level-scoped
@@ -87,6 +110,21 @@ extern uint64_t gWJGlobalLexEnvVal;
 // (callee->environment()). MFunctionEnvironment loads this at function entry,
 // giving the CORRECT runtime environment even for closures (unlike a baked one).
 extern uint32_t gWJCurrentEnv;
+
+// Set by WJEmitBody (reset at entry) to true iff the compiled function contains an
+// alwaysBails block emitted as a deopt-at-entry (a cold/untyped Warp branch). Read
+// by the deopt-storm valve: a storming function WITH an alwaysBails block deopts
+// from that (cold-IC) block, which recompiling reproduces identically -- so it goes
+// straight to PBL (Failed) instead of churning recompiles (deltablue wrong-value/
+// crash). A storming function WITHOUT one (a stale monomorphic guard) still
+// recompiles to specialize (crypto). Single-threaded synchronous compile.
+extern bool gWJHadAlwaysBails;
+
+// Compile bail-reason tracking (GECKO_WJ_CDBG): the most recent reason a function
+// stayed in PBL plus its source line, printed by WJWarpCompile when WJEmitBody
+// returns false. gWJBailReason points to a string literal (no ownership).
+extern const char* gWJBailReason;
+extern uint32_t gWJBailLine;
 
 // Resume state buffer (WASMJIT_REARCH_PLAN.md §4.1). On a guard miss the emitted
 // code boxes the resume point's live values [this, args, locals, stack] into
@@ -152,6 +190,27 @@ extern uint32_t gWJCallFn[];      // cached callee obj ptr (0 = empty)
 extern int32_t gWJCallTblIdx[];   // callee's shared-table index
 // Next unused call-site id (process-global; assigned at compile).
 uint32_t WJAllocCallSite();
+
+// Inline property-load IC (for MegamorphicLoadSlot / named GetPropertyCache of
+// own data properties). Mirrors the call IC: per-site cached (receiver shape,
+// TaggedSlotOffset). The JIT'd code loads obj->shape(), compares to the cached
+// shape; on a hit it loads the slot inline (no C++ hop), on a miss it calls
+// wjhelp(WJH_PROPIC) which does a pure lookup, fills the IC, and returns the
+// value. A Shape is immutable and uniquely determines an own data property's
+// slot, so a shape-identity match is sufficient for correctness; the only hazard
+// is shape-pointer REUSE after a compacting GC, handled by clearing this IC on
+// major-GC marking in WJTraceRoots. Indexed [site * kWJPropWays + way].
+static constexpr uint32_t kWJPropSites = 16384;
+static constexpr uint32_t kWJPropWays = 4;
+extern uint32_t gWJPropShape[];   // cached receiver Shape* (0 = empty)
+extern uint32_t gWJPropOff[];     // cached TaggedSlotOffset bits ((off<<1)|isFixed)
+uint32_t WJAllocPropSite();
+// Per-site baked PropertyKey for the WJH_PROPIC fill helper (the property name).
+extern uint64_t gWJPropKey[];     // jsid raw bits per site
+extern uint8_t gWJPropStrict[];   // per-site strict flag (set-prop fallback)
+// Staging for the prop-IC miss helper: obj (boxed) -> gWJScratch[0]; result in
+// gWJScratch[kWJResultSlot]. site passed as wjhelp's 2nd arg.
+void WJClearPropIC();
 
 // GC-root shadow stack. The value-per-local backend holds object pointers in
 // wasm locals, invisible to the GC. Before a call (which can trigger a moving

@@ -1042,13 +1042,21 @@ AbortReasonOr<Ok> WarpScriptOracle::maybeInlineIC(WarpOpSnapshotList& snapshots,
       return Ok();
     }
 
-    // Cold IC. Normally bail out so Baseline can collect information. But under
-    // the portable baseline interpreter the scripted-call fast path bypasses the
-    // call IC, so a call IC stays cold forever -- bailing would make every
-    // scripted call (e.g. richards' dispatch) uncompilable. For invoke ops skip
-    // the bailout and let WarpBuilder emit a generic call (always correct).
-    static int wjColdCall = getenv("GECKO_WJ_COLDCALL") ? 1 : 0;
-    if (!(loc.isInvokeOp() && wjColdCall)) {
+    // Cold IC (no optimized stub AND the fallback was never entered). In stock
+    // SpiderMonkey this bails to Baseline so it can collect type information and
+    // attach a stub for the next Ion compile. Under the portable baseline
+    // interpreter there is NO Baseline tier and PBL's inline fast paths bypass
+    // the IC fallback entirely, so enteredCount stays 0 forever -- the bailout
+    // never leads to re-specialization, it just permanently strands the function
+    // (or the cold block) in the slow interpreter. That is the opposite of what
+    // we want ("almost never engage PBL"). Instead, emit a GENERIC inline IC
+    // (exactly what the enteredCount != 0 case below does): the op runs in JIT
+    // via its generic CacheIR path, correct for any runtime type. This mirrors
+    // Ion emitting a generic MGetPropertyCache/MCall/MBinaryCache when it has no
+    // specialized type info, rather than refusing to compile. GECKO_WJ_COLDBAIL
+    // restores the stock bail-to-collect behavior for A/B debugging.
+    static int coldBail = getenv("GECKO_WJ_COLDBAIL") ? 1 : 0;
+    if (coldBail) {
       if (!AddOpSnapshot<WarpBailout>(alloc_, snapshots, offset)) {
         return abort(AbortReason::Alloc);
       }

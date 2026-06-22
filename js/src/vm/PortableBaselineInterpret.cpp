@@ -9500,8 +9500,17 @@ bool WasmJitResumeViaPBL(JSContext* cx, JSScript* script, uint64_t thisBits,
   // reached via the js::Interpret -> WasmJitRunCall shortcut (an InterpreterActivation), there
   // is none -> a nursery GC mid-resume mis-traces the interpreter frame (splay crash). Push a
   // JitActivation here iff we are not already in one.
+  // A deopt reached via a FAST wasm->wasm call_indirect is already under a
+  // JitActivation (from the original entry), but the caller/callee wasm frames sit
+  // BETWEEN that activation's exit-FP and the BaselineFrame we push here -- so
+  // reusing it makes a minor GC's TraceJitFrames walk a tangled chain into the wasm
+  // frames and hit a bad value (deltablue AB_ALL crash). Pushing a FRESH activation
+  // makes this deopt frame the clean bottom of a new activation (matching its
+  // CppToJSJit descriptor): TraceJitFrames traces it and stops at the C++ boundary.
+  // GECKO_WJ_REUSEACT reverts to the old reuse-if-present behavior.
+  static int reuseAct = getenv("GECKO_WJ_REUSEACT") ? 1 : 0;
   mozilla::Maybe<js::jit::JitActivation> jitAct;
-  if (!cx->activation() || !cx->activation()->isJit()) {
+  if (!reuseAct || !cx->activation() || !cx->activation()->isJit()) {
     jitAct.emplace(cx);
   }
   // PBL needs IC entries (jitScript). It was pre-created at compile time (WJCompile) in a

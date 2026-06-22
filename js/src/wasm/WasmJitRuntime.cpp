@@ -37,6 +37,7 @@
 
 #include "vm/NativeObject-inl.h"
 #include "vm/Interpreter-inl.h"  // GetElementOperation
+#include "vm/JSObject-inl.h"     // GuessArrayGCKind
 
 #if defined(__EMSCRIPTEN__)
 #  include <emscripten.h>
@@ -92,6 +93,14 @@ uint64_t gWJConstructNewTarget = 0;  // boxed newTarget for constructing calls
 uintptr_t gWJMarkBarrierAddr = 0;  // baked zone needs-marking-barrier flag address
 uint64_t gWJGlobalLexEnvVal = 0;   // boxed global lexical env (for FunctionEnvironment)
 uint32_t gWJCurrentEnv = 0;        // current fn's runtime environment (raw ptr)
+bool gWJHadAlwaysBails = false;    // last compile emitted an alwaysBails deopt block
+const char* gWJBailReason = "unknown";  // why the last WJEmitBody returned false
+uint32_t gWJBailLine = 0;          // source line of the last bailed function
+uint32_t gWJNewShapeSlot = 0;      // alloc helper: shape pool index
+uint32_t gWJNewAux = 0;            // alloc helper: allocKind or array length
+uint32_t gWJNewHeap = 0;           // alloc helper: gc::Heap
+uintptr_t gWJNurseryPosAddr = 0;   // address of zone nursery position_ (inline alloc)
+uintptr_t gWJObjHeaderWord = 0;    // NurseryCellHeader value for Object cells
 uint32_t gWJHelpObj = 0;        // object ptr for WJH_SETSLOT
 uint32_t gWJHelpSlot = 0;
 uint64_t gWJHelpVal = 0;        // boxed value for WJH_SETSLOT
@@ -101,6 +110,20 @@ static uint32_t gWJNextCallSite = 0;
 uint32_t WJAllocCallSite() {
   if (gWJNextCallSite >= kWJCallSites) return 0;  // site 0 is a safe sentinel
   return gWJNextCallSite++;
+}
+
+// Inline property-load IC (see WasmJitBackend.h).
+uint32_t gWJPropShape[kWJPropSites * kWJPropWays];
+uint32_t gWJPropOff[kWJPropSites * kWJPropWays];
+uint64_t gWJPropKey[kWJPropSites];
+uint8_t gWJPropStrict[kWJPropSites];
+static uint32_t gWJNextPropSite = 1;  // site 0 is a never-filled sentinel
+uint32_t WJAllocPropSite() {
+  if (gWJNextPropSite >= kWJPropSites) return 0;
+  return gWJNextPropSite++;
+}
+void WJClearPropIC() {
+  memset(gWJPropShape, 0, sizeof(gWJPropShape));
 }
 }  // namespace wasm
 }  // namespace js
@@ -170,6 +193,7 @@ struct WJEntry {
   uint32_t jitRuns = 0;  // entries that ran fully in JIT (no deopt)
   uint32_t deopts = 0;   // entries that deopted to PBL (resume)
   uint32_t recompiles = 0;  // deopt-storm-triggered recompiles so far
+  bool hasAlwaysBails = false;  // compiled fn has a cold-IC alwaysBails deopt block
   uint32_t nargs = 0;
   uint32_t nlocals = 0;
   uint32_t observes = 0;
@@ -237,7 +261,10 @@ bool js::wasm::WasmJitObserveCall(JSScript* script) {
   JSContext* cx = js::TlsContext.get();
   if (!cx) return false;
   uint32_t nargs = 0, nlocals = 0;
-  int tblSlot = -1;
+  // Preferred shared-table slot: reuse the prior slot on a deopt-storm recompile
+  // (callers' call ICs cache funPtr->slot; funPtr is unchanged, so the new module
+  // must take over the same slot). -1 (first compile) allocates a fresh one.
+  int tblSlot = e.tblSlot;
   int handle = js::wasm::WJWarpCompile(cx, script, &nargs, &nlocals, &tblSlot);
   if (handle < 0) {
     // Recompile-when-warm: a bail is often a cold IC (Warp emits an unconditional
@@ -254,6 +281,14 @@ bool js::wasm::WasmJitObserveCall(JSScript* script) {
   e.state = WJEntry::State::Compiled;
   e.handle = handle;
   e.tblSlot = tblSlot;
+  e.hasAlwaysBails = js::wasm::gWJHadAlwaysBails;
+  if (getenv("GECKO_WJ_COMPILECNT")) {
+    static uint64_t cc = 0;
+    fprintf(stderr, "[wj-compile] #%llu %s:%u hasAB=%d recomp=%u\n",
+            (unsigned long long)(++cc),
+            script->filename() ? script->filename() : "?",
+            unsigned(script->lineno()), e.hasAlwaysBails, e.recompiles);
+  }
   e.nargs = nargs;
   e.nlocals = nlocals;
   // Register the trampoline in the MAIN indirect table for direct (no-JS-hop)
@@ -375,12 +410,32 @@ int js::wasm::WasmJitRunCall(JSScript* script, uint64_t thisBits,
     e.deopts++;
     if (e.deopts >= 300 && e.deopts > (e.jitRuns + 1) &&
         !getenv("GECKO_WJ_NODEOPTVALVE")) {
+      // A storming fn with an alwaysBails block deopts from that COLD-IC block;
+      // recompiling reproduces it identically (verified: deltablue 741's recompiled
+      // MIR is byte-identical), so recompiling is pointless AND the recompile churn
+      // corrupts state (deltablue wrong-value/GC-crash). Go straight to PBL. A
+      // storming fn WITHOUT one deopts from a stale monomorphic guard -> recompile
+      // to specialize it polymorphic (crypto 3.1x). (Cold branches that NEVER fire,
+      // e.g. navier lin_solve's a===0, never reach here: deopts stays 0.)
+      if (getenv("GECKO_WJ_VALVEDBG")) {
+        fprintf(stderr, "[wj-valve] %s:%u hasAB=%d deopts=%u jitRuns=%u recomp=%u -> %s\n",
+                script->filename() ? script->filename() : "?",
+                unsigned(script->lineno()), e.hasAlwaysBails, e.deopts, e.jitRuns,
+                e.recompiles, e.hasAlwaysBails ? "FAIL" : "recompile");
+      }
+      if (e.hasAlwaysBails) {
+        e.state = WJEntry::State::Failed;
+        return 0;
+      }
       if (e.recompiles < 3) {
         e.recompiles++;
         e.state = WJEntry::State::Cold;  // re-observe + recompile with fresh ICs
         e.handle = -1;
         e.directIdx = -1;
-        e.tblSlot = -1;
+        // KEEP e.tblSlot: the recompile reuses it so callers' cached call ICs
+        // (funPtr->slot, funPtr unchanged) keep resolving to the new module.
+        // Resetting it to -1 allocated a NEW slot, leaving cached ICs pointing at
+        // the stale old module -> deltablue wrong results.
         e.deopts = 0;
         e.jitRuns = 0;
         e.observes = 0;
@@ -544,6 +599,24 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
   if (!cx) return 1.0;
   int kind = int(kindF);
 
+  static int helpHist = getenv("GECKO_WJ_HELPHIST") ? 1 : 0;
+  if (helpHist) {
+    static uint64_t hc[32] = {0};
+    static uint64_t tot = 0;
+    if (kind >= 0 && kind < 32) hc[kind]++;
+    if ((++tot % 200000) == 0) {
+      static const char* nm[16] = {"?",        "RESUME",  "CALL",
+                                   "SETSLOT",  "GETPROP", "SETPROP",
+                                   "GETELEM",  "INSTOF",  "ARRPUSH",
+                                   "ARRPOP",   "CRTHIS",  "CONSTRUCT",
+                                   "POSTBAR",  "PREBAR",  "?14",  "?15"};
+      fprintf(stderr, "[wb-helphist] %llu calls:", (unsigned long long)tot);
+      for (int k = 0; k < 16; k++)
+        if (hc[k]) fprintf(stderr, " %s=%llu", nm[k], (unsigned long long)hc[k]);
+      fprintf(stderr, "\n");
+    }
+  }
+
   if (kind == js::wasm::WJH_RESUME) {
     gWJDidResume = true;  // this JIT entry deopted (safety-valve accounting)
     if(getenv("GECKO_DEBUG_JIT")){static uint64_t c=0; if((++c%5000)==0) fprintf(stderr,"[wb-resume-count] %llu\n",(unsigned long long)c);}
@@ -598,8 +671,27 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
       (void)haveInner;
       JS::RootedValueVector vals(cx);
       if (!vals.reserve(total)) return 1.0;
+      static int rchk = getenv("GECKO_WJ_RESUMECHK") ? 1 : 0;
       for (uint32_t i = 0; i < total; i++) {
-        vals.infallibleAppend(JS::Value::fromRawBits(gWJResumeVals[off + i]));
+        uint64_t bits = gWJResumeVals[off + i];
+        if (rchk) {
+          JS::Value v = JS::Value::fromRawBits(bits);
+          bool ok = v.isObject() || v.isString() || v.isSymbol() ||
+                    v.isBigInt() || v.isInt32() || v.isDouble() || v.isBoolean() ||
+                    v.isNull() || v.isUndefined() || v.isMagic();
+          if (!ok || (v.isGCThing() && (uintptr_t(v.toGCThing()) < 0x1000 ||
+                                        (uintptr_t(v.toGCThing()) & 7)))) {
+            const char* kind = i == 0 ? "this"
+                               : i < 1 + nargs ? "arg"
+                               : i < 1 + nargs + nlocals ? "local" : "stack";
+            fprintf(stderr,
+                    "[wj-badval] %s:%u f=%u slot=%u(%s) bits=%016llx gcthing=%d\n",
+                    script->filename() ? script->filename() : "?",
+                    unsigned(script->lineno()), f, i, kind,
+                    (unsigned long long)bits, v.isGCThing());
+          }
+        }
+        vals.infallibleAppend(JS::Value::fromRawBits(bits));
       }
       uint64_t thisBits = vals[0].asRawBits();
       const JS::Value* args = vals.begin() + 1;
@@ -759,6 +851,91 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
     return 0.0;
   }
 
+  if (kind == js::wasm::WJH_PROPIC) {
+    // Inline property-load IC miss: the JIT'd fast path didn't match a cached
+    // shape. Get the value AND, for an OWN data property of a native receiver,
+    // fill the per-site IC (shape -> TaggedSlotOffset) so the next access loads
+    // the slot inline. Property name is baked per-site in gWJPropKey.
+    uint32_t site = uint32_t(siteF);
+    RootedValue objv(cx, JS::Value::fromRawBits(gWJScratch[0]));
+    JS::RootedId id(cx, JS::PropertyKey::fromRawBits(uintptr_t(gWJPropKey[site])));
+    if (objv.isObject() && objv.toObject().is<js::NativeObject>()) {
+      js::NativeObject* nobj = &objv.toObject().as<js::NativeObject>();
+      mozilla::Maybe<js::PropertyInfo> prop = nobj->lookupPure(id);
+      if (prop.isSome() && prop->isDataProperty()) {
+        uint32_t base = site * js::wasm::kWJPropWays;
+        uint32_t shapeBits =
+            uint32_t(uintptr_t(static_cast<void*>(nobj->shape())));
+        js::TaggedSlotOffset t = nobj->getTaggedSlotOffset(prop->slot());
+        uint32_t offBits =
+            (t.offset() << js::TaggedSlotOffset::OffsetShift) |
+            (t.isFixedSlot() ? js::TaggedSlotOffset::IsFixedSlotFlag : 0);
+        uint32_t w = 0;
+        for (; w < js::wasm::kWJPropWays; w++) {
+          if (gWJPropShape[base + w] == 0 || gWJPropShape[base + w] == shapeBits)
+            break;
+        }
+        if (w == js::wasm::kWJPropWays) w = 0;  // evict way 0
+        gWJPropShape[base + w] = shapeBits;
+        gWJPropOff[base + w] = offBits;
+        gWJScratch[js::wasm::kWJResultSlot] = nobj->getSlot(prop->slot()).asRawBits();
+        return 0.0;
+      }
+    }
+    // Fallback: proto/accessor/non-native/missing property -> generic get, no
+    // caching (the site keeps missing for this shape, always correct). Use the
+    // same generic element get as WJH_GETPROP, with the baked key as a Value.
+    RootedValue keyv(cx, js::IdToValue(id));
+    RootedValue res(cx);
+    if (!js::GetElementOperation(cx, objv, keyv, &res)) return 1.0;
+    gWJScratch[js::wasm::kWJResultSlot] = res.asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_SETPROPIC) {
+    // Set-prop IC miss: store value into obj.name. For a WRITABLE own data
+    // property of a native receiver, fill the per-site IC (shape ->
+    // TaggedSlotOffset) so the next store writes the slot inline, and store via
+    // setSlot (which runs the proper pre/post barriers). Otherwise fall back to
+    // the generic set (no caching).
+    uint32_t site = uint32_t(siteF);
+    RootedValue objv(cx, JS::Value::fromRawBits(gWJScratch[0]));
+    RootedValue idv(cx, JS::Value::fromRawBits(gWJScratch[1]));
+    RootedValue val(cx, JS::Value::fromRawBits(gWJScratch[2]));
+    JS::RootedId id(cx);
+    if (!js::ToPropertyKey(cx, idv, &id)) return 1.0;
+    if (objv.isObject() && objv.toObject().is<js::NativeObject>()) {
+      js::NativeObject* nobj = &objv.toObject().as<js::NativeObject>();
+      mozilla::Maybe<js::PropertyInfo> prop = nobj->lookupPure(id);
+      if (prop.isSome() && prop->isDataProperty() && prop->writable()) {
+        uint32_t base = site * js::wasm::kWJPropWays;
+        uint32_t shapeBits =
+            uint32_t(uintptr_t(static_cast<void*>(nobj->shape())));
+        js::TaggedSlotOffset t = nobj->getTaggedSlotOffset(prop->slot());
+        uint32_t offBits =
+            (t.offset() << js::TaggedSlotOffset::OffsetShift) |
+            (t.isFixedSlot() ? js::TaggedSlotOffset::IsFixedSlotFlag : 0);
+        uint32_t w = 0;
+        for (; w < js::wasm::kWJPropWays; w++) {
+          if (gWJPropShape[base + w] == 0 || gWJPropShape[base + w] == shapeBits)
+            break;
+        }
+        if (w == js::wasm::kWJPropWays) w = 0;
+        gWJPropShape[base + w] = shapeBits;
+        gWJPropOff[base + w] = offBits;
+        nobj->setSlot(prop->slot(), val);  // pre+post write barriers included
+        return 0.0;
+      }
+    }
+    // Fallback: setter / non-writable / proto / add / non-native -> generic set.
+    if (!objv.isObject()) return 1.0;
+    RootedObject obj(cx, &objv.toObject());
+    RootedValue keyv(cx, js::IdToValue(id));
+    bool strict = gWJPropStrict[site] != 0;
+    if (!js::SetObjectElement(cx, obj, keyv, val, strict)) return 1.0;
+    return 0.0;
+  }
+
   if (kind == js::wasm::WJH_SETPROP) {
     RootedValue objv(cx, JS::Value::fromRawBits(gWJScratch[0]));
     if (!objv.isObject()) return 1.0;
@@ -865,6 +1042,37 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
     return 0.0;
   }
 
+  if (kind == js::wasm::WJH_NEWPLAIN) {
+    // gWJNewShapeSlot = address of the traced shape-pool slot (relocated by
+    // WJTraceRoots); load the GC-current Shape* from it.
+    js::Shape* sh =
+        *reinterpret_cast<js::Shape**>(uintptr_t(gWJNewShapeSlot));
+    if (!sh) return 1.0;
+    JS::Rooted<js::SharedShape*> shape(cx, &sh->asShared());
+    JSObject* obj = js::NewPlainObjectOptimizedFallback(
+        cx, shape, js::gc::AllocKind(gWJNewAux), js::gc::Heap(gWJNewHeap));
+    if (!obj) return 1.0;
+    gWJScratch[js::wasm::kWJResultSlot] = JS::ObjectValue(*obj).asRawBits();
+    return 0.0;
+  }
+  if (kind == js::wasm::WJH_NEWARROBJ) {
+    js::gc::AllocKind ak = GuessArrayGCKind(gWJNewAux);
+    js::NewObjectKind nk = gWJNewHeap == uint32_t(js::gc::Heap::Tenured)
+                               ? js::TenuredObject
+                               : js::GenericObject;
+    js::ArrayObject* arr =
+        js::NewArrayObjectOptimizedFallback(cx, gWJNewAux, ak, nk);
+    if (!arr) return 1.0;
+    gWJScratch[js::wasm::kWJResultSlot] = JS::ObjectValue(*arr).asRawBits();
+    return 0.0;
+  }
+  if (kind == js::wasm::WJH_NEWARR) {
+    js::ArrayObject* arr = js::NewArrayOperation(cx, gWJNewAux);
+    if (!arr) return 1.0;
+    gWJScratch[js::wasm::kWJResultSlot] = JS::ObjectValue(*arr).asRawBits();
+    return 0.0;
+  }
+
   return 1.0;
 }
 
@@ -894,6 +1102,19 @@ extern "C" EMSCRIPTEN_KEEPALIVE void WJTraceRoots(JSTracer* trc, void*) {
   for (uint32_t i = 0; i < gWJShapePoolCount; i++) {
     if (gWJShapePool[i]) {
       js::TraceRoot(trc, reinterpret_cast<js::Shape**>(&gWJShapePool[i]), "wjshape");
+    }
+  }
+  // Prop-IC cached shapes: trace+relocate (wasm32, so the uint32 IS the Shape*).
+  // Keeps cached shapes live and pointer-current, so a shape match is always
+  // correct (no stale/reused-pointer hazard). The paired offset stays valid
+  // because a Shape's property layout is immutable.
+  {
+    uint32_t n = js::wasm::gWJNextPropSite * js::wasm::kWJPropWays;
+    for (uint32_t i = 0; i < n; i++) {
+      if (gWJPropShape[i]) {
+        js::TraceRoot(trc, reinterpret_cast<js::Shape**>(&gWJPropShape[i]),
+                      "wjpropic");
+      }
     }
   }
   uint32_t sp = gWJRootSP;

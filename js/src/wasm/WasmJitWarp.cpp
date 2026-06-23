@@ -221,6 +221,28 @@ static int AssembleAndInstall(MIRGenerator& mirGen, MIRGraph& graph,
 int WJWarpCompile(JSContext* cx, JSScript* script, uint32_t* nargsOut,
                   uint32_t* nlocalsOut, int* tblSlotOut) {
   bool dump = getenv("GECKO_WJWARP_DUMP");
+  // Functions with try/catch/finally (try-notes): our JIT propagates a thrown
+  // exception OUT of a function via a return flag, but has NO in-function CATCH
+  // landing pad. So a throw inside a try region unwinds PAST its own catch instead
+  // of landing in it -- e.g. gbemu initLCD's `try { new GameBoyCanvas() } catch`
+  // (the headless canvas op throws; the catch must run) hard-failed. Bail such
+  // functions to PBL, which handles try/catch correctly. They are typically cold
+  // (setup / feature-detection), so the perf cost is ~nil. GECKO_WJ_NOTRYBAIL
+  // keeps JIT-compiling them (for when catch landing pads are implemented).
+  if (!getenv("GECKO_WJ_NOTRYBAIL")) {
+    // Only Catch/Finally need an exception LANDING pad (they swallow/handle a
+    // throw). ForIn/ForOf/Destructuring/Loop try-notes are normal control-flow
+    // cleanup -- bailing on those too is far too broad (it tanked richards 5x:
+    // for-of/destructuring are everywhere). Bail only when a real catch/finally
+    // is present.
+    for (const js::TryNote& tn : script->trynotes()) {
+      if (tn.kind() == js::TryNoteKind::Catch ||
+          tn.kind() == js::TryNoteKind::Finally) {
+        js::wasm::gWJBailReason = "trycatch";
+        return -1;
+      }
+    }
+  }
   // Bake the zone's needs-marking-barrier flag address for the emitted pre-write
   // barrier fast path (single-zone shell -> one stable address).
   js::wasm::gWJMarkBarrierAddr =

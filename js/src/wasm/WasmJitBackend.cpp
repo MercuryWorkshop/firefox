@@ -37,6 +37,8 @@
 #include "vm/JSFunction.h"
 #include "vm/JSObject.h"
 #include "vm/NativeObject.h"
+#include "vm/ArrayBufferViewObject.h"  // dataOffset (typed-array element access)
+#include "js/ScalarType.h"             // Scalar::Type/byteSize (typed arrays)
 #include "vm/JSAtomUtils-inl.h"  // js::AtomToId (GetPropertyCache inline IC key)
 #include "gc/Heap.h"      // gc::Arena::thingSize, NurseryCellHeader (inline alloc)
 #include "gc/Nursery.h"   // Nursery::nurseryCellHeaderSize/offsetOfCurrentEndFromPosition
@@ -80,14 +82,17 @@ static uint8_t WJValType(MIRType t) {
   switch (t) {
     case MIRType::Int32:
     case MIRType::Boolean:
+    case MIRType::IntPtr:  // wasm32: a native pointer-sized int == i32
       return uint8_t(TypeCode::I32);
     case MIRType::Int64:
     case MIRType::Value:  // boxed JS::Value (NUNBOX32 -> 64 bits)
       return uint8_t(TypeCode::I64);
     case MIRType::Double:
-      return uint8_t(TypeCode::F64);
     case MIRType::Float32:
-      return uint8_t(TypeCode::F32);
+      // Float32 values are held in f64 locals (JS numbers are f64; only typed-array
+      // STORAGE is 32-bit). This matches EmitSpillValue/arith which already treat
+      // Float32 as f64, and avoids f32/f64 local.set mismatches (gbemu).
+      return uint8_t(TypeCode::F64);
     case MIRType::Object:
     case MIRType::String:
     case MIRType::Symbol:
@@ -208,6 +213,16 @@ static bool GetOp(Encoder& e, WJBackend& be, const MDefinition* d) {
            e.writeVarU32(uint32_t(js::NativeObject::offsetOfSlots()));
   }
   if (d->type() == MIRType::Elements) {
+    // Typed-array / DataView data pointer: a PrivateValue in fixed slot DATA_SLOT.
+    // On NUNBOX32 a PrivateValue stores the raw pointer as asBits_ (no tag/shift),
+    // so the wasm32 data pointer is the low 32 bits at dataOffset() -- a plain
+    // 32-bit load. Rematerialized (not cached) so it stays current if a minor GC
+    // moves the owning view (same hazard as MElements).
+    if (d->isArrayBufferViewElements()) {
+      if (!GetOp(e, be, d->toArrayBufferViewElements()->object())) return false;
+      return e.writeOp(Op::I32Load) && e.writeVarU32(2) &&
+             e.writeVarU32(uint32_t(js::ArrayBufferViewObject::dataOffset()));
+    }
     if (!GetOp(e, be, d->toElements()->object())) return false;
     return e.writeOp(Op::I32Load) && e.writeVarU32(2) &&
            e.writeVarU32(uint32_t(js::NativeObject::offsetOfElements()));
@@ -979,10 +994,12 @@ static void WJCollectRoots(WJBackend& be, MInstruction* ins,
     }
     return false;
   };
+  static int rootAll = getenv("GECKO_WJ_ROOTALL") ? 1 : 0;
   auto consider = [&](MDefinition* d) {
     bool isObj = d->type() == MIRType::Object;
     bool isVal = d->type() == MIRType::Value;
-    if ((isObj || isVal) && be.local(d) >= 0 && liveAfterIns(d)) add(d, isObj);
+    if ((isObj || isVal) && be.local(d) >= 0 && (rootAll || liveAfterIns(d)))
+      add(d, isObj);
   };
   // Root values whose def dominates `ins` and are live across it, unioned with
   // the call's resume-point operands (the precise abstract-interpreter live
@@ -1631,10 +1648,24 @@ static bool WJMegaConvertibleGuard(jit::MDefinition* gg) {
       }
     } else if (op == Op::Elements || op == Op::StoreDynamicSlot ||
                op == Op::LoadFixedSlotFromOffset ||
-               op == Op::StoreFixedSlotFromOffset || op == Op::GuardShape) {
+               op == Op::StoreFixedSlotFromOffset || op == Op::GuardShape ||
+               op == Op::AddAndStoreSlot || op == Op::AllocateAndStoreSlot) {
+      // AddAndStoreSlot / AllocateAndStoreSlot ADD a property: they assume the
+      // object's exact pre-transition shape to transition to a specific post-shape
+      // and write a specific slot. Removing the guard lets a polymorphic receiver
+      // through -> wrong shape transition / wrong slot -> heap corruption (raytrace
+      // "Scene rendered incorrectly"). These cannot run under a removed guard.
       return false;  // shape-dependent, not converting -> keep the guard
     }
     // else: shape-agnostic use -> safe with an unguarded object.
+  }
+  if (getenv("GECKO_WJ_MEGAUSES")) {
+    fprintf(stderr, "[wj-megauses] guard %s CONV uses:", WJOpName(gg->op()));
+    for (jit::MUseIterator u = gg->usesBegin(); u != gg->usesEnd(); u++) {
+      if (!u->consumer()->isDefinition()) { fprintf(stderr, " <rp>"); continue; }
+      fprintf(stderr, " %s", WJOpName(u->consumer()->toDefinition()->op()));
+    }
+    fprintf(stderr, "\n");
   }
   return true;  // no disallowed shape-dependent use -> safe to passthrough
 }
@@ -1729,6 +1760,9 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
       switch (c->type()) {
         case MIRType::Int32:
           return e.writeOp(Op::I32Const) && e.writeVarS32(c->toInt32());
+        case MIRType::IntPtr:  // wasm32: pointer-sized int constant == i32
+          return e.writeOp(Op::I32Const) &&
+                 e.writeVarS32(int32_t(c->toIntPtr()));
         case MIRType::Boolean:
           return e.writeOp(Op::I32Const) && e.writeVarS32(c->toBoolean() ? 1 : 0);
         case MIRType::Double:
@@ -2262,6 +2296,76 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
       if (!e.writeOp(Op::End)) return false;
       return GetLocal(e, uint32_t(il));  // passthrough index
     }
+    // IntPtr <-> Int32 conversions: on wasm32 IntPtr == i32, so these are no-ops
+    // (the framework stores the operand value into this node's local). The guard
+    // form is a passthrough -- the typed-array BoundsCheck already validates range.
+    case MDefinition::Opcode::Int32ToIntPtr:
+    case MDefinition::Opcode::NonNegativeIntPtrToInt32:
+    case MDefinition::Opcode::GuardInt32IsNonNegative:
+      return GetOp(e, be, ins->getOperand(0));
+    // Typed-array / DataView data pointer (see GetOp). Emit it so the node gets a
+    // local; GetOp rematerializes on every use to stay GC-current.
+    case MDefinition::Opcode::ArrayBufferViewElements:
+      return GetOp(e, be, ins);
+    // Typed-array length: a PrivateValue (raw size_t) in fixed slot LENGTH_SLOT;
+    // the wasm32 value is the low 32 bits at lengthOffset() -- a plain i32 load.
+    // Result IntPtr (== i32). gbemu reads `memory.length` in its hot fns.
+    case MDefinition::Opcode::ArrayBufferViewLength: {
+      if (!GetOp(e, be, ins->toArrayBufferViewLength()->object())) return false;
+      return e.writeOp(Op::I32Load) && e.writeVarU32(2) &&
+             e.writeVarU32(uint32_t(js::ArrayBufferViewObject::lengthOffset()));
+    }
+    // Sign-extend an 8/16-bit int held in an i32 to full 32-bit (e.g. `(x<<24)>>24`
+    // patterns / Int8Array reads that Warp lowers to MSignExtendInt32).
+    case MDefinition::Opcode::SignExtendInt32: {
+      if (!GetOp(e, be, ins->getOperand(0))) return false;
+      return ins->toSignExtendInt32()->mode() == jit::MSignExtendInt32::Byte
+                 ? e.writeOp(Op::I32Extend8S)
+                 : e.writeOp(Op::I32Extend16S);
+    }
+    // Typed-array element load: addr = data + index * byteSize(storageType), then a
+    // sized scalar load. Mirrors Ion visitLoadUnboxedScalar. gbemu's GameBoy memory
+    // is Uint8Array/Int8Array -> I32Load8U/S; this kept its hot fns in PBL before.
+    case MDefinition::Opcode::LoadUnboxedScalar: {
+      auto* l = ins->toLoadUnboxedScalar();
+      Scalar::Type st = l->storageType();
+      int32_t il = be.local(l->index());
+      if (il < 0) return false;
+      uint32_t esz = uint32_t(Scalar::byteSize(st));
+      if (!GetOp(e, be, l->elements()) || !GetLocal(e, uint32_t(il)) ||
+          !e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(esz)) ||
+          !e.writeOp(Op::I32Mul) || !e.writeOp(Op::I32Add))
+        return false;  // addr on stack
+      MIRType rty = ins->type();
+      switch (st) {
+        case Scalar::Int8:
+          return e.writeOp(Op::I32Load8S) && e.writeVarU32(0) && e.writeVarU32(0);
+        case Scalar::Uint8:
+        case Scalar::Uint8Clamped:
+          return e.writeOp(Op::I32Load8U) && e.writeVarU32(0) && e.writeVarU32(0);
+        case Scalar::Int16:
+          return e.writeOp(Op::I32Load16S) && e.writeVarU32(1) && e.writeVarU32(0);
+        case Scalar::Uint16:
+          return e.writeOp(Op::I32Load16U) && e.writeVarU32(1) && e.writeVarU32(0);
+        case Scalar::Int32:
+          return e.writeOp(Op::I32Load) && e.writeVarU32(2) && e.writeVarU32(0);
+        case Scalar::Uint32:
+          // Result is Int32 (raw bits, may be negative) or Double (unsigned value).
+          if (!e.writeOp(Op::I32Load) || !e.writeVarU32(2) || !e.writeVarU32(0))
+            return false;
+          if (rty == MIRType::Double)
+            return e.writeOp(Op::F64ConvertI32U);  // unsigned -> double
+          return true;                              // Int32 raw bits
+        case Scalar::Float32:
+          if (!e.writeOp(Op::F32Load) || !e.writeVarU32(2) || !e.writeVarU32(0))
+            return false;
+          return e.writeOp(Op::F64PromoteF32);  // -> f64 local (Double/Float32)
+        case Scalar::Float64:
+          return e.writeOp(Op::F64Load) && e.writeVarU32(3) && e.writeVarU32(0);
+        default:
+          return WJBAIL("LoadUnboxedScalar storage type unsupported\n");
+      }
+    }
     case MDefinition::Opcode::LoadElement:
     case MDefinition::Opcode::LoadElementAndUnbox: {
       bool andUnbox = ins->op() == MDefinition::Opcode::LoadElementAndUnbox;
@@ -2520,11 +2624,23 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
     }
     case MDefinition::Opcode::ToDouble:
     case MDefinition::Opcode::ToFloat32: {
+      // Result is Float32 (an f32 local). Produce an f32 value: Int32 -> f32
+      // (convert), Double -> f32 (demote), Float32 -> already f32. The old code
+      // emitted f64 (convert_i32_s / no-op) into the f32 local -> invalid wasm
+      // "local.set expected f32, found f64" (gbemu).
+      // Result Float32 is held as f64 (see WJValType) but ROUNDED to f32 precision:
+      // value -> f32 -> f64. Matches JS Math.fround / Float32 store semantics.
       MDefinition* in = ins->getOperand(0);
       if (!GetOp(e, be, in)) return false;
-      if (in->type() == MIRType::Int32) return e.writeOp(Op::F64ConvertI32S);
-      if (in->type() == MIRType::Double) return true;  // no-op
-      return false;
+      if (in->type() == MIRType::Int32) {
+        if (!e.writeOp(Op::F32ConvertI32S)) return false;
+      } else if (in->type() == MIRType::Double ||
+                 in->type() == MIRType::Float32) {
+        if (!e.writeOp(Op::F32DemoteF64)) return false;
+      } else {
+        return false;
+      }
+      return e.writeOp(Op::F64PromoteF32);  // back to the f64 local
     }
     case MDefinition::Opcode::Add:
     case MDefinition::Opcode::Sub:
@@ -2803,7 +2919,13 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
       // defined semantics here; deopting was UNSOUND -- re-ran committed stores).
       MDefinition* in = ins->getOperand(0);
       if (in->type() == MIRType::Int32) return GetOp(e, be, in);
-      if (in->type() != MIRType::Double) return false;
+      // NB: a Value operand (`x|0` on a boxed number) was tried via a
+      // number-unbox-to-double + deopt-on-non-number, but its deopt resumed
+      // incorrectly -> gbemu checksum NaN. Left to bail until deopt-resume here is
+      // sound; mandreel (the main user) is already >=2x without it.
+      // Float32 is held as f64 (see WJValType) -> same wrapping trunc as Double.
+      if (in->type() != MIRType::Double && in->type() != MIRType::Float32)
+        return false;
       return GetOp(e, be, in) && e.writeOp(MiscOp::I64TruncSatF64S) &&
              e.writeOp(Op::I32WrapI64);
     }
@@ -2818,7 +2940,8 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
       // gives the nearest resume point; the only store here is after this op).
       MDefinition* in = ins->getOperand(0);
       if (in->type() == MIRType::Int32) return GetOp(e, be, in);
-      if (in->type() != MIRType::Double) return false;
+      if (in->type() != MIRType::Double && in->type() != MIRType::Float32)
+        return false;  // Float32 held as f64 -> same path
       // deopt unless f64.convert_i32_s(i32.trunc_sat_f64_s(d)) == d  (exact int32).
       if (!GetOp(e, be, in) || !e.writeOp(MiscOp::I32TruncSatF64S) ||
           !e.writeOp(Op::F64ConvertI32S) || !GetOp(e, be, in) ||
@@ -3909,6 +4032,16 @@ static EffectKind EmitEffect(Encoder& e, WJBackend& be, MInstruction* ins) {
             return EffectKind::Fail;
           return e.writeOp(Op::Drop) ? EffectKind::Emitted : EffectKind::Fail;
         }
+        // Guard was removed (passthrough) but this store can't convert by-name
+        // (key underivable / receiver not MIRType::Object). A raw fixed-slot store
+        // at s->slot() would write the WRONG slot for a polymorphic receiver ->
+        // heap corruption (raytrace "Scene rendered incorrectly"). BAIL the whole
+        // function to PBL -- matches LoadFixedSlot's behaviour; never emit the raw
+        // store under a removed guard.
+        if (getenv("GECKO_WJ_MEGASTOREBAIL"))
+          fprintf(stderr, "[wj-megastorebail] StoreFixedSlot slot=%zu objType=%d\n",
+                  s->slot(), int(WJGuardObject(gs)->type()));
+        return EffectKind::Fail;
       }
       int32_t objLocal = be.local(s->object());
       if (objLocal < 0) return EffectKind::Fail;
@@ -3990,6 +4123,61 @@ static EffectKind EmitEffect(Encoder& e, WJBackend& be, MInstruction* ins) {
       if (!e.writeOp(Op::I64Store) || !e.writeVarU32(3) || !e.writeVarU32(off))
         return EffectKind::Fail;
       return EffectKind::Emitted;
+    }
+    case MDefinition::Opcode::StoreUnboxedScalar: {
+      // Typed-array element store: data[index] = value (sized). Mirrors Ion
+      // visitStoreUnboxedScalar. Int storage takes an Int32 value (wasm truncates
+      // the low bits, matching JS ToInt32-then-narrow); float storage takes a
+      // Double. No barrier (scalar data, no GC pointers). gbemu's Uint8Array writes.
+      auto* s = ins->toStoreUnboxedScalar();
+      Scalar::Type st = s->writeType();
+      int32_t il = be.local(s->index());
+      if (il < 0) return EffectKind::Fail;
+      MDefinition* valD = s->value();
+      bool valDouble = valD->type() == MIRType::Double ||
+                       valD->type() == MIRType::Float32;
+      bool valInt = valD->type() == MIRType::Int32 || valD->type() == MIRType::Boolean;
+      bool floatStore = st == Scalar::Float32 || st == Scalar::Float64;
+      // Require the value already coerced to the storage class (Warp inserts the
+      // conversion); a mismatch (e.g. Double into an int array) is rare -> bail.
+      if (floatStore ? !valDouble : !valInt)
+        return WJBAIL("StoreUnboxedScalar value/type mismatch\n") ? EffectKind::Fail
+                                                                  : EffectKind::Fail;
+      uint32_t esz = uint32_t(Scalar::byteSize(st));
+      if (!GetOp(e, be, s->elements()) || !GetLocal(e, uint32_t(il)) ||
+          !e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(esz)) ||
+          !e.writeOp(Op::I32Mul) || !e.writeOp(Op::I32Add))
+        return EffectKind::Fail;  // addr on stack
+      if (!GetOp(e, be, valD)) return EffectKind::Fail;  // value
+      switch (st) {
+        case Scalar::Int8:
+        case Scalar::Uint8:
+          if (!e.writeOp(Op::I32Store8) || !e.writeVarU32(0) || !e.writeVarU32(0))
+            return EffectKind::Fail;
+          return EffectKind::Emitted;
+        case Scalar::Int16:
+        case Scalar::Uint16:
+          if (!e.writeOp(Op::I32Store16) || !e.writeVarU32(1) || !e.writeVarU32(0))
+            return EffectKind::Fail;
+          return EffectKind::Emitted;
+        case Scalar::Int32:
+        case Scalar::Uint32:
+          if (!e.writeOp(Op::I32Store) || !e.writeVarU32(2) || !e.writeVarU32(0))
+            return EffectKind::Fail;
+          return EffectKind::Emitted;
+        case Scalar::Float32:
+          // value is f64 (Double or Float32, both f64 locals) -> demote to f32.
+          if (!e.writeOp(Op::F32DemoteF64) || !e.writeOp(Op::F32Store) ||
+              !e.writeVarU32(2) || !e.writeVarU32(0))
+            return EffectKind::Fail;
+          return EffectKind::Emitted;
+        case Scalar::Float64:
+          if (!e.writeOp(Op::F64Store) || !e.writeVarU32(3) || !e.writeVarU32(0))
+            return EffectKind::Fail;
+          return EffectKind::Emitted;
+        default:
+          return EffectKind::Fail;  // Uint8Clamped (needs saturation) / BigInt -> PBL
+      }
     }
     case MDefinition::Opcode::StoreElement: {
       if (getenv("GECKO_WJ_NONEWSTORE")) return EffectKind::Fail;

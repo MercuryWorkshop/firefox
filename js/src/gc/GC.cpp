@@ -2024,6 +2024,12 @@ bool GCRuntime::shouldCompact() {
 }
 
 bool GCRuntime::isCompactingGCEnabled() const {
+  static int noCompact = -1;
+  if (noCompact < 0) {
+    noCompact = getenv("GECKO_NO_COMPACT") ? 1 : 0;
+    if (noCompact) fprintf(stderr, "[gc] compacting GC DISABLED via GECKO_NO_COMPACT\n");
+  }
+  if (noCompact) return false;
   return compactingEnabled &&
          rt->mainContextFromOwnThread()->compactingDisabledCount == 0;
 }

@@ -45,6 +45,7 @@
 #include "vm/ConstantCompareOperand.h"
 #include "vm/EnvironmentObject.h"
 #include "vm/FrameIter.h"    // js::{,Script}FrameIter
+#include "wasm/WasmJit.h"    // js::wasm::WasmJitInWasm (skip decompile in JIT frames)
 #include "vm/JSAtomUtils.h"  // AtomToPrintableString, Atomize
 #include "vm/JSContext.h"
 #include "vm/JSFunction.h"
@@ -2383,6 +2384,17 @@ static bool DecompileExpressionFromStack(JSContext* cx, int spindex,
   }
 
   if (spindex == JSDVG_IGNORE_STACK) {
+    return true;
+  }
+
+  // When the error is thrown from emitted wasm-JIT code (JS_CODEGEN_NONE build:
+  // no Baseline frames), the top activation frame is not a JS script frame that
+  // FrameIter/BytecodeParser can walk -- attempting to decompile it traps
+  // ("Unexpected state"). Fall back to the generic value source so the throw
+  // propagates normally (e.g. to a JS try/catch) instead of crashing. This is the
+  // gbemu "throw from a JIT'd typed-array fn" crash and also unblocks JIT'd throws
+  // generally.
+  if (js::wasm::WasmJitInWasm()) {
     return true;
   }
 

@@ -247,6 +247,19 @@ void js::gc::GCRuntime::traceRuntimeForMajorGC(JSTracer* trc,
   }
 
   traceRuntimeCommon(trc, MarkRuntime);
+
+#ifdef __EMSCRIPTEN__
+  // The wasm-JIT's cached GC pointers (gWJPropShape/Off shape-cache, gWJShapePool,
+  // gWJNameHolder/Shape, gWJConstPool, gWJScratch, gWJCallRoots) must be traced on
+  // MAJOR GC too -- not just minor. This same function is also the compaction
+  // pointer-UPDATE pass (Compacting.cpp updateRuntimePointersToRelocatedCells), so
+  // tracing here both keeps the cached shapes live during major-GC marking AND
+  // relocates them when a compacting GC moves shapes. Without this, a compaction
+  // left gWJPropShape pointing at moved/dead shapes -> a new shape at the old
+  // address falsely matched the IC -> wrong slot loaded (raytrace "Scene rendered
+  // incorrectly" after enough allocation triggered a compacting GC).
+  WJTraceRoots(trc, nullptr);
+#endif
 }
 
 void js::gc::GCRuntime::traceRuntimeForMinorGC(JSTracer* trc,

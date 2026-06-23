@@ -334,6 +334,14 @@ bool js::wasm::WasmJitObserveCall(JSScript* script) {
     // so a genuinely-unsupported function eventually gives up (stays in PBL).
     const char* reason =
         js::wasm::gWJBailReason ? js::wasm::gWJBailReason : "?";
+    // LOG-BAIL (non-fatal coverage audit): print each compile bail so a bench that
+    // silently degrades to ~1x (hot fns in PBL) can be diagnosed. Post-process with
+    // sort|uniq -c (retries repeat the same line). Off by default.
+    if (getenv("GECKO_WJ_LOGBAIL")) {
+      fprintf(stderr, "[WJ-BAIL] %s:%u reason=%s\n",
+              script->filename() ? script->filename() : "?",
+              unsigned(script->lineno()), reason);
+    }
     // FAIL-ON-BAIL: a compile bail means the function runs in PBL forever -- the
     // exact "running in PBL not JIT" signal we must never miss. With FAILONBAIL set,
     // print it loudly and ABORT so any bench with an unJIT-able function insta-fails
@@ -1248,8 +1256,12 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
             break;
         }
         if (w == js::wasm::kWJPropWays) w = 0;  // evict way 0
-        gWJPropShape[base + w] = shapeBits;
-        gWJPropOff[base + w] = offBits;
+        static int noFill = -1;
+        if (noFill < 0) noFill = getenv("GECKO_WJ_PROPNOFILL") ? 1 : 0;
+        if (!noFill) {
+          gWJPropShape[base + w] = shapeBits;
+          gWJPropOff[base + w] = offBits;
+        }
         gWJScratch[js::wasm::kWJResultSlot] = nobj->getSlot(prop->slot()).asRawBits();
         return 0.0;
       }
@@ -1293,8 +1305,12 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
             break;
         }
         if (w == js::wasm::kWJPropWays) w = 0;
-        gWJPropShape[base + w] = shapeBits;
-        gWJPropOff[base + w] = offBits;
+        static int noFillS = -1;
+        if (noFillS < 0) noFillS = getenv("GECKO_WJ_PROPNOFILL") ? 1 : 0;
+        if (!noFillS) {
+          gWJPropShape[base + w] = shapeBits;
+          gWJPropOff[base + w] = offBits;
+        }
         nobj->setSlot(prop->slot(), val);  // pre+post write barriers included
         return 0.0;
       }
@@ -1505,6 +1521,24 @@ extern "C" EMSCRIPTEN_KEEPALIVE void WJTraceRoots(JSTracer* trc, void*) {
                       "wjnameholder");
         js::TraceRoot(trc, reinterpret_cast<js::Shape**>(&gWJNameShape[i]),
                       "wjnameshape");
+      }
+    }
+  }
+  // Polymorphic CALL IC: trace+relocate the cached callee function pointers so the
+  // IC's `gWJCallFn[w] == currentCallee` dispatch compare stays pointer-current
+  // across a GC that MOVES a cached function (nursery promotion on a minor GC, or
+  // compaction). Without this, a moved function leaves a stale cached pointer; if a
+  // DIFFERENT function is later allocated at that stale address the compare FALSE-
+  // MATCHES and dispatches via the stale table slot -> calls the WRONG function ->
+  // wrong result (raytrace "Scene rendered incorrectly"; NO_NURSERY masked it by
+  // never moving objects). gWJCallTblIdx is a plain table index (not a pointer) and
+  // needs no tracing. Functions kept alive this way (a strong root) is a bounded
+  // acceptable leak, matching gWJShapePool/gWJPropShape.
+  {
+    uint32_t n = js::wasm::gWJNextCallSite * js::wasm::kWJCallWays;
+    for (uint32_t i = 0; i < n; i++) {
+      if (gWJCallFn[i]) {
+        js::TraceRoot(trc, reinterpret_cast<JSObject**>(&gWJCallFn[i]), "wjcallfn");
       }
     }
   }

@@ -60,6 +60,14 @@ UNIFIED_SOURCES += [
     "WasmValue.cpp",
 ]
 
+# Re-architected JS->wasm JIT: separate TUs (not unified) -- file-static globals
+# and anonymous-namespace helpers would collide if merged with each other/WasmJS.cpp.
+SOURCES += [
+    "WasmJitBackend.cpp",
+    "WasmJitRuntime.cpp",
+    "WasmJitWarp.cpp",
+]
+
 # Generate wasm/WasmBuiltinModuleGenerated.h from wasm/WasmBuiltinModule.yaml
 GeneratedFile(
     "WasmBuiltinModuleGenerated.h",

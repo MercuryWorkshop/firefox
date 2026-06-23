@@ -372,6 +372,7 @@ bool js::wasm::WasmJitObserveCall(JSScript* script) {
   // PBL->JIT entry via a C function pointer. -1 if registration failed.
   if (!getenv("GECKO_WJ_NODIRECT")) {
     e.directIdx = int(wasmhost_call(handle, -1, nullptr, 0));
+    if (e.directIdx <= 0) e.directIdx = -1;
   }
   return true;
 }

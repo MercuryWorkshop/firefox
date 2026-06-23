@@ -77,12 +77,23 @@ enum WJHelpKind : int {
   WJH_NEWARROBJ = 17,     // gWJNewShapeSlot/gWJNewAux(length)/gWJNewHeap
                           // -> NewArrayObjectOptimizedFallback
   WJH_NEWARR = 18,        // gWJNewAux(length) -> NewArrayOperation (NewArray/DynamicLength)
+  WJH_BINARYARITH = 19,   // scratch[0]=lhs, scratch[1]=rhs, site=JSOp -> *Values; boxed result
+  WJH_UNARYARITH = 20,    // scratch[0]=operand, site=JSOp -> Neg/BitNot/Inc/Dec/Pos/ToNumeric
+  WJH_GETNAME = 21,       // scratch[0]=envObj, scratch[1]=name(StringValue) -> GetEnvironmentName
+  WJH_TOPROPKEY = 22,     // scratch[0]=input -> ToPropertyKey -> IdToValue (boxed)
+  WJH_CHARCODEAT = 23,    // scratch[0]=string, scratch[1]=index -> jit::CharCodeAt (Int32)
+  WJH_FROMCHARCODE = 24,  // scratch[0]=code(Int32) -> StringFromCharCode (String)
+  WJH_TOSTRING = 25,      // scratch[0]=input -> ToString (String)
+  WJH_COMPARE = 26,       // scratch[0]=lhs, scratch[1]=rhs, site=JSOp -> Boolean (==,!=,<,<=,>,>=,===,!==)
+  WJH_NEWOBJECT = 27,     // gWJNewObjScript/gWJNewObjPcOff -> NewObjectOperation (object literal)
 };
 
 // Allocation-helper staging (non-GC ints; the shape is in the traced shape pool).
 extern uint32_t gWJNewShapeSlot;  // gWJShapePool index of the template shape
 extern uint32_t gWJNewAux;        // allocKind (NewPlainObject) or array length
 extern uint32_t gWJNewHeap;       // gc::Heap (0=Default nursery)
+extern uint32_t gWJNewObjScript;  // JSScript* (raw) for WJH_NEWOBJECT
+extern uint32_t gWJNewObjPcOff;   // bytecode offset of the JSOp::NewObject
 
 // Compile-time-baked address of the current zone's needs-marking-barrier flag
 // (zone->addressOfNeedsMarkingBarrier()). The emitted pre-write-barrier fast path
@@ -119,6 +130,7 @@ extern uint32_t gWJCurrentEnv;
 // crash). A storming function WITHOUT one (a stale monomorphic guard) still
 // recompiles to specialize (crypto). Single-threaded synchronous compile.
 extern bool gWJHadAlwaysBails;
+extern bool gWJForceMega;  // next compile: megamorphic property reads (post-storm)
 
 // Compile bail-reason tracking (GECKO_WJ_CDBG): the most recent reason a function
 // stayed in PBL plus its source line, printed by WJWarpCompile when WJEmitBody
@@ -205,12 +217,28 @@ static constexpr uint32_t kWJPropWays = 4;
 extern uint32_t gWJPropShape[];   // cached receiver Shape* (0 = empty)
 extern uint32_t gWJPropOff[];     // cached TaggedSlotOffset bits ((off<<1)|isFixed)
 uint32_t WJAllocPropSite();
+uint32_t WJAllocPropSiteKeyed(uint64_t key);  // reuse a site for the same read
 // Per-site baked PropertyKey for the WJH_PROPIC fill helper (the property name).
 extern uint64_t gWJPropKey[];     // jsid raw bits per site
 extern uint8_t gWJPropStrict[];   // per-site strict flag (set-prop fallback)
 // Staging for the prop-IC miss helper: obj (boxed) -> gWJScratch[0]; result in
 // gWJScratch[kWJResultSlot]. site passed as wjhelp's 2nd arg.
 void WJClearPropIC();
+
+// GetName IC (MGetNameCache). A global/lexical name resolves to a data-property
+// slot on a REALM-SINGLETON holder (the global object or global lexical env),
+// stable for the whole run -- so we cache the holder pointer (traced + relocated
+// by WJTraceRoots, GC-current), its shape (validation), and the tagged slot
+// offset, per site. The fast path loads holder->slot directly (the VALUE may
+// mutate, e.g. deltablue's `planner`, but the LOCATION is fixed); on holder==0
+// (uncached) or shape mismatch it calls wjhelp(WJH_GETNAME, site) which resolves,
+// fills the cache (only for global-singleton holders), and returns the value.
+static constexpr uint32_t kWJNameSites = 8192;
+extern uintptr_t gWJNameHolder[];  // traced holder NativeObject* (0 = uncached)
+extern uint32_t gWJNameShape[];    // cached holder Shape* (wasm32: uint32 == ptr)
+extern uint32_t gWJNameOff[];      // cached TaggedSlotOffset bits ((off<<1)|isFixed)
+extern uint64_t gWJNameKey[];      // baked StringValue(name) bits per site
+uint32_t WJAllocNameSite();
 
 // GC-root shadow stack. The value-per-local backend holds object pointers in
 // wasm locals, invisible to the GC. Before a call (which can trigger a moving

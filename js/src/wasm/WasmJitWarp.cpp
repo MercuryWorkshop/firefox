@@ -180,10 +180,14 @@ static int AssembleAndInstall(MIRGenerator& mirGen, MIRGraph& graph,
   e.patchVarU32(trampOff, uint32_t(e.currentOffset() - trampStart));
   e.finishSection(s);
 
-  if (getenv("GECKO_WJWARP_DUMP") || getenv("GECKO_WJ_WASMDUMP")) {
+  if (getenv("GECKO_WJWARP_DUMP") || getenv("GECKO_WJ_WASMDUMP") ||
+      (js::wasm::gWJForceMega && getenv("GECKO_WJ_MEGADUMP"))) {
     JSScript* dscript = mirGen.outerInfo().script();
     char path[128];
-    snprintf(path, sizeof(path), "/tmp/wbjit_%u.wasm",
+    // Megamorphic recompiles dump to a SEPARATE file so they're not overwritten
+    // by interleaved non-mega compiles of the same function (deltablue 414 diag).
+    snprintf(path, sizeof(path), js::wasm::gWJForceMega ? "/tmp/wbjit_mega_%u.wasm"
+                                              : "/tmp/wbjit_%u.wasm",
              dscript ? dscript->lineno() : 0);
     if (FILE* f = fopen(path, "wb")) {
       fwrite(out.begin(), 1, out.length(), f);

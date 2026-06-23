@@ -40,6 +40,11 @@ extern int WasmJitRunCall(JSScript* script, uint64_t thisBits,
                           const JS::Value* args, uint32_t argc,
                           JSObject* envChain, uint64_t* retBits);
 
+// True while emitted wasm-JIT code is currently executing on the stack. Backs
+// the shell's inWasmJit()/inJit()/inIon() so the jit-test warm-up spin loops
+// (`do { f(); } while (!inIon())`) can detect that `f` got JIT-compiled.
+extern bool WasmJitInWasm();
+
 }  // namespace wasm
 }  // namespace js
 

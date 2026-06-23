@@ -124,6 +124,8 @@ struct WJBackend {
   const CompileInfo* info = nullptr;  // slot layout for resume points
   MResumePoint* curRp = nullptr;      // resume point for the instruction being emitted
   uint32_t curOp = 0;                 // op() of the instruction being emitted (deopt histogram)
+  uint32_t deoptCallLine = 0;         // __LINE__ of the EmitDeopt call (deopt-line histogram)
+  uint32_t propReadIdx = 0;           // per-compile mega-read counter (stable prop-site key)
   WarpSnapshot* snapshot = nullptr;   // for resolving NurseryObject references
 
   // Out-of-line deopt (the dispatch-loop path). Each guard miss inside a hot
@@ -134,8 +136,14 @@ struct WJBackend {
   // ~3.6x slower). The dispatcher, emitted after all bodies, switches on
   // deoptSiteLocal and runs the matching resume. Only active on the dispatch path.
   bool oolDeopt = false;          // out-of-line mode enabled
+  bool forceMega = false;         // megamorphic recompile: GuardShape-guarded
+                                  // property reads -> multi-shape EmitPropIC (no
+                                  // deopt) instead of a monomorphic GuardShape
+                                  // that storms on a polymorphic receiver.
   bool inDispatchBody = false;    // currently emitting a hot dispatch block body
   uint32_t bodyLoopIdx = 0;       // br-index of loop $L from the current body base
+  uint32_t deoptExtraNest = 0;    // extra `if`/block levels enclosing a deopt vs the
+                                  // usual single guard-`if` (so the OOL br reaches $D)
   uint32_t deoptSiteLocal = 0;    // i32 local: which deopt site fired
   uint32_t propObjLocal = 0;      // i32 local: prop-IC receiver pointer
   uint32_t propShapeLocal = 0;    // i32 local: prop-IC receiver shape
@@ -286,7 +294,8 @@ static bool EmitEnvRootPop(Encoder& e, WJBackend& be);
 
 // Emit a deopt at the current instruction's resume point. All guard misses route
 // here; if there's no usable resume point the whole function bails at compile.
-static bool EmitDeopt(Encoder& e, WJBackend& be) { return EmitDeoptResume(e, be); }
+static bool EmitDeoptImpl(Encoder& e, WJBackend& be) { return EmitDeoptResume(e, be); }
+#define EmitDeopt(e, be) (((be).deoptCallLine = __LINE__), EmitDeoptImpl((e), (be)))
 
 // NUNBOX32 tag word (high 32 bits) for a non-double value type.
 static uint32_t TagWord(JSValueType t) {
@@ -568,9 +577,13 @@ static bool EmitDeoptResumeInline(Encoder& e, WJBackend& be,
   if (nframes > 1 && noInlineResume) return false;
 
   // Debug: gWJDeoptByOp[curOp]++ at the deopt path (which guard kind deopts).
-  static int deoptHist = getenv("GECKO_WJ_DEOPTHIST") ? 1 : 0;
-  if (deoptHist && be.curOp < kWJNumOps) {
-    uintptr_t a = uintptr_t(static_cast<void*>(&gWJDeoptByOp[be.curOp]));
+  // GECKO_WJ_DEOPTLINE: index by the EmitDeopt call's source line instead, so a
+  // stale curOp can't mis-attribute (line%kWJNumOps; print maps back).
+  static int deoptLine = getenv("GECKO_WJ_DEOPTLINE") ? 1 : 0;
+  static int deoptHist = (getenv("GECKO_WJ_DEOPTHIST") || deoptLine) ? 1 : 0;
+  uint32_t histIdx = deoptLine ? (be.deoptCallLine / 8) : be.curOp;
+  if (deoptHist && histIdx < kWJNumOps) {
+    uintptr_t a = uintptr_t(static_cast<void*>(&gWJDeoptByOp[histIdx]));
     if (!e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(a)) ||
         !e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(a)) ||
         !e.writeOp(Op::I32Load) || !e.writeVarU32(2) || !e.writeVarU32(0) ||
@@ -732,12 +745,20 @@ static bool EmitDeoptResume(Encoder& e, WJBackend& be) {
     uint32_t site = uint32_t(be.deoptSites.size());
     // Shadow-eligible iff single-frame (the hot-path shadow only mirrors frame 0).
     bool isShadow = be.shadowDeopt && be.curRp->caller() == nullptr;
+    if (getenv("GECKO_WJ_DEOPTSITEDBG")) {
+      JSScript* ms = be.info ? be.info->script() : nullptr;
+      fprintf(stderr, "[wj-deoptsite] %s:%u curOp=%u(%s) callLine=%u\n",
+              ms && ms->filename() ? ms->filename() : "?",
+              ms ? unsigned(ms->lineno()) : 0, be.curOp,
+              be.curOp < kWJNumOps ? "" : "?", be.deoptCallLine);
+    }
     be.deoptSites.push_back({be.curRp, be.curOp, isShadow});
     // deoptSiteLocal = site; br to `block $D` (one scope past loop $L; +1 again
     // for the guard's own enclosing `if`, where every in-body deopt sits).
     return e.writeOp(Op::I32Const) && e.writeVarS32(int32_t(site)) &&
            e.writeOp(Op::LocalSet) && e.writeVarU32(be.deoptSiteLocal) &&
-           e.writeOp(Op::Br) && e.writeVarU32(be.bodyLoopIdx + 2);
+           e.writeOp(Op::Br) &&
+           e.writeVarU32(be.bodyLoopIdx + 2 + be.deoptExtraNest);
   }
   return EmitDeoptResumeInline(e, be);
 }
@@ -987,6 +1008,18 @@ static bool EmitStageConstBoxed(Encoder& e, WJBackend& be, uint64_t bits,
   return e.writeOp(Op::I64Store) && e.writeVarU32(3) && e.writeVarU32(slot * 8);
 }
 
+// Allocate a prop-IC site for the CURRENT mega read/store, REUSING the same site
+// across recompiles via a stable (script, per-compile read-index) key. This keeps
+// the site pool bounded by the number of distinct read sites (not by recompile
+// count) so it never exhausts -- the exhaustion was why a late mega-recompile's
+// read couldn't convert and fell back to a wrong fixed-slot load (deltablue 741).
+static uint32_t WJPropSite(WJBackend& be) {
+  JSScript* s = be.info ? be.info->script() : nullptr;
+  uint64_t key = (uint64_t(uint32_t(uintptr_t(static_cast<void*>(s)))) << 20) |
+                 (uint64_t(be.propReadIdx++) & 0xFFFFF);
+  return js::wasm::WJAllocPropSiteKeyed(key);
+}
+
 // Inline property-load IC for an own data property with a compile-time-known
 // name (MegamorphicLoadSlot, named GetPropertyCache). `object` must be a
 // receiver of MIRType::Object. Loads obj->shape(), compares to up to kWJPropWays
@@ -996,9 +1029,19 @@ static bool EmitStageConstBoxed(Encoder& e, WJBackend& be, uint64_t bits,
 // the stack. `site` must be a valid (nonzero) pre-allocated prop-site. Mirrors
 // Ion's megamorphic-cache inline load; the per-site cache avoids hash collisions.
 static bool EmitPropIC(Encoder& e, WJBackend& be, MInstruction* ins,
-                       MDefinition* object, uint64_t keyBits, uint32_t site) {
-  gWJPropKey[site] = keyBits;
+                       MDefinition* object, uint64_t keyBits, uint32_t site,
+                       js::Shape* bakedShape = nullptr, uint32_t bakedByteOff = 0,
+                       bool bakedFixed = false) {
   uint32_t base = site * kWJPropWays;
+  // Sites are REUSED across recompiles (WJPropSite, keyed by script+read-index). If
+  // a warmer recompile shifts which reads convert, a site could be repurposed for a
+  // DIFFERENT property -- so reset the key AND the cached (shape->offset) ways here
+  // each compile. A stale shape entry from the old property would otherwise match a
+  // same-shaped receiver and load the OLD property's offset (wrong slot).
+  if (gWJPropKey[site] != keyBits) {
+    for (uint32_t w = 0; w < kWJPropWays; w++) gWJPropShape[base + w] = 0;
+  }
+  gWJPropKey[site] = keyBits;
   uintptr_t shapeArr = uintptr_t(static_cast<void*>(&gWJPropShape[0]));
   uintptr_t offArr = uintptr_t(static_cast<void*>(&gWJPropOff[0]));
   // propObj = receiver pointer (rematerialized, GC-current).
@@ -1037,25 +1080,125 @@ static bool EmitPropIC(Encoder& e, WJBackend& be, MInstruction* ins,
     return e.writeOp(Op::I64Load) && e.writeVarU32(3) && e.writeVarU32(0);
   };
 
-  for (uint32_t w = 0; w < kWJPropWays; w++) {
-    // gWJPropShape[base+w] == propShape ?  (empty slot = 0 never matches a shape)
-    if (!e.writeOp(Op::I32Const) ||
-        !e.writeVarS32(int32_t(shapeArr + (base + w) * 4)) ||
-        !e.writeOp(Op::I32Load) || !e.writeVarU32(2) || !e.writeVarU32(0) ||
-        !GetLocal(e, be.propShapeLocal) || !e.writeOp(Op::I32Eq))
+  // Runtime-cache ways + helper miss path (the polymorphic fallback). Each way:
+  // gWJPropShape[base+w] == propShape ? load that way's (runtime) tagged offset.
+  auto emitWaysAndHelper = [&]() -> bool {
+    for (uint32_t w = 0; w < kWJPropWays; w++) {
+      if (!e.writeOp(Op::I32Const) ||
+          !e.writeVarS32(int32_t(shapeArr + (base + w) * 4)) ||
+          !e.writeOp(Op::I32Load) || !e.writeVarU32(2) || !e.writeVarU32(0) ||
+          !GetLocal(e, be.propShapeLocal) || !e.writeOp(Op::I32Eq))
+        return false;
+      if (!e.writeOp(Op::If) || !e.writeFixedU8(uint8_t(TypeCode::I64)))
+        return false;  // both arms yield i64
+      if (!emitSlotLoad(w)) return false;
+      if (!e.writeOp(Op::Else)) return false;
+    }
+    if (!EmitStageScratch(e, be, object, 0)) return false;
+    if (!EmitHelperCallResult(e, be, ins, WJH_PROPIC, site)) return false;
+    for (uint32_t w = 0; w < kWJPropWays; w++) {
+      if (!e.writeOp(Op::End)) return false;
+    }
+    return true;
+  };
+
+  // BAKED MONOMORPHIC FAST PATH (Ion-like): for a read whose receiver shape is
+  // known at compile time (a GuardShape site), guard obj->shape == the baked
+  // (interned, relocation-safe) shape and load at a COMPILE-TIME-CONSTANT offset --
+  // no runtime offset load, no fixed/dynamic tagged-bit branch (those are the
+  // EmitPropIC overhead that made mega ~10% slower than a plain guarded load on
+  // monomorphic benches like splay). On a shape mismatch (polymorphic receiver, or
+  // a moved-then-different shape) fall to the runtime cache + helper -- NO deopt,
+  // so still correct + fast for deltablue's polymorphic constraint methods.
+  uint32_t bakedSlot = bakedShape ? WJInternShape(uintptr_t(bakedShape)) : 0;
+  if (bakedShape && bakedSlot) {
+    if (!GetLocal(e, be.propShapeLocal)) return false;
+    if (!e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(bakedSlot)) ||
+        !e.writeOp(Op::I32Load) || !e.writeVarU32(2) || !e.writeVarU32(0))
+      return false;  // live (relocated) baked shape from the pool
+    if (!e.writeOp(Op::I32Eq)) return false;
+    if (!e.writeOp(Op::If) || !e.writeFixedU8(uint8_t(TypeCode::I64))) return false;
+    // then: baked constant-offset load.
+    if (!GetLocal(e, be.propObjLocal)) return false;
+    if (!bakedFixed) {  // dynamic slot: base = obj->slots
+      if (!e.writeOp(Op::I32Load) || !e.writeVarU32(2) ||
+          !e.writeVarU32(uint32_t(js::NativeObject::offsetOfSlots())))
+        return false;
+    }
+    if (bakedByteOff) {
+      if (!e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(bakedByteOff)) ||
+          !e.writeOp(Op::I32Add))
+        return false;
+    }
+    if (!e.writeOp(Op::I64Load) || !e.writeVarU32(3) || !e.writeVarU32(0))
       return false;
-    if (!e.writeOp(Op::If) || !e.writeFixedU8(uint8_t(TypeCode::I64)))
-      return false;  // both arms yield i64
-    if (!emitSlotLoad(w)) return false;
     if (!e.writeOp(Op::Else)) return false;
+    if (!emitWaysAndHelper()) return false;
+    return e.writeOp(Op::End);
   }
-  // Innermost else: miss -> stage obj, call WJH_PROPIC (fills the IC + returns).
-  if (!EmitStageScratch(e, be, object, 0)) return false;
-  if (!EmitHelperCallResult(e, be, ins, WJH_PROPIC, site)) return false;
-  for (uint32_t w = 0; w < kWJPropWays; w++) {
-    if (!e.writeOp(Op::End)) return false;
-  }
-  return true;
+  return emitWaysAndHelper();
+}
+
+// GetName IC fast path. Loads the per-site cached holder (gWJNameHolder[site], a
+// traced realm-singleton global object/lexical); if present and its shape still
+// matches, loads the cached slot directly (the value may have mutated, the slot
+// location hasn't). On holder==0 or shape mismatch, stages env+name and calls
+// wjhelp(WJH_GETNAME, site) which resolves + fills the cache + returns the value.
+// Leaves the boxed value (i64) on the stack. `nameBits` = StringValue(name) bits.
+static bool EmitNameIC(Encoder& e, WJBackend& be, MInstruction* ins,
+                       MDefinition* envOp, uint64_t nameBits, uint32_t site) {
+  gWJNameKey[site] = nameBits;
+  uintptr_t holderAddr = uintptr_t(static_cast<void*>(&gWJNameHolder[site]));
+  uintptr_t shapeAddr = uintptr_t(static_cast<void*>(&gWJNameShape[site]));
+  uintptr_t offAddr = uintptr_t(static_cast<void*>(&gWJNameOff[site]));
+  // holder = load gWJNameHolder[site] -> propObjLocal (reuse prop-IC scratch).
+  if (!e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(holderAddr)) ||
+      !e.writeOp(Op::I32Load) || !e.writeVarU32(2) || !e.writeVarU32(0) ||
+      !e.writeOp(Op::LocalSet) || !e.writeVarU32(be.propObjLocal))
+    return false;
+  // valid = holder!=0 ? (holder->shape == gWJNameShape[site]) : 0
+  if (!GetLocal(e, be.propObjLocal) || !e.writeOp(Op::I32Eqz)) return false;
+  if (!e.writeOp(Op::If) || !e.writeFixedU8(uint8_t(TypeCode::I32))) return false;
+  if (!e.writeOp(Op::I32Const) || !e.writeVarS32(0)) return false;  // holder==0
+  if (!e.writeOp(Op::Else)) return false;
+  if (!GetLocal(e, be.propObjLocal) || !e.writeOp(Op::I32Load) ||
+      !e.writeVarU32(2) ||
+      !e.writeVarU32(uint32_t(offsetof(JS::shadow::Object, shape))) ||
+      !e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(shapeAddr)) ||
+      !e.writeOp(Op::I32Load) || !e.writeVarU32(2) || !e.writeVarU32(0) ||
+      !e.writeOp(Op::I32Eq))
+    return false;
+  if (!e.writeOp(Op::End)) return false;
+  // if (valid) load cached slot else miss-helper. Both arms yield i64.
+  if (!e.writeOp(Op::If) || !e.writeFixedU8(uint8_t(TypeCode::I64))) return false;
+  // hit: tagged = gWJNameOff[site]; base = (tagged&1)?holder:holder->slots_;
+  //      value = I64Load(base + (tagged>>1)).
+  if (!e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(offAddr)) ||
+      !e.writeOp(Op::I32Load) || !e.writeVarU32(2) || !e.writeVarU32(0) ||
+      !e.writeOp(Op::LocalSet) || !e.writeVarU32(be.propTaggedLocal))
+    return false;
+  if (!GetLocal(e, be.propTaggedLocal) || !e.writeOp(Op::I32Const) ||
+      !e.writeVarS32(1) || !e.writeOp(Op::I32And))
+    return false;
+  if (!e.writeOp(Op::If) || !e.writeFixedU8(uint8_t(TypeCode::I32))) return false;
+  if (!GetLocal(e, be.propObjLocal)) return false;
+  if (!e.writeOp(Op::Else)) return false;
+  if (!GetLocal(e, be.propObjLocal) || !e.writeOp(Op::I32Load) ||
+      !e.writeVarU32(2) ||
+      !e.writeVarU32(uint32_t(js::NativeObject::offsetOfSlots())))
+    return false;
+  if (!e.writeOp(Op::End)) return false;
+  if (!GetLocal(e, be.propTaggedLocal) || !e.writeOp(Op::I32Const) ||
+      !e.writeVarS32(1) || !e.writeOp(Op::I32ShrU) || !e.writeOp(Op::I32Add))
+    return false;
+  if (!e.writeOp(Op::I64Load) || !e.writeVarU32(3) || !e.writeVarU32(0))
+    return false;
+  if (!e.writeOp(Op::Else)) return false;
+  // miss: stage env + name, call WJH_GETNAME(site) (resolves + fills cache).
+  if (!EmitStageScratch(e, be, envOp, 0)) return false;
+  if (!EmitStageConstBoxed(e, be, nameBits, 1)) return false;
+  if (!EmitHelperCallResult(e, be, ins, WJH_GETNAME, site)) return false;
+  return e.writeOp(Op::End);
 }
 
 // Emit a guarded incremental-GC pre-write barrier on an OLD value about to be
@@ -1223,6 +1366,159 @@ static bool EmitPropStoreIC(Encoder& e, WJBackend& be, MInstruction* ins,
   return true;
 }
 
+// Megamorphic recompile (be.forceMega) support. Find the property KEY for a
+// fixed slot on a shape (the inverse of the cold-IC monomorphic GuardShape: we
+// re-derive the name so a multi-shape EmitPropIC can self-guard + helper-fall-
+// back instead of deopting on a polymorphic receiver). Native shapes only.
+static bool WJDerivePropKey(js::Shape* shape, uint32_t slot, uint64_t* keyBits) {
+  if (!shape || !shape->isShared()) return false;  // shared native shapes only
+  for (js::SharedShapePropertyIter<js::NoGC> it(&shape->asShared()); !it.done();
+       it++) {
+    if (it->hasSlot() && it->slot() == slot) {
+      // EmitPropIC/WJH_PROPIC expect a PropertyKey (jsid) raw bits, NOT a Value.
+      *keyBits = it->key().asRawBits();
+      return true;
+    }
+  }
+  return false;
+}
+// A representative shared shape for a shape guard (GuardShape or, after the IC
+// warms polymorphic, GuardShapeList). For a list all shapes share the property's
+// slot (Warp only folds same-slot shapes), so shapes()[0] derives the same key.
+static js::Shape* WJGuardRepShape(jit::MDefinition* g) {
+  if (g->isGuardShape()) return g->toGuardShape()->shape();
+  if (g->isGuardShapeList()) {
+    const auto& shapes = g->toGuardShapeList()->shapeList()->shapes();
+    for (size_t i = 0; i < 4; i++)
+      if (shapes[i]) return shapes[i];
+  }
+  return nullptr;
+}
+static bool WJIsShapeGuard(jit::MDefinition* g) {
+  return g && (g->isGuardShape() || g->isGuardShapeList());
+}
+// A shape guard (GuardShape/GuardShapeList) is mega-convertible iff every SHAPE-
+// DEPENDENT use is a fixed/dynamic-slot READ or derivable STORE. Then the guard
+// becomes a no-op passthrough (no deopt -- crucially, GuardShapeList no longer
+// deopts on a shape outside its captured set, which was deltablue 414's storm)
+// and reads become self-guarding multi-shape EmitPropIC. Shape-AGNOSTIC uses
+// (calls/compares/returns) are fine unguarded.
+static bool WJMegaConvertibleGuard(jit::MDefinition* gg) {
+  using Op = jit::MDefinition::Opcode;
+  js::Shape* shape = WJGuardRepShape(gg);
+  if (!shape || !shape->isShared()) return false;
+  uint32_t nfixed = shape->asShared().numFixedSlots();
+  for (jit::MUseIterator u = gg->usesBegin(); u != gg->usesEnd(); u++) {
+    jit::MNode* c = u->consumer();
+    if (!c->isDefinition()) continue;  // resume points etc. are shape-agnostic
+    jit::MDefinition* d = c->toDefinition();
+    Op op = d->op();
+    uint64_t k;
+    if (op == Op::LoadFixedSlot) {
+      if (!WJDerivePropKey(shape, uint32_t(d->toLoadFixedSlot()->slot()), &k))
+        return false;
+    } else if (op == Op::LoadFixedSlotAndUnbox) {
+      if (!WJDerivePropKey(shape, uint32_t(d->toLoadFixedSlotAndUnbox()->slot()), &k))
+        return false;
+    } else if (op == Op::StoreFixedSlot) {
+      // store converts to a baked-key store IC; require a derivable key + that the
+      // object operand is THIS guard (operand 0), not the stored value.
+      auto* s = d->toStoreFixedSlot();
+      if (s->object() != gg) return false;  // gg is the stored VALUE -> bail
+      if (!WJDerivePropKey(shape, uint32_t(s->slot()), &k)) return false;
+    } else if (op == Op::Slots) {
+      // dynamic slots: every use of the Slots must be a derivable dynamic READ.
+      for (jit::MUseIterator su = d->usesBegin(); su != d->usesEnd(); su++) {
+        if (!su->consumer()->isDefinition()) continue;
+        jit::MDefinition* sd = su->consumer()->toDefinition();
+        Op so = sd->op();
+        uint32_t dynSlot;
+        if (so == Op::LoadDynamicSlot)
+          dynSlot = uint32_t(sd->toLoadDynamicSlot()->slot());
+        else if (so == Op::LoadDynamicSlotAndUnbox)
+          dynSlot = uint32_t(sd->toLoadDynamicSlotAndUnbox()->slot());
+        else
+          return false;  // dynamic store / other -> keep guard
+        if (!WJDerivePropKey(shape, nfixed + dynSlot, &k)) return false;
+      }
+    } else if (op == Op::Elements || op == Op::StoreDynamicSlot ||
+               op == Op::LoadFixedSlotFromOffset ||
+               op == Op::StoreFixedSlotFromOffset || op == Op::GuardShape) {
+      return false;  // shape-dependent, not converting -> keep the guard
+    }
+    // else: shape-agnostic use -> safe with an unguarded object.
+  }
+  return true;  // no disallowed shape-dependent use -> safe to passthrough
+}
+// The object operand guarded by a shape guard (GuardShape/GuardShapeList).
+static jit::MDefinition* WJGuardObject(jit::MDefinition* g) {
+  if (g->isGuardShape()) return g->toGuardShape()->object();
+  if (g->isGuardShapeList()) return g->toGuardShapeList()->object();
+  return nullptr;
+}
+// If `slots` is MSlots(obj) where obj is a mega-convertible shape guard, return
+// that guard (dynamic reads through it convert to EmitPropIC); else null.
+static jit::MDefinition* WJMegaSlotsGuard(jit::MDefinition* slots) {
+  if (!slots || !slots->isSlots()) return nullptr;
+  jit::MDefinition* obj = slots->getOperand(0);
+  if (!WJIsShapeGuard(obj) || !WJMegaConvertibleGuard(obj)) return nullptr;
+  return obj;
+}
+// GuardShapeListToOffset (polymorphic read where the property sits at DIFFERENT
+// slots per shape -> shape->offset table + deopt on an unlisted shape, deltablue
+// 414's storm). For mega: derive the property key (all shapes hold the same
+// property; shapes()[0]+offsets()[0] suffices -- offsets are dynamic-slot BYTE
+// offsets, so abs slot = numFixedSlots + offset/8). Returns the guarded object +
+// key iff convertible.
+static bool WJMegaGSLTO(jit::MDefinition* g, jit::MDefinition** objOut,
+                        uint64_t* keyOut) {
+  if (!g->isGuardShapeListToOffset()) return false;
+  auto* gg = g->toGuardShapeListToOffset();
+  const auto& shapes = gg->shapeList()->shapes();
+  const auto& offsets = gg->shapeList()->offsets();
+  js::Shape* s0 = nullptr;
+  uint32_t off0 = 0;
+  for (size_t i = 0; i < 4; i++) {
+    if (shapes[i]) { s0 = shapes[i]; off0 = offsets[i]; break; }
+  }
+  if (!s0 || !s0->isShared()) return false;
+  if (off0 % sizeof(JS::Value) != 0) return false;
+  uint32_t slot = s0->asShared().numFixedSlots() + off0 / uint32_t(sizeof(JS::Value));
+  if (!WJDerivePropKey(s0, slot, keyOut)) return false;
+  *objOut = gg->object();
+  return true;
+}
+
+// A generic-IC helper (WJH_BINARYARITH/UNARYARITH/...) leaves a BOXED i64 result
+// on the stack. If Warp TYPED the node (Int32/Double/Boolean), coerce the box to
+// that wasm type so it matches the node's local (else host rejects the module).
+static bool EmitHelperResultAsType(Encoder& e, WJBackend& be, jit::MIRType type) {
+  if (type == jit::MIRType::Value) return true;  // box already matches i64 local
+  if (type == jit::MIRType::Double || type == jit::MIRType::Float32) {
+    // A numeric box may be int32-tagged (e.g. 2+3=5) or double-tagged. Convert
+    // both to f64 WITHOUT deopting (arith of a Double-typed node is always
+    // numeric): int32 -> f64.convert_i32_s; else -> f64.reinterpret. (Raw
+    // reinterpret alone mangles an int32 box -> garbage f64 -> OOB/trap.)
+    uint32_t s = be.unboxScratch;
+    if (!e.writeOp(Op::LocalSet) || !e.writeVarU32(s)) return false;
+    // tag == INT32 ?
+    if (!GetLocal(e, s) || !e.writeOp(Op::I64Const) || !e.writeVarS64(32) ||
+        !e.writeOp(Op::I64ShrU) || !e.writeOp(Op::I32WrapI64) ||
+        !e.writeOp(Op::I32Const) ||
+        !e.writeVarS32(int32_t(TagWord(JSVAL_TYPE_INT32))) || !e.writeOp(Op::I32Eq))
+      return false;
+    if (!e.writeOp(Op::If) || !e.writeFixedU8(0x7C)) return false;  // result f64
+    if (!GetLocal(e, s) || !e.writeOp(Op::I32WrapI64) ||
+        !e.writeOp(Op::F64ConvertI32S))
+      return false;
+    if (!e.writeOp(Op::Else)) return false;
+    if (!GetLocal(e, s) || !e.writeOp(Op::F64ReinterpretI64)) return false;
+    return e.writeOp(Op::End);
+  }
+  // Int32 / Boolean: the payload is the low 32 bits of the NUNBOX box.
+  return e.writeOp(Op::I32WrapI64);
+}
+
 // Compute a node's value, leaving exactly one wasm value on the stack. (For
 // effectful/void nodes EmitEffect is used instead.) Returns false => unsupported.
 static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
@@ -1344,6 +1640,53 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
       // so the guard keeps comparing against the live pointer. Baking it raw made
       // a moved shape ALWAYS fail -> permanent deopt storm (crypto am3: ~475k).
       MGuardShape* g = ins->toGuardShape();
+      // Megamorphic recompile: if every use is a derivable fixed-slot read, the
+      // reads become self-guarding EmitPropIC (handled in LoadFixedSlot), so this
+      // guard is a no-op passthrough -- NO deopt on a polymorphic receiver.
+      if (be.forceMega) {
+        bool conv = WJMegaConvertibleGuard(g);
+        if (getenv("GECKO_WJ_MEGADBG")) {
+          js::Shape* sh = g->shape();
+          const char* badop = "none";
+          if (conv) badop = "CONVERTED";
+          else if (!sh || !sh->isShared()) badop = "not-shared-shape";
+          else {
+            for (jit::MUseIterator u = g->usesBegin(); u != g->usesEnd(); u++) {
+              if (!u->consumer()->isDefinition()) continue;
+              badop = WJOpName(u->consumer()->toDefinition()->op());
+              jit::MDefinition::Opcode o = u->consumer()->toDefinition()->op();
+              if (o == jit::MDefinition::Opcode::LoadFixedSlot ||
+                  o == jit::MDefinition::Opcode::LoadFixedSlotAndUnbox)
+                continue;
+              break;
+            }
+          }
+          JSScript* ms = be.info ? be.info->script() : nullptr;
+          fprintf(stderr, "[wj-mega] %s:%u GuardShape conv=%d firstbad=%s\n",
+                  ms && ms->filename() ? ms->filename() : "?",
+                  ms ? unsigned(ms->lineno()) : 0, conv, badop);
+        }
+        if (conv) return GetOp(e, be, g->object());
+        if (getenv("GECKO_WJ_MEGAFAIL")) {
+          js::Shape* sh = g->shape();
+          const char* badop = (!sh || !sh->isShared()) ? "not-shared" : "?";
+          if (sh && sh->isShared()) {
+            for (jit::MUseIterator u = g->usesBegin(); u != g->usesEnd(); u++) {
+              if (!u->consumer()->isDefinition()) continue;
+              jit::MDefinition::Opcode o = u->consumer()->toDefinition()->op();
+              if (o == jit::MDefinition::Opcode::LoadFixedSlot ||
+                  o == jit::MDefinition::Opcode::LoadFixedSlotAndUnbox)
+                continue;
+              badop = WJOpName(o);
+              break;
+            }
+          }
+          JSScript* ms = be.info ? be.info->script() : nullptr;
+          fprintf(stderr, "[wj-megafail] %s:%u GuardShape NOTCONV firstbad=%s\n",
+                  ms && ms->filename() ? ms->filename() : "?",
+                  ms ? unsigned(ms->lineno()) : 0, badop);
+        }
+      }
       int32_t objLocal = be.local(g->object());
       if (objLocal < 0) return false;
       uint32_t shapeOff = uint32_t(offsetof(JS::shadow::Object, shape));
@@ -1389,6 +1732,40 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
       // safe). Passthrough the object. Lets polymorphic property access (e.g.
       // splay `this.root_` Node-or-null, deltablue constraint subtypes) compile.
       MGuardShapeList* g = ins->toGuardShapeList();
+      // Megamorphic recompile: a GuardShapeList DEOPTS on any shape outside its
+      // captured set -> storms when a new subtype appears (deltablue 414). If its
+      // uses are convertible reads, passthrough (no deopt) and let the reads
+      // self-guard via multi-shape EmitPropIC (helper fallback handles ANY shape).
+      if (be.forceMega) {
+        bool conv = WJMegaConvertibleGuard(ins);
+        if (getenv("GECKO_WJ_MEGADBG")) {
+          js::Shape* sh = WJGuardRepShape(ins);
+          const char* bad = conv ? "CONV" : (!sh || !sh->isShared()) ? "notshared" : "?";
+          if (!conv && sh && sh->isShared()) {
+            for (jit::MUseIterator u = g->usesBegin(); u != g->usesEnd(); u++) {
+              if (!u->consumer()->isDefinition()) continue;
+              jit::MDefinition* d = u->consumer()->toDefinition();
+              jit::MDefinition::Opcode o = d->op();
+              if (o == jit::MDefinition::Opcode::LoadFixedSlot ||
+                  o == jit::MDefinition::Opcode::LoadFixedSlotAndUnbox) {
+                uint64_t k;
+                if (!WJDerivePropKey(sh, o == jit::MDefinition::Opcode::LoadFixedSlot
+                    ? uint32_t(d->toLoadFixedSlot()->slot())
+                    : uint32_t(d->toLoadFixedSlotAndUnbox()->slot()), &k)) {
+                  bad = "nokey-read"; break;
+                }
+                continue;
+              }
+              bad = WJOpName(o); break;
+            }
+          }
+          JSScript* ms = be.info ? be.info->script() : nullptr;
+          fprintf(stderr, "[wj-mega] %s:%u GuardShapeList conv=%d bad=%s\n",
+                  ms && ms->filename() ? ms->filename() : "?",
+                  ms ? unsigned(ms->lineno()) : 0, conv, bad);
+        }
+        if (conv) return GetOp(e, be, g->object());
+      }
       int32_t objLocal = be.local(g->object());
       if (objLocal < 0) return false;
       uint32_t shapeOff = uint32_t(offsetof(JS::shadow::Object, shape));
@@ -1425,6 +1802,23 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
       // safe), then a deopt-free select for the offset. Relocation-safe interned
       // shapes (GC-traced pool). (splay insert/remove `node.left/right`.)
       auto* g = ins->toGuardShapeListToOffset();
+      // Megamorphic recompile: if every use is a LoadDynamicSlotFromOffset that
+      // converts to EmitPropIC (which self-guards + helper-falls-back, ignoring
+      // this offset), drop the DEOPT and emit a dummy offset. This kills the
+      // GuardShapeListToOffset storm on an unlisted shape (deltablue 414).
+      if (be.forceMega) {
+        jit::MDefinition* o = nullptr;
+        uint64_t k = 0;
+        bool allConv = g->hasUses() && WJMegaGSLTO(ins, &o, &k) &&
+                       o->type() == MIRType::Object;
+        for (jit::MUseIterator u = g->usesBegin(); allConv && u != g->usesEnd();
+             u++) {
+          if (!u->consumer()->isDefinition()) continue;
+          if (!u->consumer()->toDefinition()->isLoadDynamicSlotFromOffset())
+            allConv = false;
+        }
+        if (allConv) return e.writeOp(Op::I32Const) && e.writeVarS32(0);
+      }
       int32_t objLocal = be.local(g->object());
       if (objLocal < 0) return false;
       uint32_t shapeOff = uint32_t(offsetof(JS::shadow::Object, shape));
@@ -1520,6 +1914,29 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
       int32_t l = be.local(ins->getOperand(0));
       if (l < 0) return false;
       return GetLocal(e, uint32_t(l));
+    }
+    case MDefinition::Opcode::GuardNullOrUndefined: {
+      // Deopt unless the value's tag is NULL or UNDEFINED; passthrough the value.
+      // (splay `x == null` fast paths.) tag = high 32 bits of the NUNBOX box.
+      int32_t l = be.local(ins->getOperand(0));
+      if (l < 0) return false;
+      auto pushTag = [&]() -> bool {
+        return GetLocal(e, uint32_t(l)) && e.writeOp(Op::I64Const) &&
+               e.writeVarS64(32) && e.writeOp(Op::I64ShrU) &&
+               e.writeOp(Op::I32WrapI64);
+      };
+      if (!pushTag() || !e.writeOp(Op::I32Const) ||
+          !e.writeVarS32(int32_t(TagWord(JSVAL_TYPE_NULL))) || !e.writeOp(Op::I32Eq))
+        return false;
+      if (!pushTag() || !e.writeOp(Op::I32Const) ||
+          !e.writeVarS32(int32_t(TagWord(JSVAL_TYPE_UNDEFINED))) ||
+          !e.writeOp(Op::I32Eq))
+        return false;
+      if (!e.writeOp(Op::I32Or) || !e.writeOp(Op::I32Eqz)) return false;
+      if (!e.writeOp(Op::If) || !e.writeFixedU8(0x40)) return false;
+      if (!EmitDeopt(e, be)) return false;
+      if (!e.writeOp(Op::End)) return false;
+      return GetLocal(e, uint32_t(l));  // passthrough the (null/undefined) value
     }
     case MDefinition::Opcode::GuardFunctionScript: {
       // Deopt unless the function's BaseScript matches the expected one. This is
@@ -1693,6 +2110,30 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
     }
     case MDefinition::Opcode::LoadFixedSlot: {
       MLoadFixedSlot* l = ins->toLoadFixedSlot();
+      // Megamorphic recompile: this read is guarded by a mega-convertible
+      // GuardShape (now a passthrough). Re-derive the property key and emit a
+      // multi-shape EmitPropIC (shape-cache + helper fallback, NO deopt) on the
+      // real receiver -- so a polymorphic receiver (deltablue Equality vs Scale)
+      // never deopts. The PropIC self-guards, so losing the GuardShape is sound.
+      if (be.forceMega && WJIsShapeGuard(l->object()) &&
+          WJMegaConvertibleGuard(l->object())) {
+        // Guard removed -> read MUST convert by-name or BAIL (a fixed-slot read
+        // under a removed guard is a correctness bug for a polymorphic receiver).
+        jit::MDefinition* gs = l->object();
+        uint64_t keyBits = 0;
+        if (WJDerivePropKey(WJGuardRepShape(gs), uint32_t(l->slot()), &keyBits)) {
+          uint32_t site = WJPropSite(be);
+          if (site != 0 && WJGuardObject(gs)->type() == MIRType::Object) {
+            if (!EmitPropIC(e, be, ins, WJGuardObject(gs), keyBits, site,
+                            WJGuardRepShape(gs),
+                            uint32_t(js::NativeObject::getFixedSlotOffset(l->slot())),
+                            /*bakedFixed=*/true))
+              return false;
+            return EmitHelperResultAsType(e, be, l->type());
+          }
+        }
+        return WJBAIL("mega read couldn't convert (guard removed)\n");
+      }
       uint32_t off = uint32_t(js::NativeObject::getFixedSlotOffset(l->slot()));
       // Read the object via GetOp (rematerializes Unbox/GuardShape from the rooted
       // source) -- a cached object local goes stale across a GC-ing call.
@@ -1710,6 +2151,26 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
     }
     case MDefinition::Opcode::LoadFixedSlotAndUnbox: {
       MLoadFixedSlotAndUnbox* l = ins->toLoadFixedSlotAndUnbox();
+      // Megamorphic recompile (see LoadFixedSlot): self-guarding multi-shape load.
+      if (be.forceMega && WJIsShapeGuard(l->object()) &&
+          WJMegaConvertibleGuard(l->object())) {
+        // Guard removed -> read MUST convert by-name or BAIL (a fixed-slot read
+        // under a removed guard is a correctness bug for a polymorphic receiver).
+        jit::MDefinition* gs = l->object();
+        uint64_t keyBits = 0;
+        if (WJDerivePropKey(WJGuardRepShape(gs), uint32_t(l->slot()), &keyBits)) {
+          uint32_t site = WJPropSite(be);
+          if (site != 0 && WJGuardObject(gs)->type() == MIRType::Object) {
+            if (!EmitPropIC(e, be, ins, WJGuardObject(gs), keyBits, site,
+                            WJGuardRepShape(gs),
+                            uint32_t(js::NativeObject::getFixedSlotOffset(l->slot())),
+                            /*bakedFixed=*/true))
+              return false;
+            return EmitHelperResultAsType(e, be, l->type());
+          }
+        }
+        return WJBAIL("mega read couldn't convert (guard removed)\n");
+      }
       uint32_t off = uint32_t(js::NativeObject::getFixedSlotOffset(l->slot()));
       if (!GetOp(e, be, l->object())) return false;  // rematerialized object
       if (!e.writeOp(Op::I64Load) || !e.writeVarU32(3) || !e.writeVarU32(off))
@@ -1721,6 +2182,33 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
     }
     case MDefinition::Opcode::LoadDynamicSlotAndUnbox: {
       MLoadDynamicSlotAndUnbox* l = ins->toLoadDynamicSlotAndUnbox();
+      if (be.forceMega) {
+        if (jit::MDefinition* gs = WJMegaSlotsGuard(l->slots())) {
+          // The shape guard WILL be passthrough'd (removed -- WJMegaConvertibleGuard
+          // matched). So this read MUST become a self-guarding by-name EmitPropIC;
+          // a bare fixed-slot load would read the WRONG slot for a polymorphic
+          // receiver that no longer hits the (removed) guard. If we can't convert
+          // (no derivable key / site pool exhausted), BAIL the whole function --
+          // emitting the fixed-slot load here is a CORRECTNESS bug (deltablue 741
+          // "Cycle": late valve-recompile exhausted the prop-site pool, guard
+          // removed but read stayed fixed-slot).
+          uint32_t nf = WJGuardRepShape(gs)->asShared().numFixedSlots();
+          uint64_t keyBits = 0;
+          if (WJDerivePropKey(WJGuardRepShape(gs), nf + uint32_t(l->slot()), &keyBits) &&
+              WJGuardObject(gs)->type() == MIRType::Object) {
+            uint32_t site = WJPropSite(be);
+            if (site != 0) {
+              if (!EmitPropIC(e, be, ins, WJGuardObject(gs), keyBits, site,
+                              WJGuardRepShape(gs),
+                              uint32_t(l->slot() * sizeof(JS::Value)),
+                              /*bakedFixed=*/false))
+                return false;
+              return EmitHelperResultAsType(e, be, l->type());
+            }
+          }
+          return WJBAIL("mega read couldn't convert (guard removed)\n");
+        }
+      }
       uint32_t off = uint32_t(l->slot() * sizeof(JS::Value));
       if (!GetOp(e, be, l->slots())) return false;
       if (!e.writeOp(Op::I64Load) || !e.writeVarU32(3) || !e.writeVarU32(off))
@@ -1732,6 +2220,28 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
     }
     case MDefinition::Opcode::LoadDynamicSlot: {
       MLoadDynamicSlot* l = ins->toLoadDynamicSlot();
+      if (be.forceMega) {
+        if (jit::MDefinition* gs = WJMegaSlotsGuard(l->slots())) {
+          // Guard removed -> read MUST convert by-name or BAIL (see
+          // LoadDynamicSlotAndUnbox: a fixed-slot read under a removed guard is a
+          // correctness bug on a polymorphic receiver).
+          uint32_t nf = WJGuardRepShape(gs)->asShared().numFixedSlots();
+          uint64_t keyBits = 0;
+          if (WJDerivePropKey(WJGuardRepShape(gs), nf + uint32_t(l->slot()), &keyBits) &&
+              WJGuardObject(gs)->type() == MIRType::Object) {
+            uint32_t site = WJPropSite(be);
+            if (site != 0) {
+              if (!EmitPropIC(e, be, ins, WJGuardObject(gs), keyBits, site,
+                              WJGuardRepShape(gs),
+                              uint32_t(l->slot() * sizeof(JS::Value)),
+                              /*bakedFixed=*/false))
+                return false;
+              return EmitHelperResultAsType(e, be, l->type());
+            }
+          }
+          return WJBAIL("mega read couldn't convert (guard removed)\n");
+        }
+      }
       uint32_t off = uint32_t(l->slot() * sizeof(JS::Value));
       if (!GetOp(e, be, l->slots())) return false;
       if (!e.writeOp(Op::I64Load) || !e.writeVarU32(3) || !e.writeVarU32(off))
@@ -1745,6 +2255,26 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
       // result = loadValue(slots + offset). offset is a runtime byte offset
       // (Ion: BaseIndex(slots, offset, TimesOne)). Result is a boxed Value.
       MLoadDynamicSlotFromOffset* l = ins->toLoadDynamicSlotFromOffset();
+      // Megamorphic recompile: the offset comes from a GuardShapeListToOffset that
+      // DEOPTS on an unlisted shape (deltablue 414 storm). Convert to a no-deopt
+      // multi-shape EmitPropIC on the real receiver (helper fallback for any shape).
+      if (be.forceMega) {
+        jit::MDefinition* obj = nullptr;
+        uint64_t keyBits = 0;
+        if (WJMegaGSLTO(l->offset(), &obj, &keyBits) &&
+            obj->type() == MIRType::Object) {
+          uint32_t site = WJPropSite(be);
+          if (site != 0) {
+            if (!EmitPropIC(e, be, ins, obj, keyBits, site)) return false;
+            return EmitHelperResultAsType(e, be, l->type());
+          }
+          // The GuardShapeListToOffset may have been converted to a DUMMY offset (0)
+          // -- then GetOp(offset) reads slots+0 (the WRONG slot). Can't convert (no
+          // site) -> BAIL rather than read the wrong slot. Conservative (also bails
+          // the rare case the GSLTO kept its real offset), but always correct.
+          return WJBAIL("mega GSLTO read couldn't convert\n");
+        }
+      }
       if (!GetOp(e, be, l->slots())) return false;       // i32 slots ptr
       if (!GetOp(e, be, l->offset())) return false;       // i32 byte offset
       if (!e.writeOp(Op::I32Add)) return false;
@@ -2079,6 +2609,341 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
       if (!EmitStageScratch(e, be, g->idval(), 1)) return false;
       return EmitHelperCallResult(e, be, ins, WJH_GETPROP, 0);
     }
+    case MDefinition::Opcode::GetNameCache: {
+      // Global/lexical name lookup. envObj = operand 0; the name is the GETNAME/
+      // GETGNAME bytecode's atom operand at the node's resume-point pc (baked as a
+      // StringValue, like Ion's IonGetNameIC reading the pc). Helper does the env
+      // walk (GetEnvironmentName). Result is a Value.
+      if (getenv("GECKO_WJ_NOGETNAME")) return false;
+      MResumePoint* rp = ins->resumePoint();
+      JSScript* s = be.info ? be.info->script() : nullptr;
+      if (!rp || !rp->pc() || !s) return false;
+      js::PropertyName* name = s->getName(rp->pc());
+      if (!name) return false;
+      uint64_t nameBits = JS::StringValue(name).asRawBits();
+      uint32_t site = WJAllocNameSite();
+      if (site == 0) {  // out of IC sites: uncached helper (rare, still correct)
+        if (!EmitStageScratch(e, be, ins->getOperand(0), 0)) return false;
+        if (!EmitStageConstBoxed(e, be, nameBits, 1)) return false;
+        return EmitHelperCallResult(e, be, ins, WJH_GETNAME, 0);
+      }
+      return EmitNameIC(e, be, ins, ins->getOperand(0), nameBits, site);
+    }
+    case MDefinition::Opcode::ToPropertyKeyCache: {
+      if (!EmitStageScratch(e, be, ins->getOperand(0), 0)) return false;
+      return EmitHelperCallResult(e, be, ins, WJH_TOPROPKEY, 0);  // Value
+    }
+    case MDefinition::Opcode::CharCodeAt: {
+      if (!EmitStageScratch(e, be, ins->getOperand(0), 0)) return false;  // string
+      if (!EmitStageScratch(e, be, ins->getOperand(1), 1)) return false;  // index
+      if (!EmitHelperCallResult(e, be, ins, WJH_CHARCODEAT, 0)) return false;
+      return EmitHelperResultAsType(e, be, ins->type());  // Int32
+    }
+    case MDefinition::Opcode::FromCharCode: {
+      if (!EmitStageScratch(e, be, ins->getOperand(0), 0)) return false;  // code
+      if (!EmitHelperCallResult(e, be, ins, WJH_FROMCHARCODE, 0)) return false;
+      return EmitHelperResultAsType(e, be, ins->type());  // String
+    }
+    case MDefinition::Opcode::ToString: {
+      if (!EmitStageScratch(e, be, ins->getOperand(0), 0)) return false;
+      if (!EmitHelperCallResult(e, be, ins, WJH_TOSTRING, 0)) return false;
+      return EmitHelperResultAsType(e, be, ins->type());  // String
+    }
+    case MDefinition::Opcode::BinaryCache: {
+      // The JSOp comes from the node's RESUME POINT pc (matching Ion's
+      // visitBinaryValueCache -- NOT trackedSite, which points at a JumpTarget
+      // here). Only the 12 arith ops reach a BinaryValueCache (comparisons use
+      // MCompare).
+      MResumePoint* rp = ins->resumePoint();
+      if (!rp || !rp->pc()) return false;
+      JSOp jsop = JSOp(*rp->pc());
+      MIRType ty = ins->type();
+      int32_t l0 = be.local(ins->getOperand(0)), l1 = be.local(ins->getOperand(1));
+
+      // (A) SPECULATIVE INLINE f64 ARITH (default-on). A cold/unspecialized arith
+      // IC yields an untyped MBinaryCache; the IC never warms in this PBL build
+      // (CacheIR stubs can't attach -> Warp stays blind), so navier's hot double
+      // loops were stuck on it. Instead of a C++ helper hop, unbox both operands
+      // as NUMBERS (int32 -> convert, double -> reinterpret, else DEOPT to PBL --
+      // correct for string concat / objects) and do the f64 op inline. This is
+      // typed arith WITHOUT needing the IC to warm. +,-,*,/ map directly to f64
+      // ops (JS number semantics); %/** and bitops fall through to (B).
+      Op fop = Op::F64Add;
+      bool f64op = true;
+      switch (jsop) {
+        case JSOp::Add: fop = Op::F64Add; break;
+        case JSOp::Sub: fop = Op::F64Sub; break;
+        case JSOp::Mul: fop = Op::F64Mul; break;
+        case JSOp::Div: fop = Op::F64Div; break;
+        default: f64op = false; break;
+      }
+      // ty==Double: operands are proven numbers -> inline f64 (the fallible unbox's
+      // deopt never fires).
+      if (f64op && l0 >= 0 && l1 >= 0 && ty == MIRType::Double &&
+          !getenv("GECKO_WJ_NOSPECARITH")) {
+        if (!EmitUnboxLocal(e, be, uint32_t(l0), MIRType::Double, /*fallible=*/true))
+          return false;
+        if (!EmitUnboxLocal(e, be, uint32_t(l1), MIRType::Double, /*fallible=*/true))
+          return false;
+        return e.writeOp(fop);  // f64 result matches the f64 local
+      }
+      // ty==Value Add/Sub/Mul/Div: the operands COULD be non-numbers (splay's string
+      // concat `'..' + tag + '..'`). The old code unboxed them as Double and DEOPTED
+      // on strings every time -> deopt-resume churn/corruption. Instead branch at
+      // runtime with NO deopt: if BOTH operands are numbers, inline f64 (keeps
+      // navier's Value-typed numeric arith fast); else call WJH_BINARYARITH
+      // (AddValues/... -- correct for strings + mixed types). The result is a boxed
+      // Value (i64) either way.
+      if (f64op && l0 >= 0 && l1 >= 0 && ty == MIRType::Value &&
+          !getenv("GECKO_WJ_NOSPECARITH")) {
+        auto pushTag = [&](int32_t l) -> bool {
+          return GetLocal(e, uint32_t(l)) && e.writeOp(Op::I64Const) &&
+                 e.writeVarS64(32) && e.writeOp(Op::I64ShrU) &&
+                 e.writeOp(Op::I32WrapI64);
+        };
+        auto pushIsNum = [&](int32_t l) -> bool {  // (tag u<= CLEAR) | (tag == INT32)
+          return pushTag(l) && e.writeOp(Op::I32Const) &&
+                 e.writeVarS32(int32_t(uint32_t(JSVAL_TAG_CLEAR))) &&
+                 e.writeOp(Op::I32LeU) && pushTag(l) && e.writeOp(Op::I32Const) &&
+                 e.writeVarS32(int32_t(TagWord(JSVAL_TYPE_INT32))) &&
+                 e.writeOp(Op::I32Eq) && e.writeOp(Op::I32Or);
+        };
+        auto pushF64 = [&](int32_t l) -> bool {  // int32 -> convert; else reinterpret
+          if (!pushTag(l) || !e.writeOp(Op::I32Const) ||
+              !e.writeVarS32(int32_t(TagWord(JSVAL_TYPE_INT32))) ||
+              !e.writeOp(Op::I32Eq) || !e.writeOp(Op::If) || !e.writeFixedU8(0x7C))
+            return false;
+          if (!GetLocal(e, uint32_t(l)) || !e.writeOp(Op::I32WrapI64) ||
+              !e.writeOp(Op::F64ConvertI32S) || !e.writeOp(Op::Else))
+            return false;
+          if (!GetLocal(e, uint32_t(l)) || !e.writeOp(Op::F64ReinterpretI64) ||
+              !e.writeOp(Op::End))
+            return false;
+          return true;
+        };
+        if (!pushIsNum(l0) || !pushIsNum(l1) || !e.writeOp(Op::I32And)) return false;
+        if (!e.writeOp(Op::If) || !e.writeFixedU8(uint8_t(TypeCode::I64)))
+          return false;
+        // both numbers: inline f64, box to a double Value.
+        if (!pushF64(l0) || !pushF64(l1) || !e.writeOp(fop)) return false;
+        if (!EmitBoxFromStack(e, MIRType::Double)) return false;
+        if (!e.writeOp(Op::Else)) return false;
+        // non-numbers: VM helper (no deopt).
+        if (!EmitStageScratch(e, be, ins->getOperand(0), 0)) return false;
+        if (!EmitStageScratch(e, be, ins->getOperand(1), 1)) return false;
+        if (!EmitHelperCallResult(e, be, ins, WJH_BINARYARITH, uint32_t(jsop)))
+          return false;
+        return e.writeOp(Op::End);
+      }
+
+      // (A2) INLINE i32 ARITH for an Int32-typed result. Bitwise ops directly;
+      // Add/Sub/Mul in the i64 domain with an overflow deopt (a result that
+      // doesn't fit int32 becomes a double, violating the Int32 type). Operands
+      // unboxed as int32 (deopt if not). Mod/Pow/Ursh fall to (B).
+      if (ty == MIRType::Int32 && l0 >= 0 && l1 >= 0 &&
+          !getenv("GECKO_WJ_NOSPECARITH")) {
+        Op bop = Op::I32Or;
+        bool bit = true;
+        switch (jsop) {
+          case JSOp::BitOr: bop = Op::I32Or; break;
+          case JSOp::BitAnd: bop = Op::I32And; break;
+          case JSOp::BitXor: bop = Op::I32Xor; break;
+          case JSOp::Lsh: bop = Op::I32Shl; break;
+          case JSOp::Rsh: bop = Op::I32ShrS; break;
+          default: bit = false; break;
+        }
+        if (bit) {
+          if (!EmitUnboxLocal(e, be, uint32_t(l0), MIRType::Int32, true)) return false;
+          if (!EmitUnboxLocal(e, be, uint32_t(l1), MIRType::Int32, true)) return false;
+          return e.writeOp(bop);
+        }
+        if (jsop == JSOp::Add || jsop == JSOp::Sub || jsop == JSOp::Mul) {
+          Op iop = jsop == JSOp::Add   ? Op::I64Add
+                   : jsop == JSOp::Sub ? Op::I64Sub
+                                       : Op::I64Mul;
+          if (!EmitUnboxLocal(e, be, uint32_t(l0), MIRType::Int32, true)) return false;
+          if (!e.writeOp(Op::I64ExtendI32S)) return false;
+          if (!EmitUnboxLocal(e, be, uint32_t(l1), MIRType::Int32, true)) return false;
+          if (!e.writeOp(Op::I64ExtendI32S)) return false;
+          if (!e.writeOp(iop)) return false;  // exact i64 result
+          if (!e.writeOp(Op::LocalSet) || !e.writeVarU32(be.unboxScratch))
+            return false;
+          // deopt unless result == sign_extend(wrap32(result)) (i.e. fits int32).
+          if (!GetLocal(e, be.unboxScratch) || !e.writeOp(Op::I32WrapI64) ||
+              !e.writeOp(Op::I64ExtendI32S) || !GetLocal(e, be.unboxScratch) ||
+              !e.writeOp(Op::I64Ne))
+            return false;
+          if (!e.writeOp(Op::If) || !e.writeFixedU8(0x40)) return false;
+          if (!EmitDeopt(e, be)) return false;
+          if (!e.writeOp(Op::End)) return false;
+          return GetLocal(e, be.unboxScratch) && e.writeOp(Op::I32WrapI64);
+        }
+      }
+
+      // (A3) COMPARISON (Boolean-typed MBinaryCache): a cold/untyped ==,!=,<,<=,>,
+      // >=,===,!== whose operands our inline Compare couldn't type. Route to the
+      // WJH_COMPARE VM helper (correct for any operand types). It's a C++ hop
+      // (~PBL speed for THIS op) but keeps the whole FUNCTION compiled in JIT rather
+      // than bailing it to PBL (deltablue's constraint comparisons did the latter
+      // -> whole functions ran in PBL -> slow). Default-on: a compile-coverage win.
+      if (ins->type() == MIRType::Boolean) {
+        switch (jsop) {
+          case JSOp::Eq: case JSOp::Ne: case JSOp::StrictEq: case JSOp::StrictNe:
+          case JSOp::Lt: case JSOp::Le: case JSOp::Gt: case JSOp::Ge:
+            break;
+          default: return false;
+        }
+        if (!EmitStageScratch(e, be, ins->getOperand(0), 0)) return false;
+        if (!EmitStageScratch(e, be, ins->getOperand(1), 1)) return false;
+        if (!EmitHelperCallResult(e, be, ins, WJH_COMPARE, uint32_t(jsop)))
+          return false;
+        return EmitHelperResultAsType(e, be, MIRType::Boolean);
+      }
+
+      // (B) Generic VM-helper fallback (WJH_BINARYARITH = the *Values VM ops): %, **,
+      // bitops, or non-number Add/Sub/Mul/Div not handled inline above. DEFAULT-ON
+      // now (was ARITHCACHE-gated): a C++ hop but keeps the FUNCTION in JIT instead
+      // of bailing to PBL (crypto bignum %/bitops, raytrace Math.pow). jsop from
+      // rp->pc() is correct (the old crash was the trackedSite-pc bug).
+      // GECKO_WJ_NOARITHHELPER reverts.
+      if (getenv("GECKO_WJ_NOARITHHELPER")) return false;
+      switch (jsop) {
+        case JSOp::Add: case JSOp::Sub: case JSOp::Mul: case JSOp::Div:
+        case JSOp::Mod: case JSOp::Pow: case JSOp::BitOr: case JSOp::BitAnd:
+        case JSOp::BitXor: case JSOp::Lsh: case JSOp::Rsh: case JSOp::Ursh:
+          break;
+        default: return false;
+      }
+      if (!EmitStageScratch(e, be, ins->getOperand(0), 0)) return false;
+      if (!EmitStageScratch(e, be, ins->getOperand(1), 1)) return false;
+      if (!EmitHelperCallResult(e, be, ins, WJH_BINARYARITH, uint32_t(jsop)))
+        return false;
+      return EmitHelperResultAsType(e, be, ins->type());
+    }
+    case MDefinition::Opcode::UnaryCache: {
+      MResumePoint* rp = ins->resumePoint();
+      if (!rp || !rp->pc()) return false;
+      JSOp jsop = JSOp(*rp->pc());
+      MIRType ty = ins->type();
+      int32_t l0 = be.local(ins->getOperand(0));
+
+      // (A) SPECULATIVE INLINE f64 (default-on; see BinaryCache). Neg/Pos/ToNumeric
+      // of a Value/Double: unbox the operand as a NUMBER (deopt on non-number) and
+      // do the f64 op inline -- typed arith without the (never-warming) IC. Neg ->
+      // f64.neg; Pos/ToNumeric on a number is just the unboxed value.
+      if ((jsop == JSOp::Neg || jsop == JSOp::Pos || jsop == JSOp::ToNumeric) &&
+          l0 >= 0 && (ty == MIRType::Value || ty == MIRType::Double) &&
+          !getenv("GECKO_WJ_NOSPECARITH")) {
+        if (!EmitUnboxLocal(e, be, uint32_t(l0), MIRType::Double, /*fallible=*/true))
+          return false;
+        if (jsop == JSOp::Neg && !e.writeOp(Op::F64Neg)) return false;
+        if (ty == MIRType::Double) return true;
+        return EmitBoxFromStack(e, MIRType::Double);
+      }
+
+      // Value-typed Inc/Dec (navier's `i++/j++` loop counters Warp didn't prove
+      // Int32). Runtime branch, NO deopt: number -> inline f64 +/-1 (box as a double
+      // Value -- semantically a number); non-number -> WJH_UNARYARITH helper. Keeps
+      // the hot loop counter inline instead of a per-iteration C++ hop or a bail.
+      if ((jsop == JSOp::Inc || jsop == JSOp::Dec) && l0 >= 0 &&
+          ty == MIRType::Value && !getenv("GECKO_WJ_NOSPECARITH")) {
+        auto pushTag = [&]() -> bool {
+          return GetLocal(e, uint32_t(l0)) && e.writeOp(Op::I64Const) &&
+                 e.writeVarS64(32) && e.writeOp(Op::I64ShrU) &&
+                 e.writeOp(Op::I32WrapI64);
+        };
+        if (!pushTag() || !e.writeOp(Op::I32Const) ||
+            !e.writeVarS32(int32_t(uint32_t(JSVAL_TAG_CLEAR))) ||
+            !e.writeOp(Op::I32LeU) || !pushTag() || !e.writeOp(Op::I32Const) ||
+            !e.writeVarS32(int32_t(TagWord(JSVAL_TYPE_INT32))) ||
+            !e.writeOp(Op::I32Eq) || !e.writeOp(Op::I32Or))
+          return false;  // isNumber
+        if (!e.writeOp(Op::If) || !e.writeFixedU8(uint8_t(TypeCode::I64)))
+          return false;
+        // number: int32 -> convert, else reinterpret; +/- 1.0; box double.
+        if (!pushTag() || !e.writeOp(Op::I32Const) ||
+            !e.writeVarS32(int32_t(TagWord(JSVAL_TYPE_INT32))) ||
+            !e.writeOp(Op::I32Eq) || !e.writeOp(Op::If) || !e.writeFixedU8(0x7C))
+          return false;
+        if (!GetLocal(e, uint32_t(l0)) || !e.writeOp(Op::I32WrapI64) ||
+            !e.writeOp(Op::F64ConvertI32S) || !e.writeOp(Op::Else) ||
+            !GetLocal(e, uint32_t(l0)) || !e.writeOp(Op::F64ReinterpretI64) ||
+            !e.writeOp(Op::End))
+          return false;
+        if (!e.writeOp(Op::F64Const) || !e.writeFixedF64(1.0) ||
+            !e.writeOp(jsop == JSOp::Inc ? Op::F64Add : Op::F64Sub))
+          return false;
+        if (!EmitBoxFromStack(e, MIRType::Double)) return false;
+        if (!e.writeOp(Op::Else)) return false;
+        if (!EmitStageScratch(e, be, ins->getOperand(0), 0)) return false;
+        if (!EmitHelperCallResult(e, be, ins, WJH_UNARYARITH, uint32_t(jsop)))
+          return false;
+        return e.writeOp(Op::End);
+      }
+
+      // (A2) INLINE i32 for an Int32-typed result (cold loop counters i++/i--,
+      // ~x). Operand unboxed as int32 (deopt if not). Inc/Dec overflow-checked;
+      // Neg deopts on 0 (-> -0 double) and INT32_MIN (overflow); BitNot is exact.
+      if (ty == MIRType::Int32 && l0 >= 0 && !getenv("GECKO_WJ_NOSPECARITH")) {
+        if (jsop == JSOp::BitNot) {
+          if (!EmitUnboxLocal(e, be, uint32_t(l0), MIRType::Int32, true)) return false;
+          return e.writeOp(Op::I32Const) && e.writeVarS32(-1) &&
+                 e.writeOp(Op::I32Xor);
+        }
+        if (jsop == JSOp::Inc || jsop == JSOp::Dec) {
+          if (!EmitUnboxLocal(e, be, uint32_t(l0), MIRType::Int32, true)) return false;
+          if (!e.writeOp(Op::I64ExtendI32S) || !e.writeOp(Op::I64Const) ||
+              !e.writeVarS64(jsop == JSOp::Inc ? 1 : -1) || !e.writeOp(Op::I64Add))
+            return false;
+          if (!e.writeOp(Op::LocalSet) || !e.writeVarU32(be.unboxScratch))
+            return false;
+          if (!GetLocal(e, be.unboxScratch) || !e.writeOp(Op::I32WrapI64) ||
+              !e.writeOp(Op::I64ExtendI32S) || !GetLocal(e, be.unboxScratch) ||
+              !e.writeOp(Op::I64Ne))
+            return false;
+          if (!e.writeOp(Op::If) || !e.writeFixedU8(0x40)) return false;
+          if (!EmitDeopt(e, be)) return false;
+          if (!e.writeOp(Op::End)) return false;
+          return GetLocal(e, be.unboxScratch) && e.writeOp(Op::I32WrapI64);
+        }
+        if (jsop == JSOp::Neg) {
+          // deopt if operand == 0 (Neg(0) = -0, a double) or INT32_MIN (overflow).
+          if (!EmitUnboxLocal(e, be, uint32_t(l0), MIRType::Int32, true)) return false;
+          if (!e.writeOp(Op::LocalSet) || !e.writeVarU32(be.unboxScratch))
+            return false;
+          // (op == 0) | (op == INT32_MIN)  -> deopt
+          if (!GetLocal(e, be.unboxScratch) || !e.writeOp(Op::I32Eqz))
+            return false;
+          if (!GetLocal(e, be.unboxScratch) || !e.writeOp(Op::I32Const) ||
+              !e.writeVarS32(INT32_MIN) || !e.writeOp(Op::I32Eq) ||
+              !e.writeOp(Op::I32Or))
+            return false;
+          if (!e.writeOp(Op::If) || !e.writeFixedU8(0x40)) return false;
+          if (!EmitDeopt(e, be)) return false;
+          if (!e.writeOp(Op::End)) return false;
+          // 0 - op
+          return e.writeOp(Op::I32Const) && e.writeVarS32(0) &&
+                 GetLocal(e, be.unboxScratch) && e.writeOp(Op::I32Sub);
+        }
+      }
+
+      // (B) Generic VM-helper fallback (WJH_UNARYARITH = DoUnaryArithFallback).
+      // DEFAULT-ON now: an uncovered unary (e.g. a Value-typed Inc/Dec navier emits)
+      // must COMPILE, not bail the whole function to PBL. jsop now comes from
+      // rp->pc() (correct) -- the old ARITHCACHE crash was the trackedSite-pc bug
+      // giving a wrong jsop. GECKO_WJ_NOARITHHELPER reverts.
+      if (getenv("GECKO_WJ_NOARITHHELPER")) return false;
+      switch (jsop) {
+        case JSOp::BitNot: case JSOp::Pos: case JSOp::Neg:
+        case JSOp::Inc: case JSOp::Dec: case JSOp::ToNumeric:
+          break;
+        default: return false;
+      }
+      if (!EmitStageScratch(e, be, ins->getOperand(0), 0)) return false;
+      if (!EmitHelperCallResult(e, be, ins, WJH_UNARYARITH, uint32_t(jsop)))
+        return false;
+      return EmitHelperResultAsType(e, be, ins->type());
+    }
     case MDefinition::Opcode::ArrayPush: {
       MArrayPush* a = ins->toArrayPush();
       if (!EmitStageScratch(e, be, a->object(), 0)) return false;
@@ -2102,7 +2967,7 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
       MMegamorphicLoadSlot* m = ins->toMegamorphicLoadSlot();
       static int noPropIC = getenv("GECKO_WJ_NOPROPIC") ? 1 : 0;
       if (!noPropIC && m->object()->type() == MIRType::Object) {
-        uint32_t site = WJAllocPropSite();
+        uint32_t site = WJPropSite(be);
         if (site != 0) {
           return EmitPropIC(e, be, ins, m->object(), m->name().asRawBits(), site);
         }
@@ -2126,6 +2991,7 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
       if (!EmitStageScratch(e, be, c->getOperand(1), 1)) return false;  // newTarget
       return EmitHelperCallResult(e, be, ins, WJH_CREATETHIS, 0);
     }
+    case MDefinition::Opcode::NewObject:
     case MDefinition::Opcode::NewPlainObject:
     case MDefinition::Opcode::NewArrayObject:
     case MDefinition::Opcode::NewArray: {
@@ -2147,7 +3013,11 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
       // createPlainGCObject: load nursery position, bump, bounds-check vs
       // currentEnd, store NurseryCellHeader+shape+slots+elements, fill undefined;
       // this WJH_NEW* helper becomes the OOL nursery-full fallback). Kept gated.
-      static int doNewAlloc = getenv("GECKO_WJ_NEWALLOC") ? 1 : 0;
+      // DEFAULT-ON now (was gated): bailing the whole function to PBL is worse
+      // than the helper hop per the "compile everything" directive, and inline
+      // bump-alloc below handles the hot NewPlainObject case. GECKO_WJ_NONEWALLOC
+      // reverts to bailing.
+      static int doNewAlloc = getenv("GECKO_WJ_NONEWALLOC") ? 0 : 1;
       if (!doNewAlloc) return false;
       auto stG = [&](void* g, int32_t v) -> bool {
         return e.writeOp(Op::I32Const) && e.writeVarS32(int32_t(uintptr_t(g))) &&
@@ -2155,9 +3025,65 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
                e.writeOp(Op::I32Store) && e.writeVarU32(2) && e.writeVarU32(0);
       };
       int kind;
-      if (ins->op() == MDefinition::Opcode::NewPlainObject) {
-        MNewPlainObject* n = ins->toNewPlainObject();
-        uintptr_t shapeAddr = WJInternShape(uintptr_t(n->shape()));
+      // NewObject in ObjectLiteral mode carries NO compile-time template shape (the
+      // shape is in the bytecode) -> NewObjectOperation(script, pc) via WJH_NEWOBJECT.
+      if (ins->op() == MDefinition::Opcode::NewObject &&
+          !ins->toNewObject()->templateObject()) {
+        // Use the RESUME POINT pc, not trackedSite() -- the latter points at a
+        // JumpTarget here (NewObjectOperation would read a garbage gcthing ->
+        // wrong-shaped object -> OOB StoreFixedSlot -> heap corruption). The rp pc
+        // is the JSOp::NewObject bytecode (matches Ion's visitNewObject site).
+        MResumePoint* rp = ins->resumePoint();
+        if (!rp || !rp->pc()) return false;
+        JSScript* sc = rp->block()->info().script();
+        if (!sc) return false;
+        jsbytecode* pc = rp->pc();
+        if (JSOp(*pc) != JSOp::NewObject && JSOp(*pc) != JSOp::NewInit &&
+            JSOp(*pc) != JSOp::Object) {
+          if (getenv("GECKO_WJ_NEWOBJDBG"))
+            fprintf(stderr, "[wj-newobj] %s:%u UNEXPECTED op@rp=%s -> bail\n",
+                    sc->filename() ? sc->filename() : "?", unsigned(sc->lineno()),
+                    js::CodeName(JSOp(*pc)));
+          return false;  // unexpected pc -> bail rather than risk corruption
+        }
+        uint32_t pcOff = uint32_t(pc - sc->code());
+        if (!stG(&js::wasm::gWJNewObjScript,
+                 int32_t(uintptr_t(static_cast<void*>(sc)))) ||
+            !stG(&js::wasm::gWJNewObjPcOff, int32_t(pcOff)))
+          return false;
+        if (!EmitHelperCallResult(e, be, ins, WJH_NEWOBJECT, 0)) return false;
+        return e.writeOp(Op::I32WrapI64);
+      }
+      // NewObject (object literal `{a:.., b:..}` -- splay GeneratePayloadTree) shares
+      // the NewPlainObject inline bump-alloc, deriving the shape/layout from its
+      // template object. Both allocate an object with a fixed shape, fixed slots
+      // init'd to undefined (the bytecode's InitProp/StoreFixedSlot fills the real
+      // values). Falls to the WJH_NEWPLAIN helper (any shared shape) on nursery-full.
+      bool isPlainLike = ins->op() == MDefinition::Opcode::NewPlainObject ||
+                         ins->op() == MDefinition::Opcode::NewObject;
+      if (isPlainLike) {
+        const js::Shape* pShape = nullptr;
+        uint32_t pNfixed = 0, pNdynamic = 0;
+        js::gc::AllocKind pAllocKind = js::gc::AllocKind::OBJECT0;
+        gc::Heap pHeap = gc::Heap::Default;
+        if (ins->op() == MDefinition::Opcode::NewPlainObject) {
+          MNewPlainObject* n = ins->toNewPlainObject();
+          pShape = n->shape();
+          pNfixed = n->numFixedSlots();
+          pNdynamic = n->numDynamicSlots();
+          pAllocKind = n->allocKind();
+          pHeap = n->initialHeap();
+        } else {
+          JSObject* t = ins->toNewObject()->templateObject();
+          if (!t || !t->is<js::NativeObject>()) return false;  // VM-call mode: bail
+          js::NativeObject* nt = &t->as<js::NativeObject>();
+          pShape = nt->shape();
+          pNfixed = nt->numFixedSlots();
+          pNdynamic = nt->numDynamicSlots();
+          pAllocKind = nt->asTenured().getAllocKind();
+          pHeap = ins->toNewObject()->initialHeap();
+        }
+        uintptr_t shapeAddr = WJInternShape(uintptr_t(pShape));
         if (!shapeAddr) return false;
         // INLINE nursery bump-allocation (Ion createPlainGCObject), with the
         // WJH_NEWPLAIN helper as the nursery-full OOL fallback. Makes alloc-bound
@@ -2165,14 +3091,14 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
         // hop. Gated GECKO_WJ_INLINEALLOC. Only ndynamic==0 (else helper). All
         // layout values (header size, currentEnd offset, thingSize) come from the
         // real runtime functions so wasm32 alignment is correct by construction.
-        static int inlineAlloc = getenv("GECKO_WJ_INLINEALLOC") ? 1 : 0;
-        if (inlineAlloc && n->numDynamicSlots() == 0 && gWJNurseryPosAddr &&
+        static int inlineAlloc = getenv("GECKO_WJ_NOINLINEALLOC") ? 0 : 1;
+        if (inlineAlloc && pNdynamic == 0 && gWJNurseryPosAddr &&
             gWJObjHeaderWord) {
           uint32_t headerSize = uint32_t(js::Nursery::nurseryCellHeaderSize());
           int32_t endOff = js::Nursery::offsetOfCurrentEndFromPosition();
           uint32_t totalSize =
-              uint32_t(js::gc::Arena::thingSize(n->allocKind())) + headerSize;
-          uint32_t nfixed = n->numFixedSlots();
+              uint32_t(js::gc::Arena::thingSize(pAllocKind)) + headerSize;
+          uint32_t nfixed = pNfixed;
           uint32_t shapeOff = uint32_t(offsetof(JS::shadow::Object, shape));
           uint32_t slotsOff = uint32_t(js::NativeObject::offsetOfSlots());
           uint32_t elemsOff = uint32_t(js::NativeObject::offsetOfElements());
@@ -2203,8 +3129,8 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
             return false;
           // OOL (nursery full): helper alloc, unwrap boxed Object -> ptr.
           if (!stG(&gWJNewShapeSlot, int32_t(shapeAddr)) ||
-              !stG(&gWJNewAux, int32_t(uint32_t(n->allocKind()))) ||
-              !stG(&gWJNewHeap, int32_t(uint32_t(n->initialHeap()))) ||
+              !stG(&gWJNewAux, int32_t(uint32_t(pAllocKind))) ||
+              !stG(&gWJNewHeap, int32_t(uint32_t(pHeap))) ||
               !EmitHelperCallResult(e, be, ins, WJH_NEWPLAIN, 0) ||
               !e.writeOp(Op::I32WrapI64))
             return false;
@@ -2241,8 +3167,8 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
           return true;  // obj pointer (i32) on stack
         }
         if (!stG(&gWJNewShapeSlot, int32_t(shapeAddr)) ||
-            !stG(&gWJNewAux, int32_t(uint32_t(n->allocKind()))) ||
-            !stG(&gWJNewHeap, int32_t(uint32_t(n->initialHeap()))))
+            !stG(&gWJNewAux, int32_t(uint32_t(pAllocKind))) ||
+            !stG(&gWJNewHeap, int32_t(uint32_t(pHeap))))
           return false;
         kind = WJH_NEWPLAIN;
       } else if (ins->op() == MDefinition::Opcode::NewArrayObject) {
@@ -2403,7 +3329,8 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
       // next way, then to the slow wjhelp hop }. Way 0 first => monomorphic
       // calls cost one compare; polymorphic dispatch (task.run) stays in wasm.
       if (!e.writeOp(Op::Block) || !e.writeFixedU8(0x40)) return false;  // void
-      for (uint32_t w = 0; w < kWJCallWays; w++) {
+      static int forceSlowCall = getenv("GECKO_WJ_FORCESLOWCALL") ? 1 : 0;
+      for (uint32_t w = 0; w < kWJCallWays && !forceSlowCall; w++) {
         uintptr_t fnW =
             uintptr_t(static_cast<void*>(&gWJCallFn[site * kWJCallWays + w]));
         uintptr_t tblW =
@@ -2604,7 +3531,20 @@ static EffectKind EmitEffect(Encoder& e, WJBackend& be, MInstruction* ins) {
   switch (ins->op()) {
     case MDefinition::Opcode::Bail:
     case MDefinition::Opcode::Unreachable:
-      return EmitDeopt(e, be) ? EffectKind::Emitted : EffectKind::Fail;
+    case MDefinition::Opcode::Throw: {
+      // Throw: a cold error path (splay `throw new Error(...)`, raytrace asserts).
+      // Deopt to PBL, which re-executes from the resume point and performs the real
+      // throw with correct exception semantics. Lets the hot path stay JIT'd instead
+      // of bailing the whole function to PBL. This is a TOP-LEVEL deopt (not inside a
+      // guard's `if`), so clear inDispatchBody so EmitDeopt uses the inline-return
+      // path -- the OOL `br $D` depth is calibrated for a guard's enclosing `if` and
+      // would branch one scope too far here (invalid wasm: "expected 2 for branch").
+      bool savedDispatch = be.inDispatchBody;
+      be.inDispatchBody = false;
+      bool ok = EmitDeopt(e, be);
+      be.inDispatchBody = savedDispatch;
+      return ok ? EffectKind::Emitted : EffectKind::Fail;
+    }
     case MDefinition::Opcode::Start:
     case MDefinition::Opcode::CheckOverRecursed:
     case MDefinition::Opcode::InterruptCheck:
@@ -2649,6 +3589,28 @@ static EffectKind EmitEffect(Encoder& e, WJBackend& be, MInstruction* ins) {
     }
     case MDefinition::Opcode::StoreFixedSlot: {
       MStoreFixedSlot* s = ins->toStoreFixedSlot();
+      // Megamorphic recompile: this store is on a mega-convertible (passthrough)
+      // GuardShape, so the receiver may be polymorphic -> a raw fixed-slot store
+      // would corrupt. Route through the generic SETPROP helper (baked key, no
+      // deopt, handles any shape). EFFECT -> leaves nothing on the stack.
+      if (be.forceMega && WJIsShapeGuard(s->object()) &&
+          WJMegaConvertibleGuard(s->object())) {
+        jit::MDefinition* gs = s->object();
+        uint64_t keyBits = 0;
+        if (WJDerivePropKey(WJGuardRepShape(gs), uint32_t(s->slot()), &keyBits) &&
+            WJGuardObject(gs)->type() == MIRType::Object) {
+          // WJH_SETPROP does ToPropertyKey(scratch[1]) -> needs the key as a
+          // VALUE (StringValue), not the jsid bits WJDerivePropKey returns.
+          uint64_t keyVal = js::IdToValue(
+              JS::PropertyKey::fromRawBits(uintptr_t(keyBits))).asRawBits();
+          if (!EmitStageScratch(e, be, WJGuardObject(gs), 0)) return EffectKind::Fail;
+          if (!EmitStageConstBoxed(e, be, keyVal, 1)) return EffectKind::Fail;
+          if (!EmitStageScratch(e, be, s->value(), 2)) return EffectKind::Fail;
+          if (!EmitHelperCallResult(e, be, ins, WJH_SETPROP, 0))
+            return EffectKind::Fail;
+          return e.writeOp(Op::Drop) ? EffectKind::Emitted : EffectKind::Fail;
+        }
+      }
       int32_t objLocal = be.local(s->object());
       if (objLocal < 0) return EffectKind::Fail;
       MDefinition* v = s->value();
@@ -2774,6 +3736,27 @@ static EffectKind EmitEffect(Encoder& e, WJBackend& be, MInstruction* ins) {
         return EffectKind::Fail;
       return EffectKind::Emitted;
     }
+    case MDefinition::Opcode::SetInitializedLength: {
+      // elements->initializedLength = index + 1 (Ion SetLengthFromIndex). Used to
+      // finalize a dense array literal after its elements are stored (splay
+      // GeneratePayloadTree's `[0,1,..,9]`).
+      MDefinition* elems = ins->getOperand(0);
+      MDefinition* idx = ins->getOperand(1);
+      if (getenv("GECKO_WJ_SILDBG"))
+        fprintf(stderr, "[wj-sil] idx const=%d val=%d\n", idx->isConstant(),
+                idx->isConstant() ? idx->toConstant()->toInt32() : -1);
+      if (getenv("GECKO_WJ_SILNOP")) return EffectKind::Emitted;  // isolate: no store
+      int32_t off = js::ObjectElements::offsetOfInitializedLength();
+      if (!GetOp(e, be, elems) || !e.writeOp(Op::I32Const) ||
+          !e.writeVarS32(off) || !e.writeOp(Op::I32Add))
+        return EffectKind::Fail;  // addr = elements + offsetOfInitializedLength
+      if (!GetOp(e, be, idx) || !e.writeOp(Op::I32Const) || !e.writeVarS32(1) ||
+          !e.writeOp(Op::I32Add))
+        return EffectKind::Fail;  // value = index + 1
+      if (!e.writeOp(Op::I32Store) || !e.writeVarU32(2) || !e.writeVarU32(0))
+        return EffectKind::Fail;
+      return EffectKind::Emitted;
+    }
     case MDefinition::Opcode::MegamorphicStoreSlot: {
       if (getenv("GECKO_WJ_NONEWSTORE")) return EffectKind::Fail;
       MMegamorphicStoreSlot* m = ins->toMegamorphicStoreSlot();
@@ -2792,7 +3775,7 @@ static EffectKind EmitEffect(Encoder& e, WJBackend& be, MInstruction* ins) {
       // property -> direct slot store + barriers, no C++ hop); else generic set.
       static int noPropIC = getenv("GECKO_WJ_NOPROPIC") ? 1 : 0;
       if (!noPropIC && s->object()->type() == MIRType::Object) {
-        uint32_t site = WJAllocPropSite();
+        uint32_t site = WJPropSite(be);
         if (site != 0) {
           return EmitPropStoreIC(e, be, ins, s->object(), s->idval(), s->value(),
                                  s->strict(), site)
@@ -2934,7 +3917,14 @@ static bool EmitValueTruthy(Encoder& e, WJBackend& be, uint32_t v) {
     return false;
   if (!e.writeOp(Op::I32And)) return false;
   if (!e.writeOp(Op::Else)) return false;
-  if (!EmitDeopt(e, be)) return false;  // string/symbol/bigint -> PBL
+  // string/symbol/bigint -> PBL. This deopt sits 5 `if(result i32)` levels deep
+  // in the type chain above, so the OOL deopt br-depth needs +4 over its usual
+  // single-`if` assumption (else it branches to a value block with an empty stack
+  // -> invalid wasm; was the deltablue `if(this.myOutput.stay)` compile failure).
+  be.deoptExtraNest = 4;
+  bool dok = EmitDeopt(e, be);
+  be.deoptExtraNest = 0;
+  if (!dok) return false;
   if (!e.writeOp(Op::I32Const) || !e.writeVarS32(0)) return false;  // dead
   for (int i = 0; i < 5; i++)
     if (!e.writeOp(Op::End)) return false;
@@ -2995,16 +3985,28 @@ static bool EmitBlockBody(Encoder& e, WJBackend& be, MBasicBlock* b) {
     MInstruction* ins = *it;
     if (ins->isControlInstruction()) continue;
     MResumePoint* insRp = ins->resumePoint();
-    if (insRp) lastRp = insRp;
+    if (getenv("GECKO_WJ_RPDBG") && be.info && be.info->script() &&
+        be.info->script()->lineno() == uint32_t(atoi(getenv("GECKO_WJ_RPDBG")))) {
+      fprintf(stderr, "[wj-rp] b%u op#%u(%s) rp=%s mode=%d\n", b->id(),
+              unsigned(ins->op()), WJOpName(ins->op()), insRp ? "Y" : "n",
+              insRp ? int(insRp->mode()) : -1);
+    }
+    // Deopt resume-point selection. Advance the deopt rp to this op's rp BEFORE
+    // the op ONLY for resume-AT points: a mid-op guard then re-executes this op in
+    // PBL from its own pc. For resume-AFTER points, KEEP the PRIOR rp during the op
+    // -- the resume-after point's captured stack includes this op's RESULT, but a
+    // mid-op guard deopts BEFORE the result is computed (before the local.set
+    // below), so spilling the resume-after frame would spill the op's STALE/uninit
+    // result local as the captured stack top -> PBL resumes with a garbage stack
+    // value. The prior rp (the previous op's resume-after) captures all prior
+    // effects and resumes just before this op, so PBL correctly re-executes ONLY
+    // this op. (deltablue's LoadDynamicSlotAndUnbox fallible-unbox tag-guard hit
+    // this: the bad spilled result fed the constraint solver -> "Cycle encountered"
+    // / hang.) Advance to insRp AFTER the op completes (its result now in-local).
+    bool spillAfter = insRp && IsResumeAfter(insRp->mode());
+    if (insRp && !spillAfter) lastRp = insRp;
     be.curRp = lastRp;
     be.curOp = uint32_t(ins->op());
-    // Shadow timing: spill resume-AT rps BEFORE the op (a guard inside the op
-    // deopts here and re-executes the op in PBL, so it needs the PRE-op frame --
-    // whose operands all dominate this point and are in locals). Spill resume-
-    // AFTER rps AFTER the op (their captured stack includes the op's RESULT,
-    // which isn't in its local until the local.set below; such ops complete
-    // rather than deopt mid-op, so no guard reads the not-yet-spilled rp).
-    bool spillAfter = insRp && IsResumeAfter(insRp->mode());
     bool doShadow = be.shadowDeopt && be.inDispatchBody;
     if (doShadow && !spillAfter && lastRp != spilledRp) {
       if (!EmitFrameSpillDelta(e, be, lastRp, spilledRp)) return false;
@@ -3025,6 +4027,13 @@ static bool EmitBlockBody(Encoder& e, WJBackend& be, MBasicBlock* b) {
         return false;
       }
       if (!e.writeOp(Op::LocalSet) || !e.writeVarU32(uint32_t(l))) return false;
+    }
+    // Resume-AFTER op completed: its result is now in-local, so the resume-after
+    // frame is consistent. Advance the deopt rp for subsequent ops, the terminator
+    // (which keeps the body's last rp), + the shadow post-spill below.
+    if (spillAfter) {
+      lastRp = insRp;
+      be.curRp = lastRp;
     }
     if (doShadow && spillAfter && lastRp != spilledRp) {
       if (!EmitFrameSpillDelta(e, be, lastRp, spilledRp)) return false;
@@ -3211,27 +4220,35 @@ static bool WJEmitStructured(Encoder& e, WJBackend& be,
       MBasicBlock* s = t->toGoto()->target();
       if (!EmitEdgeCopies(e, be, b, s)) return false;
       int32_t d = brTo(s, pos, 0);
-      if (d < 0) return false;
+      if (d < 0) { js::wasm::gWJBailReason = "reloop-goto-depth"; return false; }
       if (!e.writeOp(Op::Br) || !e.writeVarU32(uint32_t(d))) return false;
     } else if (t->isTest()) {
       MTest* test = t->toTest();
       MDefinition* cond = test->getOperand(0);
-      if (WJValType(cond->type()) != uint8_t(TypeCode::I32)) return false;
+      if (WJValType(cond->type()) != uint8_t(TypeCode::I32)) {
+        // Value-typed conditions need EmitValueTruthy; deferred -- the relooper has
+        // a separate br-depth bug (invalid wasm) that surfaced when these compiled,
+        // and it wasn't faster than dispatch anyway. Bail to dispatch.
+        js::wasm::gWJBailReason = "reloop-test-cond";
+        return false;
+      }
       MBasicBlock* tb = test->ifTrue();
       MBasicBlock* fb = test->ifFalse();
       if (!GetOp(e, be, cond)) return false;
       if (!e.writeOp(Op::If) || !e.writeFixedU8(kVoid)) return false;
       if (!EmitEdgeCopies(e, be, b, tb)) return false;
       int32_t dt = brTo(tb, pos, 1);
-      if (dt < 0) return false;
+      if (dt < 0) { js::wasm::gWJBailReason = "reloop-test-depth-t"; return false; }
       if (!e.writeOp(Op::Br) || !e.writeVarU32(uint32_t(dt))) return false;
       if (!e.writeOp(Op::Else)) return false;
       if (!EmitEdgeCopies(e, be, b, fb)) return false;
       int32_t df = brTo(fb, pos, 1);
-      if (df < 0) return false;
+      if (df < 0) { js::wasm::gWJBailReason = "reloop-test-depth-f"; return false; }
       if (!e.writeOp(Op::Br) || !e.writeVarU32(uint32_t(df))) return false;
       if (!e.writeOp(Op::End)) return false;
     } else {
+      js::wasm::gWJBailReason =
+          t->isTableSwitch() ? "reloop-tableswitch" : "reloop-terminator";
       return false;
     }
   }
@@ -3644,6 +4661,21 @@ bool js::wasm::WJEmitBody(MIRGenerator& mir, MIRGraph& graph, uint32_t nargs,
   // lands (crypto am3, splay tree ops). GECKO_WJ_RELOOP forces on; NORELOOP forces
   // off. If reloop bails mid-emit we fall through to the dispatch loop (started is
   // only set true once WJEmitStructured commits, in which case we must bail).
+  // Megamorphic recompile flag MUST be set before the relooper branch: small
+  // loopless call-less functions (deltablue output()/input()/isSatisfied) take the
+  // reloop path, which returns before the dispatch-loop setup below -- if forceMega
+  // were set only there, the relooper would emit the deopting GuardShape on a
+  // polymorphic receiver and storm (deltablue 414 was here). Setting it up here
+  // makes BOTH paths mega-convert.
+  // Megamorphic codegen is now the DEFAULT for every compile (not just post-storm
+  // recompiles): shape-guarded property reads/stores become self-guarding by-name
+  // EmitPropIC (per-site shape cache + helper fallback, NO deopt on a polymorphic
+  // receiver). This is the keystone that made deltablue correct AND fast (BROKEN
+  // /timeout -> 109 = ~9x): the valve's PARTIAL mega left some reads as fixed-slot
+  // under removed guards (wrong slot -> "Cycle"); full mega is consistent. Measured
+  // no regression to the others (crypto 124->174, raytrace 40->52, richards/splay/
+  // navier comparable). GECKO_WJ_NOMEGA reverts to fixed-slot+deopt codegen.
+  be.forceMega = !getenv("GECKO_WJ_NOMEGA");
   static int forceReloop = getenv("GECKO_WJ_RELOOP") ? 1 : 0;
   static int noReloop = getenv("GECKO_WJ_NORELOOP") ? 1 : 0;
   bool useReloop = forceReloop ||
@@ -3655,6 +4687,9 @@ bool js::wasm::WJEmitBody(MIRGenerator& mir, MIRGraph& graph, uint32_t nargs,
       return true;
     }
     if (started) {
+      if (getenv("GECKO_WJ_CFINFO"))
+        fprintf(stderr, "[wb-cf] lineno=%u reloop-bail reason=%s\n", cfLineno,
+                js::wasm::gWJBailReason ? js::wasm::gWJBailReason : "?");
       cfReport("reloop-bail");
       js::wasm::gWJBailReason = "reloop-bail";
       return false;  // partially emitted -> bail this compile

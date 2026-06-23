@@ -43,6 +43,15 @@ using namespace js::jit;
 
 using mozilla::Maybe;
 
+namespace js {
+namespace wasm {
+// Set by the WasmJit deopt-storm valve before a de-speculation recompile (see
+// maybeInlineIC): skip transpiling Int32 arith/element ICs so WarpBuilder emits
+// the generic no-deopt cache instead of typed-Int32 ops that deopt on doubles.
+extern bool gWJForceNumberArith;
+}  // namespace wasm
+}  // namespace js
+
 // WarpScriptOracle creates a WarpScriptSnapshot for a single JSScript. Note
 // that a single WarpOracle can use multiple WarpScriptOracles when scripts are
 // inlined.
@@ -1003,6 +1012,29 @@ AbortReasonOr<Ok> WarpScriptOracle::maybeInlineIC(WarpOpSnapshotList& snapshots,
     return Ok();
   }
 
+  // De-speculation (Ion-style "recompile with relaxed types"). For a function
+  // that deopt-stormed on a wrongly-speculated Int32 type (navier's float arrays
+  // warm up all-zero -> Warp speculates Int32 arith/element loads -> every
+  // steady-state double deopts the WHOLE function to PBL), skip transpiling the
+  // numeric/element ICs so WarpBuilder emits the generic NO-DEOPT cache
+  // (MBinaryCache / MUnaryCache / Ion GetElem IC). The deopt-driven recompile
+  // sets gWJForceNumberArith; GECKO_WJ_NUMARITH forces it always (A/B).
+  {
+    static int numArithEnv = getenv("GECKO_WJ_NUMARITH") ? 1 : 0;
+    if (numArithEnv || js::wasm::gWJForceNumberArith) {
+      switch (loc.getOp()) {
+        case JSOp::Add: case JSOp::Sub: case JSOp::Mul: case JSOp::Div:
+        case JSOp::Mod: case JSOp::Pow: case JSOp::BitOr: case JSOp::BitXor:
+        case JSOp::BitAnd: case JSOp::Lsh: case JSOp::Rsh: case JSOp::Ursh:
+        case JSOp::Neg: case JSOp::Pos: case JSOp::Inc: case JSOp::Dec:
+        case JSOp::BitNot:
+          return Ok();  // no snapshot -> WarpBuilder emits the no-deopt cache
+        default:
+          break;
+      }
+    }
+  }
+
   ICFallbackStub* fallbackStub;
   const ICEntry& entry = getICEntryAndFallback(loc, &fallbackStub);
 
@@ -1093,6 +1125,23 @@ AbortReasonOr<Ok> WarpScriptOracle::maybeInlineIC(WarpOpSnapshotList& snapshots,
     if (next->enteredCount() != 0) {
       firstStubHandlesAllCases = false;
       break;
+    }
+  }
+
+  if (const char* tl = getenv("GECKO_WJ_ICDBG")) {
+    if (script_->lineno() == uint32_t(atoi(tl))) {
+      unsigned nstubs = 0;
+      for (ICStub* s = entry.firstStub(); s && s != fallbackStub;
+           s = s->maybeNext())
+        nstubs++;
+      fprintf(stderr,
+              "[wj-icdbg] %s:%u op=%s nstubs=%u firstHandlesAll=%d "
+              "fbEntered=%u fbFailures=%d firstEntered=%u\n",
+              script_->filename() ? script_->filename() : "?",
+              unsigned(script_->lineno()), CodeName(loc.getOp()), nstubs,
+              firstStubHandlesAllCases, unsigned(fallbackStub->enteredCount()),
+              fallbackStub->state().hasFailures(),
+              unsigned(stub->enteredCount()));
     }
   }
 

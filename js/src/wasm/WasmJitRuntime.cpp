@@ -101,6 +101,7 @@ int gWJExecDepth = 0;              // >0 while emitted wasm-JIT code is on the s
                                    // (drives inWasmJit()/inJit()/inIon() in the shell)
 bool gWJHadAlwaysBails = false;    // last compile emitted an alwaysBails deopt block
 bool gWJForceMega = false;         // megamorphic recompile (set per-compile by the valve)
+bool gWJForceNumberArith = false;  // de-speculate Int32 arith/elem (set per-compile by the valve)
 const char* gWJBailReason = "unknown";  // why the last WJEmitBody returned false
 uint32_t gWJBailLine = 0;          // source line of the last bailed function
 uint32_t gWJNewShapeSlot = 0;      // alloc helper: shape pool index
@@ -486,7 +487,8 @@ int js::wasm::WasmJitRunCall(JSScript* script, uint64_t thisBits,
   // after repeated failure fall back to PBL (last resort).
   if (gWJDidResume) {
     e.deopts++;
-    if (e.deopts >= 300 && e.deopts > (e.jitRuns + 1) &&
+    static int valveN = getenv("GECKO_WJ_VALVEN") ? atoi(getenv("GECKO_WJ_VALVEN")) : 300;
+    if (e.deopts >= uint32_t(valveN) && e.deopts > (e.jitRuns + 1) &&
         !getenv("GECKO_WJ_NODEOPTVALVE")) {
       // A storming fn with an alwaysBails block deopts from that COLD-IC block;
       // recompiling reproduces it identically (verified: deltablue 741's recompiled
@@ -725,7 +727,8 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
     if(getenv("GECKO_DEBUG_JIT")){static uint64_t c=0; if((++c%5000)==0) fprintf(stderr,"[wb-resume-count] %llu\n",(unsigned long long)c);}
     if (getenv("GECKO_WJ_DEOPTHIST")) {
       static uint64_t dc = 0;
-      if ((++dc % 200) == 0) {
+      uint64_t dmod = getenv("GECKO_WJ_DEOPTHISTN") ? 10 : 200;
+      if ((++dc % dmod) == 0) {
         fprintf(stderr, "[wb-deopthist] after %llu resumes:\n",
                 (unsigned long long)dc);
         for (uint32_t o = 0; o < js::wasm::kWJNumOps; o++)
@@ -735,7 +738,10 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
     }
     if (getenv("GECKO_WJ_STORMLINE")) {
       static uint64_t sc = 0;
-      if ((++sc % 2000) == 0 && gWJResumeNFrames) {
+      ++sc;
+      uint64_t mod = getenv("GECKO_WJ_STORMFIRST") ? 1 : 2000;
+      uint64_t cap = getenv("GECKO_WJ_STORMFIRST") ? 40 : ~0ull;
+      if (sc <= cap && (sc % mod) == 0 && gWJResumeNFrames) {
         uint32_t lf = gWJResumeNFrames - 1;
         JSScript* ds =
             reinterpret_cast<JSScript*>(uintptr_t(gWJResumeScriptPtr[lf]));
@@ -1086,6 +1092,33 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
       }
     }
     gWJScratch[js::wasm::kWJResultSlot] = JS::ObjectValue(*o).asRawBits();
+    return 0.0;
+  }
+
+  // BindName (MBindNameCache): resolve the env object holding `name`'s binding for
+  // a following SetName. scratch[0]=env chain, scratch[1]=name(StringValue).
+  // gbemu deopt-stormed here before this case existed.
+  if (kind == js::wasm::WJH_BINDNAME) {
+    RootedObject env(cx, &JS::Value::fromRawBits(gWJScratch[0]).toObject());
+    JSString* s = JS::Value::fromRawBits(gWJScratch[1]).toString();
+    Rooted<js::PropertyName*> name(cx, s->asAtom().asPropertyName());
+    JSObject* holder = js::LookupNameUnqualified(cx, name, env);
+    if (!holder) return 1.0;  // error -> deopt/throw path
+    gWJScratch[js::wasm::kWJResultSlot] = JS::ObjectValue(*holder).asRawBits();
+    return 0.0;
+  }
+
+  // AllocateAndStoreSlot's slot growth (MAllocateAndStoreSlot). scratch[0]=object,
+  // gWJNewAux=new dynamic-slot capacity. growSlotsPure mallocs the slots buffer
+  // (no GC of JS objects, so obj doesn't move) and returns false on OOM without a
+  // pending exception -> report it so the [1.0] flag path throws cleanly.
+  if (kind == js::wasm::WJH_GROWSLOTS) {
+    js::NativeObject* obj =
+        &JS::Value::fromRawBits(gWJScratch[0]).toObject().as<js::NativeObject>();
+    if (!js::NativeObject::growSlotsPure(cx, obj, uint32_t(gWJNewAux))) {
+      js::ReportOutOfMemory(cx);
+      return 1.0;
+    }
     return 0.0;
   }
 

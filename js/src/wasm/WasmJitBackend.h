@@ -86,6 +86,8 @@ enum WJHelpKind : int {
   WJH_TOSTRING = 25,      // scratch[0]=input -> ToString (String)
   WJH_COMPARE = 26,       // scratch[0]=lhs, scratch[1]=rhs, site=JSOp -> Boolean (==,!=,<,<=,>,>=,===,!==)
   WJH_NEWOBJECT = 27,     // gWJNewObjScript/gWJNewObjPcOff -> NewObjectOperation (object literal)
+  WJH_BINDNAME = 28,      // scratch[0]=envChain, scratch[1]=name(StringValue) -> LookupNameUnqualified (Object)
+  WJH_GROWSLOTS = 29,     // scratch[0]=object, gWJNewAux=newCapacity -> NativeObject::growSlotsPure (AllocateAndStoreSlot)
 };
 
 // Allocation-helper staging (non-GC ints; the shape is in the traced shape pool).
@@ -131,6 +133,7 @@ extern uint32_t gWJCurrentEnv;
 // recompiles to specialize (crypto). Single-threaded synchronous compile.
 extern bool gWJHadAlwaysBails;
 extern bool gWJForceMega;  // next compile: megamorphic property reads (post-storm)
+extern bool gWJForceNumberArith;  // next compile: de-speculate Int32 arith/elem ICs (post-deopt)
 
 // Compile bail-reason tracking (GECKO_WJ_CDBG): the most recent reason a function
 // stayed in PBL plus its source line, printed by WJWarpCompile when WJEmitBody

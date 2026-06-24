@@ -558,3 +558,57 @@ void nsTransferable::SetReferrerInfo(nsIReferrerInfo* aReferrerInfo) {
   MOZ_ASSERT(mInitialized);
   mReferrerInfo = aReferrerInfo;
 }
+
+#if defined(__EMSCRIPTEN__)
+// The cairo-headless toolkit registers no platform widget components -- those live
+// in widget/{gtk,cocoa,...}/components.conf, none of which is built here. Editor
+// copy/cut/paste needs @mozilla.org/widget/transferable;1 (and the format
+// converter / clipboard helper), so register them at runtime after XPCOM init.
+// (Adding them to a static components.conf instead would shift the generated
+// Components.h ModuleID indices and require recompiling all of libxul.)
+#  include "mozilla/Attributes.h"
+#  include "mozilla/ModuleUtils.h"
+#  include "mozilla/GenericFactory.h"
+#  include "nsIComponentRegistrar.h"
+#  include "nsServiceManagerUtils.h"
+#  include "nsHTMLFormatConverter.h"
+#  include "nsClipboardHelper.h"
+#  include "nsWidgetsCID.h"
+
+NS_GENERIC_FACTORY_CONSTRUCTOR(nsTransferable)
+NS_GENERIC_FACTORY_CONSTRUCTOR(nsHTMLFormatConverter)
+NS_GENERIC_FACTORY_CONSTRUCTOR(nsClipboardHelper)
+
+extern "C" MOZ_EXPORT void WasmRegisterWidgetComponents() {
+  nsCOMPtr<nsIComponentRegistrar> reg;
+  NS_GetComponentRegistrar(getter_AddRefs(reg));
+  if (!reg) {
+    return;
+  }
+  struct Comp {
+    nsCID cid;
+    const char* name;
+    const char* contract;
+    mozilla::GenericFactory::ConstructorProcPtr ctor;
+  };
+  const Comp comps[] = {
+      {NS_TRANSFERABLE_CID, "Transferable",
+       "@mozilla.org/widget/transferable;1", nsTransferableConstructor},
+      {NS_HTMLFORMATCONVERTER_CID, "HTMLFormatConverter",
+       "@mozilla.org/widget/htmlformatconverter;1",
+       nsHTMLFormatConverterConstructor},
+      {NS_CLIPBOARDHELPER_CID, "ClipboardHelper",
+       "@mozilla.org/widget/clipboardhelper;1", nsClipboardHelperConstructor},
+  };
+  for (const auto& c : comps) {
+    bool present = false;
+    if (NS_SUCCEEDED(reg->IsContractIDRegistered(c.contract, &present)) &&
+        present) {
+      continue;
+    }
+    RefPtr<mozilla::GenericFactory> factory =
+        new mozilla::GenericFactory(c.ctor);
+    reg->RegisterFactory(c.cid, c.name, c.contract, factory);
+  }
+}
+#endif

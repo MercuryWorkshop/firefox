@@ -7,8 +7,22 @@
 #include "nsISupportsPrimitives.h"
 #include "nsComponentManagerUtils.h"
 #include "nsCOMPtr.h"
+#if defined(__EMSCRIPTEN__)
+#  include <emscripten.h>
+#endif
 
 namespace mozilla::widget {
+
+// Construct the headless clipboard as an nsISupports. The cairo-headless toolkit
+// registers no platform clipboard component, so nsClipboardSelector (the
+// @mozilla.org/widget/clipboard;1 constructor) calls this directly on emscripten
+// instead of forwarding to an unregistered @mozilla.org/widget/parent/clipboard;1.
+// This changes an existing component's implementation rather than adding a new
+// static component (which would shift Components.h ModuleID indices).
+already_AddRefed<nsISupports> CreateHeadlessClipboardSupports() {
+  RefPtr<HeadlessClipboard> clipboard = new HeadlessClipboard();
+  return clipboard.forget().downcast<nsISupports>();
+}
 
 NS_IMPL_ISUPPORTS_INHERITED0(HeadlessClipboard, nsBaseClipboard)
 
@@ -62,6 +76,25 @@ HeadlessClipboard::SetNativeClipboardData(nsITransferable* aTransferable,
     flavor.EqualsLiteral(kTextMime) ? clipboard->SetText(utf16string)
                                     : clipboard->SetHTML(utf16string);
   }
+
+#if defined(__EMSCRIPTEN__)
+  // Mirror copies/cuts out to the real system clipboard. The engine is otherwise
+  // process-local; writeText (fire-and-forget on the main thread) makes editor
+  // copy/cut land on navigator.clipboard so other apps can paste it. Only the
+  // global clipboard -- not the selection/find caches -- maps to the OS clipboard.
+  if (aWhichClipboard == nsIClipboard::kGlobalClipboard && clipboard->HasText()) {
+    NS_ConvertUTF16toUTF8 utf8(clipboard->GetText());
+    MAIN_THREAD_EM_ASM(
+        {
+          try {
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+              navigator.clipboard.writeText(UTF8ToString($0));
+            }
+          } catch (e) {}
+        },
+        utf8.get());
+  }
+#endif
 
   return NS_OK;
 }

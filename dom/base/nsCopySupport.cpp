@@ -560,7 +560,8 @@ static nsresult AppendString(nsITransferable* aTransferable,
   rv = aTransferable->AddDataFlavor(aFlavor);
   NS_ENSURE_SUCCESS(rv, rv);
 
-  return aTransferable->SetTransferData(aFlavor, data);
+  rv = aTransferable->SetTransferData(aFlavor, data);
+  return rv;
 }
 
 static nsresult AppendDOMNode(nsITransferable* aTransferable,
@@ -771,6 +772,7 @@ bool nsCopySupport::FireClipboardEvent(
                "Invalid clipboard event type");
 
   MOZ_ASSERT_IF(originalEventMessage != ePaste, aClipboardType.isSome());
+
 
   RefPtr<PresShell> presShell = aPresShell;
   if (!presShell) {

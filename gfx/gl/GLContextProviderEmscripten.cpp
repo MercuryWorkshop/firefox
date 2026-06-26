@@ -51,6 +51,15 @@ static bool ContentPassthroughEnabled() {
   return gecko_gl_passthrough_enabled && gecko_gl_passthrough_enabled() != 0;
 }
 
+// emscripten_webgl_get_proc_address is provided by emscripten's GL JS library at the
+// final link, so it is undefined in this relocatable libxul.so. Taking its address
+// directly emits a table-index relocation against an undefined symbol, which newer
+// wasm-ld (emscripten 6.0.1) rejects; a CALL to it is a deferred relocation that is
+// fine. So route the loader through this locally-defined shim.
+static void* EmscriptenGLGetProcAddress(const char* name) {
+  return emscripten_webgl_get_proc_address(name);
+}
+
 class GLContextEmscripten final : public GLContext {
  public:
   MOZ_DECLARE_REFCOUNTED_VIRTUAL_TYPENAME(GLContextEmscripten, override)
@@ -197,7 +206,7 @@ class GLContextEmscripten final : public GLContext {
     // emscripten resolves GL entry points by name (requires
     // -sGL_ENABLE_GET_PROC_ADDRESS). Matches SymbolLoader's void*(const char*)
     // ctor; the base GLContext::InitImpl loads the whole symbol table through it.
-    return Some(SymbolLoader(emscripten_webgl_get_proc_address));
+    return Some(SymbolLoader(EmscriptenGLGetProcAddress));
   }
 
   bool IsDoubleBuffered() const override { return true; }

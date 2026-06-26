@@ -6118,6 +6118,20 @@ PBIResult PortableBaselineInterpret(
       PUSH(StackVal(Value::fromRawBits(osrStack[i])));
     }
   }
+  // JS->wasm JIT deopt resume: we enter at a NON-ZERO pc, but icEntry was
+  // initialized to icEntries[0] (the IC for the first IC-op of the function). The
+  // per-op IC machinery advances icEntry by NEXT_IC() in bytecode order, so resuming
+  // mid-function with icEntry at [0] MIS-ALIGNS every IC from here on: an op uses the
+  // IC of an earlier same-or-different op (e.g. a BitOr executing against a GetProp
+  // IC -> it does a property load and returns a slot value instead of computing the
+  // bitor -> silent wrong result). This is the root of the wrong answers on
+  // box2d/pdfjs/typescript/regexp. Align icEntry to the resume pc, exactly as the
+  // Baseline interpreter does on OSR (interpreterICEntryFromPCOffset returns the
+  // first ICEntry at/after the pc). Only on the JIT-resume path (osrLocals/osrStack).
+  if (osrLocals || osrStack) {
+    uint32_t resumePcOff = uint32_t(pc - frame->script()->code());
+    icEntry = frame->icScript()->interpreterICEntryFromPCOffset(resumePcOff);
+  }
   ret->setUndefined();
 
   // Check if we are being debugged, and set a flag in the frame if so. This
@@ -7919,6 +7933,18 @@ PBIResult PortableBaselineInterpret(
                   frame->script()->getWarmUpCount() < 4096) {
                 break;
               }
+              // Also route CONSTRUCT calls through the IC once the caller is
+              // warm, so the New-op IC accumulates a CallScriptedFunction
+              // construct stub. Without a construct stub, TrialInliner can't see
+              // the constructor (nOpt=0) and every `new X` stays an un-inlined
+              // CreateThis -> the per-object allocation can never be scalar-
+              // replaced. Gated on COLDCALL so the default path is unchanged.
+              static int sWJCtorIC = -1;
+              if (sWJCtorIC < 0) sWJCtorIC = getenv("GECKO_WJ_CTORIC") ? 1 : 0;
+              if (sWJCtorIC && constructing &&
+                  frame->script()->getWarmUpCount() < 4096) {
+                break;
+              }
             }
 #endif
 
@@ -9543,6 +9569,33 @@ bool WasmJitResumeViaPBL(JSContext* cx, JSScript* script, uint64_t thisBits,
       nullptr, PBIResult::Ok, osrLocals, nLocals, osrStack, osrStackDepth);
   gPBLResumeEnclosingEnv = nullptr;
   gPBLResumeKeepEnv = false;
+  if (getenv("GECKO_WJ_RESUMERESDBG")) {
+    fprintf(stderr, "[wj-resume-res] %s:%u pcOff=%u ret=%d result=%s/%g\n",
+            script->filename() ? script->filename() : "?",
+            unsigned(script->lineno()), pcOff, int(ret),
+            result.isUndefined() ? "undef"
+            : result.isInt32() ? "i32"
+            : result.isDouble() ? "dbl"
+            : result.isObject() ? "obj" : "other",
+            result.isNumber() ? result.toNumber() : -1.0);
+    static int dumped = 0;
+    const char* wantLnEnv = getenv("GECKO_WJ_DUMPLINE");
+    uint32_t wantLn = wantLnEnv ? uint32_t(atoi(wantLnEnv)) : 0;
+    if (!dumped && (wantLn == 0 || script->lineno() == wantLn)) {
+      dumped = 1;
+      jsbytecode* p = script->code();
+      jsbytecode* e = script->codeEnd();
+      fprintf(stderr, "[wj-bytecode] %s:%u (resume pcOff=%u):\n",
+              script->filename() ? script->filename() : "?",
+              unsigned(script->lineno()), pcOff);
+      while (p < e) {
+        uint32_t off = uint32_t(p - script->code());
+        fprintf(stderr, "  %u: %s%s\n", off, js::CodeName(JSOp(*p)),
+                off == pcOff ? "   <== RESUME HERE" : "");
+        p += js::GetBytecodeLength(p);
+      }
+    }
+  }
   if (ret == PBIResult::Error || ret == PBIResult::UnwindError) return false;
   *retBits = result.asRawBits();
   return true;

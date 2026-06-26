@@ -88,6 +88,7 @@ enum WJHelpKind : int {
   WJH_NEWOBJECT = 27,     // gWJNewObjScript/gWJNewObjPcOff -> NewObjectOperation (object literal)
   WJH_BINDNAME = 28,      // scratch[0]=envChain, scratch[1]=name(StringValue) -> LookupNameUnqualified (Object)
   WJH_GROWSLOTS = 29,     // scratch[0]=object, gWJNewAux=newCapacity -> NativeObject::growSlotsPure (AllocateAndStoreSlot)
+  WJH_TOINT32 = 30,       // scratch[0]=value -> JS::ToInt32 (Int32); no-deopt ToInt32 for `x|0`/`&` on a boxed value
 };
 
 // Allocation-helper staging (non-GC ints; the shape is in the traced shape pool).
@@ -140,6 +141,13 @@ extern bool gWJForceNumberArith;  // next compile: de-speculate Int32 arith/elem
 // returns false. gWJBailReason points to a string literal (no ownership).
 extern const char* gWJBailReason;
 extern uint32_t gWJBailLine;
+// Precise bail localization: the SOURCE LINE + bytecode offset + (inlinee) script
+// filename of the specific MIR op whose emit returned false -- distinct from the
+// COMPILED function's defining line (script->lineno()). Set by WJSetBailOp at the
+// per-op emit entry; printed by the LOGBAIL audit so a bail points at the exact op.
+extern uint32_t gWJBailOpLine;
+extern uint32_t gWJBailOpOff;
+extern const char* gWJBailOpFile;
 
 // Resume state buffer (WASMJIT_REARCH_PLAN.md §4.1). On a guard miss the emitted
 // code boxes the resume point's live values [this, args, locals, stack] into
@@ -219,6 +227,10 @@ static constexpr uint32_t kWJPropSites = 16384;
 static constexpr uint32_t kWJPropWays = 4;
 extern uint32_t gWJPropShape[];   // cached receiver Shape* (0 = empty)
 extern uint32_t gWJPropOff[];     // cached TaggedSlotOffset bits ((off<<1)|isFixed)
+extern uint32_t gWJPropHolder[];  // proto-read cache: holder object* (0 = OWN-property way;
+                                  // nonzero = load the slot from this proto holder instead
+                                  // of the receiver). Validated by receiver shape match alone
+                                  // (shape encodes proto identity + no own-shadow). Traced.
 uint32_t WJAllocPropSite();
 uint32_t WJAllocPropSiteKeyed(uint64_t key);  // reuse a site for the same read
 // Per-site baked PropertyKey for the WJH_PROPIC fill helper (the property name).
@@ -265,6 +277,13 @@ static constexpr uint32_t kWJMaxArgs = 8;
 
 static constexpr uint32_t kWJResultSlot = 64;
 static constexpr uint32_t kWJThisSlot = 65;
+// Traced scratch slots (within [0..kWJThisSlot] so WJTraceRoots relocates them
+// on a moving GC) used to stage the construct callee + newTarget across the
+// WJH_CONSTRUCT call window. Must be > kWJMaxArgs and not collide with
+// result/this. The untraced gWJCallCallee/gWJConstructNewTarget globals were a
+// stale-pointer source under nursery compaction.
+static constexpr uint32_t kWJCalleeSlot = 62;
+static constexpr uint32_t kWJNewTargetSlot = 63;
 static constexpr uint32_t kWJScratchSlots = 72;
 static constexpr uint32_t kWJResultOff = kWJResultSlot * 8;
 static constexpr uint32_t kWJThisOff = kWJThisSlot * 8;

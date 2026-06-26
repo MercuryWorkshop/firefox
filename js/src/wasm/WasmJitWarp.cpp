@@ -66,9 +66,17 @@ static void DumpMIR(JSScript* script, MIRGraph& graph) {
               StringFromMIRType(p->type()), unsigned(p->numOperands()));
     }
     for (MInstructionIterator it = b->begin(); it != b->end(); it++) {
-      fprintf(stderr, "    op#%u id%u ty=%s nops=%u\n", unsigned(it->op()),
+      const char* tag = "";
+      if (it->isNewObject()) tag = " <<NEWOBJECT>>";
+      else if (it->isNewArray()) tag = " <<NEWARRAY>>";
+      else if (it->isNewArrayObject()) tag = " <<NEWARRAYOBJECT>>";
+      else if (it->isCreateThis()) tag = " <<CREATETHIS>>";
+      else if (it->isCall()) tag = " <<CALL>>";
+      else if (it->isBox()) tag = " <<BOX>>";
+      else if (it->isUnbox()) tag = " <<UNBOX>>";
+      fprintf(stderr, "    op#%u id%u ty=%s nops=%u%s\n", unsigned(it->op()),
               it->id(), StringFromMIRType(it->type()),
-              unsigned(it->numOperands()));
+              unsigned(it->numOperands()), tag);
     }
   }
 }
@@ -198,9 +206,24 @@ static int AssembleAndInstall(MIRGenerator& mirGen, MIRGraph& graph,
   }
 
   int handle = wasmhost_compile(out.begin(), int(out.length()));
-  if (handle < 0) return -1;
+  if (handle < 0) {
+    // The host (V8) REJECTED the emitted wasm module -- our codegen produced
+    // invalid/oversized wasm for this function. This is NOT an unsupported-node
+    // bail; the stale gWJBailReason (last emitted op) would mislead. Record it +
+    // the body size so LOGBAIL points here. GECKO_WJ_DUMPBADWASM writes the bytes.
+    js::wasm::gWJBailReason = "host-compile-reject";
+    if (getenv("GECKO_WJ_DUMPBADWASM")) {
+      fprintf(stderr, "[wb-badwasm] host rejected module: %zu bytes (fn line %u)\n",
+              size_t(out.length()),
+              mirGen.outerInfo().script() ? mirGen.outerInfo().script()->lineno() : 0);
+    }
+    return -1;
+  }
   const int importIds[3] = {-3, memId, tblId};  // help (shim), mem, tbl
-  if (wasmhost_instantiate(handle, importIds, 3) != 0) return -1;
+  if (wasmhost_instantiate(handle, importIds, 3) != 0) {
+    js::wasm::gWJBailReason = "host-instantiate-fail";
+    return -1;
+  }
   // Register this function in the shared table at a dense slot, so other JIT'd
   // functions can call_indirect it. -1 if the table is full (slow path only).
   // REUSE an existing slot (*tblSlotOut >= 0 on a deopt-storm RECOMPILE): callers'
@@ -288,6 +311,14 @@ int WJWarpCompile(JSContext* cx, JSScript* script, uint32_t* nargsOut,
   // internally; best-effort (ignore failure -> just no inlining).
   if (getenv("GECKO_WJ_COLDCALL")) {
     AutoRealm ar(cx, script);
+    // Crank the inliner toward Ion-like aggressiveness: inline call sites with far
+    // fewer warmup entries and much larger callee bodies. raytrace's hot path is
+    // tiny Vector methods (dot/add/...) whose call overhead dwarfs their body --
+    // inlining them is the win. GECKO_WJ_INLINEAGGR tunes; default cranks hard.
+    if (!getenv("GECKO_WJ_NOINLINEAGGR")) {
+      jit::JitOptions.inliningEntryThreshold = 2;
+      jit::JitOptions.smallFunctionMaxBytecodeLength = 2000;
+    }
     jit::ICScript* ic = scriptRoot->jitScript()->icScript();
     jit::TrialInliner inliner(cx, scriptRoot, ic);
     if (!inliner.tryInlining()) {

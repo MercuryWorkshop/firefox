@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "jit/CompileInfo.h"
+#include "jit/InlineScriptTree.h"  // BytecodeSite (precise bail op location)
 #include "jit/IonTypes.h"  // IsResumeAfter
 #include "jit/MIR.h"
 #include "jit/MIRGenerator.h"
@@ -34,6 +35,7 @@
 #include "jsfriendapi.h"  // js::IdToValue
 #include "js/shadow/Object.h"
 #include "vm/BytecodeUtil.h"  // GetNextPc
+#include "vm/JSScript.h"  // PCToLineNumber (precise bail op location)
 #include "vm/JSFunction.h"
 #include "vm/JSObject.h"
 #include "vm/NativeObject.h"
@@ -105,6 +107,45 @@ static uint8_t WJValType(MIRType t) {
   }
 }
 
+// Whether a typed slot-load's unbox must stay fallible (emit the per-access tag
+// check + deopt). GECKO_WJ_INFALLIBLESLOT makes Int32-typed slot loads INFALLIBLE
+// (branch-free i32.wrap) -- sound when the slot is monomorphically int32 (e.g.
+// gbemu's CPU-register object properties this.registerA/B/...). The per-access
+// unbox branch is the dominant per-op cost on register-heavy code (it blocks the
+// host from keeping the value in a register); dropping it is the real codegen win.
+static bool WJSlotFallible(jit::MIRType type, jit::MUnbox::Mode mode) {
+  // NOTE: forcing Int32/Boolean slot-unboxes always-fallible (tag-guard + deopt,
+  // matching Ion's type-barrier) is now SOUND (deopt-resume IC-entry is aligned) and
+  // no longer catastrophically regresses -- but it fixed no bench (box2d's truncation
+  // is in arith, not slot-loads) while adding a tag-check to every Int32 slot load,
+  // so it stays opt-in via GECKO_WJ_SLOTGUARD. The demonstrated pdfjs/box2d-correctness
+  // case is already covered by the mega-load tag-guard (EmitHelperResultAsType guardTag).
+  if (getenv("GECKO_WJ_SLOTGUARD") &&
+      (type == jit::MIRType::Int32 || type == jit::MIRType::Boolean)) {
+    return true;
+  }
+  bool fallible = mode == jit::MUnbox::Fallible;
+  if (!fallible) return false;
+  static int infSlot = getenv("GECKO_WJ_INFALLIBLESLOT") ? 1 : 0;
+  if (infSlot && type == jit::MIRType::Int32) return false;
+  return true;
+}
+
+// A value of this MIR type may be (or may box) a GC pointer that a post-write
+// barrier must record when stored into a tenured container.
+static bool WJTypeMaybeGC(jit::MIRType t) {
+  switch (t) {
+    case jit::MIRType::Value:
+    case jit::MIRType::Object:
+    case jit::MIRType::String:
+    case jit::MIRType::Symbol:
+    case jit::MIRType::BigInt:
+      return true;
+    default:
+      return false;
+  }
+}
+
 struct WJBackend {
   std::vector<int32_t> localOf;  // def id -> wasm local index (-1 = none)
   std::vector<uint8_t> localTy;  // valtype per declared local (index order)
@@ -132,6 +173,7 @@ struct WJBackend {
   const CompileInfo* info = nullptr;  // slot layout for resume points
   MResumePoint* curRp = nullptr;      // resume point for the instruction being emitted
   std::unordered_map<MBasicBlock*, MResumePoint*> blockExitRp;  // each block's exit rp (rp-fallback for null entryResumePoint)
+  std::unordered_map<uint32_t, uintptr_t> nurseryObjSlot;  // NurseryObject node id -> traced const-pool slot (rematerialize, never cache: a minor GC moves the object, the slot is traced/current, a cached local goes stale -- the deltablue-under-inlining corruption)
   uint32_t curOp = 0;                 // op() of the instruction being emitted (deopt histogram)
   uint32_t deoptCallLine = 0;         // __LINE__ of the EmitDeopt call (deopt-line histogram)
   uint32_t propReadIdx = 0;           // per-compile mega-read counter (stable prop-site key)
@@ -145,12 +187,29 @@ struct WJBackend {
   // ~3.6x slower). The dispatcher, emitted after all bodies, switches on
   // deoptSiteLocal and runs the matching resume. Only active on the dispatch path.
   bool oolDeopt = false;          // out-of-line mode enabled
+  bool hasInlinedFrames = false;  // this compile contains Warp-inlined callees (a
+                                  // multi-frame resume point exists). The fast
+                                  // wasm->wasm call_indirect path corrupts state on a
+                                  // deopt nested under an inlined caller (no C++
+                                  // boundary for the resume); route this function's
+                                  // calls through the slow (wjhelp, clean-boundary)
+                                  // path, which is deopt-correct. Targeted vs global
+                                  // FORCESLOWCALL: only inlining-containing functions.
   bool forceMega = false;         // megamorphic recompile: GuardShape-guarded
                                   // property reads -> multi-shape EmitPropIC (no
                                   // deopt) instead of a monomorphic GuardShape
                                   // that storms on a polymorphic receiver.
   bool inDispatchBody = false;    // currently emitting a hot dispatch block body
   uint32_t bodyLoopIdx = 0;       // br-index of loop $L from the current body base
+  bool reloopHasCalls = false;    // caller hint: the function makes calls (-> use OOL
+                                  // deopt in the relooper to keep call-heavy bodies lean)
+  bool reloopOol = false;         // OOL deopt is active inside the relooper (block
+                                  // $D wraps the structured body). When set, a guard
+                                  // miss brs to $D at depth reloopScopeDepth+1+nest
+                                  // instead of the dispatch-loop's bodyLoopIdx+2.
+  uint32_t reloopScopeDepth = 0;  // # of open relooper scopes (loops/blocks) enclosing
+                                  // the block body currently being emitted (excludes $D
+                                  // and the guard's own `if`).
   uint32_t deoptExtraNest = 0;    // extra `if`/block levels enclosing a deopt vs the
                                   // usual single guard-`if` (so the OOL br reaches $D)
   uint32_t deoptSiteLocal = 0;    // i32 local: which deopt site fired
@@ -300,6 +359,19 @@ static bool GetOp(Encoder& e, WJBackend& be, const MDefinition* d) {
     return GetOp(e, be, d->getOperand(0));
   if (d->op() == MDefinition::Opcode::GuardObjectIdentity)
     return GetOp(e, be, d->toGuardObjectIdentity()->object());
+  // NurseryObject: a snapshot-held (movable) object reference. Its boxed pointer is
+  // kept current in a TRACED const-pool slot; reload it from that slot on EVERY use
+  // (never the cached local, which goes stale when a minor GC moves the object --
+  // the deltablue-under-inlining corruption: inlined callees hold NurseryObject refs
+  // like `planner`/`Direction`/prototypes live across allocations).
+  if (d->op() == MDefinition::Opcode::NurseryObject) {
+    auto it = be.nurseryObjSlot.find(d->id());
+    if (it != be.nurseryObjSlot.end()) {
+      return e.writeOp(Op::I32Const) && e.writeVarS32(int32_t(it->second)) &&
+             e.writeOp(Op::I64Load) && e.writeVarU32(3) && e.writeVarU32(0) &&
+             e.writeOp(Op::I32WrapI64);
+    }
+  }
   int32_t l = be.local(d);
   if (l < 0) return false;
   return e.writeOp(Op::LocalGet) && e.writeVarU32(uint32_t(l));
@@ -540,7 +612,17 @@ static bool EmitUnboxLocal(Encoder& e, WJBackend& be, uint32_t localIdx,
       if (!e.writeOp(Op::End)) return false;  // end int32 if
       return e.writeOp(Op::End);             // end double if
     }
+    case MIRType::Float32: {
+      // Float32 values are held as f64 in our repr (WJValType). The boxed JS value
+      // for a Float32-typed def (e.g. a Float32Array element read) is a plain JS
+      // number == a double, so unbox it exactly like Double (number -> f64). Without
+      // this, gbemu's audio path (executeIteration) bailed the whole opcode loop to
+      // PBL on an Unbox:Float32.
+      return EmitUnboxLocal(e, be, localIdx, MIRType::Double, fallible);
+    }
     default:
+      if (getenv("GECKO_WJ_UNBOXDBG"))
+        fprintf(stderr, "[wj-unbox-badtype] out=%s\n", StringFromMIRType(out));
       return false;
   }
 }
@@ -580,9 +662,16 @@ static bool EmitSpillValue(Encoder& e, WJBackend& be, MDefinition* v) {
         // state is wrong, and unwinding it crashes FrameIter (raytrace "unreachable"
         // in JSJitFrameIter::baselineScriptAndPc). Until the construct-frame resume
         // is correct (deltablue-class resume work), keep this OFF by default so the
-        // function cleanly bails to PBL (correct). GECKO_WJ_CONSTRUCTSPILL opts in.
-        if (!getenv("GECKO_WJ_CONSTRUCTSPILL"))
-          return WJBAIL("spill: const type %s (construct-resume unfixed)\n",
+        // function cleanly bails to PBL (correct). NOW DEFAULT-ON: the construct-
+        // frame deopt-RESUME is sound since the icEntry-alignment fix (the prior
+        // crash was the unsound resume, not the spill) -- enabling it lets raytrace's
+        // rayTrace/getRay compile instead of running in PBL (55->63). NOTE: zeal-
+        // deterministic bisection implicates getRay's construct-frame resume in a
+        // GC-staleness, but turning this OFF makes raytrace WORSE at the default
+        // nursery (2/10 vs 6/10) -- the zeal culprit is not representative; the real
+        // residual is spread across the tracing core. Kept DEFAULT-ON; GECKO_WJ_NOCONSTRUCTSPILL reverts.
+        if (getenv("GECKO_WJ_NOCONSTRUCTSPILL"))
+          return WJBAIL("spill: const type %s (construct-spill disabled)\n",
                         StringFromMIRType(t));
         bits = (t == MIRType::MagicIsConstructing)
                    ? JS::MagicValue(JS_IS_CONSTRUCTING).asRawBits()
@@ -616,6 +705,13 @@ static bool EmitSpillValue(Encoder& e, WJBackend& be, MDefinition* v) {
   // GC-ing call (earley). GetOp falls back to the cached local for plain nodes.
   if (!GetOp(e, be, v)) return false;
   if (v->type() == MIRType::Value || v->type() == MIRType::Int64) return true;
+  if (v->type() == MIRType::Float32) {
+    // Float32 is held as an f64 (WJValType); box it as a double Value -- a float
+    // typed-array read's JS value IS a double. Without this a Float32 resume operand
+    // (gbemu executeIteration captures a LoadUnboxedScalar:Float32 audio read in a
+    // resume point) couldn't spill, bailing the WHOLE main opcode loop to PBL.
+    return EmitBoxFromStack(e, MIRType::Double);
+  }
   if (v->type() == MIRType::Object || v->type() == MIRType::Int32 ||
       v->type() == MIRType::Boolean || v->type() == MIRType::Double ||
       v->type() == MIRType::String || v->type() == MIRType::Symbol ||
@@ -623,6 +719,45 @@ static bool EmitSpillValue(Encoder& e, WJBackend& be, MDefinition* v) {
     return EmitBoxFromStack(e, v->type());
   }
   return WJBAIL("spill: type %s not boxable\n", StringFromMIRType(v->type()));
+}
+
+// Store a number into an object slot as a CANONICAL DOUBLE (leaves the boxed i64
+// on the stack). int32 N and double N are JS-indistinguishable, so storing the
+// int32 as its f64-bits keeps number slots all-double -> their reads become
+// infallible f64 reinterprets (GECKO_WJ_INFALLIBLE_DBL) with no per-read tag
+// branch. Sound ONLY for slots read as Double/Value (NOT Int32-typed slots, whose
+// infallible read does I32WrapI64). We canonicalize Value-typed stores (the
+// raytrace `initialize(x,y,z)` param case) at runtime, and statically-Int32
+// stores. GECKO_WJ_SLOTCANON gates; off -> identical to EmitSpillValue.
+static bool EmitCanonStoreValue(Encoder& e, WJBackend& be, MDefinition* v) {
+  static int canon = getenv("GECKO_WJ_SLOTCANON") ? 1 : 0;
+  if (!canon) return EmitSpillValue(e, be, v);
+  if (v->type() == MIRType::Int32) {
+    int32_t vl = be.local(v);
+    if (vl >= 0)
+      return GetLocal(e, uint32_t(vl)) && e.writeOp(Op::F64ConvertI32S) &&
+             e.writeOp(Op::I64ReinterpretF64);
+  } else if (v->type() == MIRType::Value) {
+    int32_t vl = be.local(v);
+    if (vl >= 0) {
+      // cond = (tag(v) == INT32)
+      if (!GetLocal(e, uint32_t(vl)) || !e.writeOp(Op::I64Const) ||
+          !e.writeVarS64(32) || !e.writeOp(Op::I64ShrU) ||
+          !e.writeOp(Op::I32WrapI64) || !e.writeOp(Op::I32Const) ||
+          !e.writeVarS32(int32_t(TagWord(JSVAL_TYPE_INT32))) ||
+          !e.writeOp(Op::I32Eq))
+        return false;
+      if (!e.writeOp(Op::If) || !e.writeFixedU8(0x7E)) return false;  // result i64
+      // then: int32 low bits -> double bits
+      if (!GetLocal(e, uint32_t(vl)) || !e.writeOp(Op::I32WrapI64) ||
+          !e.writeOp(Op::F64ConvertI32S) || !e.writeOp(Op::I64ReinterpretF64))
+        return false;
+      if (!e.writeOp(Op::Else)) return false;
+      if (!GetLocal(e, uint32_t(vl))) return false;  // keep as-is
+      return e.writeOp(Op::End);
+    }
+  }
+  return EmitSpillValue(e, be, v);
 }
 
 // Leave a raw i32 object pointer for `v` on the stack (used for the resume env
@@ -705,6 +840,18 @@ static bool EmitDeoptResumeInline(Encoder& e, WJBackend& be,
            e.writeOp(Op::I32Store) && e.writeVarU32(2) && e.writeVarU32(0);
   };
 
+  // DIAGNOSTIC: poison the resume-vals buffer before spilling, so that any slot
+  // WJH_RESUME reads but the spill below did NOT write returns a recognizable
+  // garbage Value -> turns a resume under-spill (stale-slot read) into a
+  // deterministic failure. GECKO_WJ_POISONRESUME.
+  if (getenv("GECKO_WJ_POISONRESUME")) {
+    for (uint32_t i = 0; i < 160; i++) {
+      if (!e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(valsBase + i * 8)) ||
+          !e.writeOp(Op::I64Const) || !e.writeVarS64(int64_t(0xfff8ccccccccccccull)) ||
+          !e.writeOp(Op::I64Store) || !e.writeVarU32(3) || !e.writeVarU32(0))
+        return false;
+    }
+  }
   uint32_t valsIdx = 0;  // running index into gWJResumeVals across all frames
   for (uint32_t f = 0; f < nframes; f++) {
     MResumePoint* rp = frames[f];
@@ -723,6 +870,35 @@ static bool EmitDeoptResumeInline(Encoder& e, WJBackend& be,
     uint32_t stackDepth = uint32_t(rp->numOperands()) - firstStack;
     uint32_t frameValsOff = valsIdx;
 
+    // Return-threading for inlined CALLER frames (f>0). The outer frame's resume
+    // point sits AT the inlined call with the call inputs [callee, this, args] on
+    // its expr stack. Re-executing the call would re-run a side-effecting callee a
+    // SECOND time (the inner frame already ran it) -- deltablue's incrementalAdd
+    // (newMark()/satisfy mutate the graph) corrupted state this way. Instead we
+    // resume AFTER the call with the inner frame's return value threaded onto the
+    // stack top, exactly as a real bailout does: spill only the stack values BELOW
+    // the call inputs, then a result slot the runtime fills with the inner return.
+    bool threaded = (f > 0);
+    uint32_t spillStack = stackDepth;  // # of rp stack operands to spill
+    uint32_t outDepth = stackDepth;    // stack depth PBL resumes with
+    jsbytecode* callPc = nullptr;
+    if (threaded) {
+      callPc = rp->pc();
+      JSOp jop = JSOp(*callPc);
+      if (jop != JSOp::Call && jop != JSOp::CallContent &&
+          jop != JSOp::CallIgnoresRv) {
+        js::wasm::gWJBailReason = "resume-thread-noncall";
+        return false;  // unusual call shape (spread/new/eval): don't inline-compile
+      }
+      uint32_t inputs = uint32_t(GET_ARGC(callPc)) + 2;  // callee + this + args
+      if (stackDepth < inputs) {
+        js::wasm::gWJBailReason = "resume-thread-depth";
+        return false;
+      }
+      spillStack = stackDepth - inputs;  // stack values below the call inputs
+      outDepth = spillStack + 1;         // + the threaded result slot
+    }
+
     auto spill = [&](MDefinition* v) -> bool {
       // skipFrameSpill: the hot-path shadow already wrote this frame's operands to
       // their (fixed) gWJResumeVals slots, so the cold dispatcher must NOT re-read
@@ -736,9 +912,12 @@ static bool EmitDeoptResumeInline(Encoder& e, WJBackend& be,
           !e.writeVarS32(int32_t(valsBase + valsIdx * 8)))
         return false;
       if (!EmitSpillValue(e, be, v)) {
-        if (getenv("GECKO_WJ_DEOPTRESUMEDBG"))
-          fprintf(stderr, "[wj-spill-fail] f-operand op=%s ty=%s local=%d\n",
+        if (getenv("GECKO_WJ_DEOPTRESUMEDBG")) {
+          JSScript* ss = be.info ? be.info->script() : nullptr;
+          fprintf(stderr, "[wj-spill-fail] %s:%u f-operand op=%s ty=%s local=%d\n",
+                  ss ? ss->filename() : "?", ss ? unsigned(ss->lineno()) : 0,
                   WJOpName(v->op()), StringFromMIRType(v->type()), be.local(v));
+        }
         if (!js::wasm::gWJBailReason ||
             !strstr(js::wasm::gWJBailReason, "spill"))
           js::wasm::gWJBailReason = "spill-operand";
@@ -756,17 +935,28 @@ static bool EmitDeoptResumeInline(Encoder& e, WJBackend& be,
     for (uint32_t i = 0; i < nlocals; i++) {
       if (!spill(rp->getOperand(info.localSlot(i)))) return false;
     }
-    for (uint32_t i = 0; i < stackDepth; i++) {
+    for (uint32_t i = 0; i < spillStack; i++) {
       if (!spill(rp->getOperand(info.stackSlot(i)))) return false;
     }
+    if (threaded) {
+      // Reserve the threaded-result slot (top of the resumed stack). The runtime
+      // overwrites it with the inner frame's return before resuming this frame;
+      // spill Undefined as a safe default.
+      if (!e.writeOp(Op::I32Const) ||
+          !e.writeVarS32(int32_t(valsBase + valsIdx * 8)) ||
+          !e.writeOp(Op::I64Const) ||
+          !e.writeVarS64(int64_t(JS::UndefinedValue().asRawBits())) ||
+          !e.writeOp(Op::I64Store) || !e.writeVarU32(3) || !e.writeVarU32(0))
+        return false;
+      valsIdx++;
+    }
 
-    // Resume-after modes: the op at rp->pc() already produced its result (on the
-    // captured stack); resume at the NEXT bytecode. This applies to the INNERMOST
-    // (deopt) frame. For OUTER (inlined-call caller) frames, the captured stack is
-    // the PRE-call inputs [callee, this, args]; we resume AT the call so PBL
-    // re-executes it (re-running the inlined callee normally) -- so do NOT advance.
+    // Innermost (deopt) frame: resume-after modes advance past the producing op.
+    // Outer (inlined-call) frames: resume AFTER the call with the threaded result
+    // on the stack (set above) -- PBL continues post-call without re-running it.
     jsbytecode* resumePc = rp->pc();
     if (f == 0 && IsResumeAfter(rp->mode())) resumePc = GetNextPc(resumePc);
+    if (threaded) resumePc = GetNextPc(callPc);
     uint32_t pcOff = uint32_t(resumePc - info.script()->code());
     if (getenv("GECKO_WJ_RPDBG")) {
       fprintf(stderr, "[wj-rpc] f=%u %s:%u mode=%d rawpc=%u op=%s resumepc=%u depth=%u\n",
@@ -775,7 +965,7 @@ static bool EmitDeoptResumeInline(Encoder& e, WJBackend& be,
               js::CodeName(JSOp(*rp->pc())), pcOff, stackDepth);
     }
     if (!storeI32(uintptr_t(&gWJResumePc[f]), int32_t(pcOff))) return false;
-    if (!storeI32(uintptr_t(&gWJResumeStackDepth[f]), int32_t(stackDepth)))
+    if (!storeI32(uintptr_t(&gWJResumeStackDepth[f]), int32_t(outDepth)))
       return false;
     if (!storeI32(uintptr_t(&gWJResumeScriptPtr[f]),
                   int32_t(uintptr_t(info.script()))))
@@ -875,12 +1065,17 @@ static bool EmitDeoptResume(Encoder& e, WJBackend& be) {
               be.curOp < kWJNumOps ? "" : "?", be.deoptCallLine);
     }
     be.deoptSites.push_back({be.curRp, be.curOp, isShadow});
-    // deoptSiteLocal = site; br to `block $D` (one scope past loop $L; +1 again
-    // for the guard's own enclosing `if`, where every in-body deopt sits).
+    // deoptSiteLocal = site; br to `block $D`. Dispatch loop: $D is one scope past
+    // loop $L (bodyLoopIdx blocks + $L + the guard `if` = bodyLoopIdx+2). Relooper:
+    // $D wraps reloopScopeDepth nested loop/block scopes; from inside the guard `if`
+    // that's reloopScopeDepth (relooper scopes) + 1 (guard `if`) to reach $D. Both
+    // add deoptExtraNest for any extra `if` levels the op opened around the deopt.
+    uint32_t brDepth = be.reloopOol
+                           ? (be.reloopScopeDepth + 1 + be.deoptExtraNest)
+                           : (be.bodyLoopIdx + 2 + be.deoptExtraNest);
     return e.writeOp(Op::I32Const) && e.writeVarS32(int32_t(site)) &&
            e.writeOp(Op::LocalSet) && e.writeVarU32(be.deoptSiteLocal) &&
-           e.writeOp(Op::Br) &&
-           e.writeVarU32(be.bodyLoopIdx + 2 + be.deoptExtraNest);
+           e.writeOp(Op::Br) && e.writeVarU32(brDepth);
   }
   return EmitDeoptResumeInline(e, be);
 }
@@ -923,10 +1118,18 @@ static bool EmitFrameSpillDelta(Encoder& e, WJBackend& be, MResumePoint* rp,
     return rp->getOperand(op) != prevRp->getOperand(op);
   };
   auto spillSlot = [&](uint32_t idx, MDefinition* v) -> bool {
-    return e.writeOp(Op::I32Const) &&
-           e.writeVarS32(int32_t(valsBase + idx * 8)) &&
-           EmitSpillValue(e, be, v) && e.writeOp(Op::I64Store) &&
-           e.writeVarU32(3) && e.writeVarU32(0);
+    if (!e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(valsBase + idx * 8)))
+      return false;
+    if (!EmitSpillValue(e, be, v)) {
+      if (getenv("GECKO_WJ_DEOPTRESUMEDBG")) {
+        JSScript* ss = be.info ? be.info->script() : nullptr;
+        fprintf(stderr, "[wj-shadowspill-fail] %s:%u op=%s ty=%s local=%d\n",
+                ss ? ss->filename() : "?", ss ? unsigned(ss->lineno()) : 0,
+                WJOpName(v->op()), StringFromMIRType(v->type()), be.local(v));
+      }
+      return false;
+    }
+    return e.writeOp(Op::I64Store) && e.writeVarU32(3) && e.writeVarU32(0);
   };
   // this/args were spilled ONCE at the prologue. Re-spill a slot here only if it
   // no longer holds its Parameter (i.e. `this`/an arg was reassigned in the body),
@@ -994,7 +1197,15 @@ static void WJCollectRoots(WJBackend& be, MInstruction* ins,
     }
     return false;
   };
-  static int rootAll = getenv("GECKO_WJ_ROOTALL") ? 1 : 0;
+  // DEFAULT-ON: root ALL object/value locals at every GC point (a true safepoint),
+  // not just those the dominance+liveness walk finds live-after `ins`. That walk
+  // MISSES values resurrected by GetOp rematerialization (a later consumer re-reads
+  // an Unbox/guard's SOURCE, whose own liveness already "ended"): the source local
+  // goes stale across an intervening alloc -> a freed/moved pointer (raytrace `new
+  // X(objArg)` "rendered incorrectly"). Rooting all named locals closes that class
+  // of bug; measured negligible cost (splay -2.5%, richards +7%). GECKO_WJ_NOROOTALL
+  // reverts to the selective (unsound-for-remat) walk.
+  static int rootAll = getenv("GECKO_WJ_NOROOTALL") ? 0 : 1;
   auto consider = [&](MDefinition* d) {
     bool isObj = d->type() == MIRType::Object;
     bool isVal = d->type() == MIRType::Value;
@@ -1044,6 +1255,12 @@ static bool EmitHelperCallResult(Encoder& e, WJBackend& be, MInstruction* ins,
     rootIsObj.clear();
   }
   uint32_t nRoots = uint32_t(rootLocal.size());
+  if (getenv("GECKO_WJ_ROOTDBG") && kind == WJH_NEWPLAIN) {
+    fprintf(stderr, "[rootdbg] NEWPLAIN ins#%u nRoots=%u locals:", ins->id(),
+            nRoots);
+    for (uint32_t k = 0; k < nRoots; k++) fprintf(stderr, " %u", rootLocal[k]);
+    fprintf(stderr, "\n");
+  }
   uintptr_t rootsBase = uintptr_t(static_cast<void*>(&gWJCallRoots[0]));
   uintptr_t spAddr = uintptr_t(static_cast<void*>(&gWJRootSP));
   auto emitSPAdjust = [&](int32_t delta) -> bool {
@@ -1113,6 +1330,48 @@ static bool EmitStageScratch(Encoder& e, WJBackend& be, MDefinition* v,
          e.writeOp(Op::I64Store) && e.writeVarU32(3) && e.writeVarU32(slot * 8);
 }
 
+// If `ins` is the `this` (arg 0) operand of a constructing call, return that
+// MCall. The construct's callee/newTarget locals go stale across `ins`'s
+// allocation (an inline-`this` NewObject/NewPlainObject can GC), so the alloc
+// site pre-stages them into the TRACED 62/63 scratch slots while still fresh
+// (see the NewObject case + the Call(constructing) case).
+static MCall* WJConstructConsumer(MInstruction* ins) {
+  for (MUseIterator u = ins->usesBegin(); u != ins->usesEnd(); u++) {
+    MNode* consumer = u->consumer();
+    if (!consumer->isDefinition()) continue;
+    MDefinition* cd = consumer->toDefinition();
+    if (!cd->isCall()) continue;
+    MCall* call = cd->toCall();
+    if (call->isConstructing() && call->numStackArgs() > 0 &&
+        call->getArg(0) == ins) {
+      return call;
+    }
+  }
+  return nullptr;
+}
+
+// Box (if Object) and store a call operand into a traced scratch slot, reading
+// its CACHED local directly (no GetOp rematerialization, which would re-read a
+// now-stale source). Used by the construct callee/newTarget pre-stage where the
+// operand local is still fresh (no GC yet). Returns false if the operand has no
+// local or an unexpected representation -> caller bails the construct to PBL.
+static bool EmitStageOperandLocal(Encoder& e, WJBackend& be, MDefinition* d,
+                                  uint32_t slot) {
+  int32_t l = be.local(d);
+  if (l < 0) {
+    js::wasm::gWJBailReason = "construct-operand-no-local";
+    return false;
+  }
+  if (!GetLocal(e, be.scratchBase) || !GetLocal(e, uint32_t(l))) return false;
+  if (d->type() == MIRType::Object) {
+    if (!EmitBoxFromStack(e, MIRType::Object)) return false;
+  } else if (d->type() != MIRType::Value) {
+    js::wasm::gWJBailReason = "construct-operand-bad-type";
+    return false;
+  }
+  return e.writeOp(Op::I64Store) && e.writeVarU32(3) && e.writeVarU32(slot * 8);
+}
+
 // Stage a compile-time-constant boxed Value into gWJScratch[slot]. GC-thing
 // values are baked via the traced constant pool (loaded live at runtime);
 // others are immediate.
@@ -1178,21 +1437,36 @@ static bool EmitPropIC(Encoder& e, WJBackend& be, MInstruction* ins,
     return false;
   if (!e.writeOp(Op::LocalSet) || !e.writeVarU32(be.propShapeLocal)) return false;
 
-  // Load the slot value for way `w` (tagged offset at gWJPropOff[base+w]).
+  uintptr_t holderArr = uintptr_t(static_cast<void*>(&gWJPropHolder[0]));
+  // Load the slot value for way `w` (tagged offset at gWJPropOff[base+w]). If
+  // gWJPropHolder[base+w] is set (proto-read way), load from that holder object
+  // instead of the receiver. objBase scratch reuses propShapeLocal (the matched
+  // way's then-branch never reads it again).
   auto emitSlotLoad = [&](uint32_t w) -> bool {
+    // objBase = gWJPropHolder[w] ? holder : receiver
+    if (!e.writeOp(Op::I32Const) ||
+        !e.writeVarS32(int32_t(holderArr + (base + w) * 4)) ||
+        !e.writeOp(Op::I32Load) || !e.writeVarU32(2) || !e.writeVarU32(0) ||
+        !e.writeOp(Op::LocalTee) || !e.writeVarU32(be.propShapeLocal))
+      return false;                                      // [holder], propShapeLocal=holder
+    if (!GetLocal(e, be.propObjLocal)) return false;     // [holder, receiver]
+    if (!GetLocal(e, be.propShapeLocal)) return false;   // [holder, receiver, holder(cond)]
+    if (!e.writeOp(Op::SelectNumeric)) return false;            // [objBase]
+    if (!e.writeOp(Op::LocalSet) || !e.writeVarU32(be.propShapeLocal))
+      return false;                                      // propShapeLocal = objBase
     if (!e.writeOp(Op::I32Const) ||
         !e.writeVarS32(int32_t(offArr + (base + w) * 4)) ||
         !e.writeOp(Op::I32Load) || !e.writeVarU32(2) || !e.writeVarU32(0) ||
         !e.writeOp(Op::LocalSet) || !e.writeVarU32(be.propTaggedLocal))
       return false;
-    // baseAddr = (tagged & 1) ? propObj : I32Load(propObj + offsetOfSlots)
+    // baseAddr = (tagged & 1) ? objBase : I32Load(objBase + offsetOfSlots)
     if (!GetLocal(e, be.propTaggedLocal) || !e.writeOp(Op::I32Const) ||
         !e.writeVarS32(1) || !e.writeOp(Op::I32And))
       return false;
     if (!e.writeOp(Op::If) || !e.writeFixedU8(uint8_t(TypeCode::I32))) return false;
-    if (!GetLocal(e, be.propObjLocal)) return false;
+    if (!GetLocal(e, be.propShapeLocal)) return false;
     if (!e.writeOp(Op::Else)) return false;
-    if (!GetLocal(e, be.propObjLocal) || !e.writeOp(Op::I32Load) ||
+    if (!GetLocal(e, be.propShapeLocal) || !e.writeOp(Op::I32Load) ||
         !e.writeVarU32(2) ||
         !e.writeVarU32(uint32_t(js::NativeObject::offsetOfSlots())))
       return false;
@@ -1302,7 +1576,20 @@ static bool EmitGetPropIC(Encoder& e, WJBackend& be, MInstruction* ins,
       !e.writeVarU32(uint32_t(offsetof(JS::shadow::Object, shape))) ||
       !e.writeOp(Op::LocalSet) || !e.writeVarU32(be.propShapeLocal))
     return false;
+  uintptr_t gpHolderArr = uintptr_t(static_cast<void*>(&gWJPropHolder[0]));
   auto emitSlotLoad = [&](uint32_t w) -> bool {
+    // objBase = gWJPropHolder[w] ? holder : receiver (proto-read support). objBase
+    // scratch reuses propShapeLocal (free in the matched way's then-branch).
+    if (!e.writeOp(Op::I32Const) ||
+        !e.writeVarS32(int32_t(gpHolderArr + (base + w) * 4)) ||
+        !e.writeOp(Op::I32Load) || !e.writeVarU32(2) || !e.writeVarU32(0) ||
+        !e.writeOp(Op::LocalTee) || !e.writeVarU32(be.propShapeLocal))
+      return false;                                      // [holder], propShapeLocal=holder
+    if (!GetLocal(e, be.propObjLocal)) return false;     // [holder, receiver]
+    if (!GetLocal(e, be.propShapeLocal)) return false;   // [holder, receiver, holder(cond)]
+    if (!e.writeOp(Op::SelectNumeric)) return false;            // [objBase]
+    if (!e.writeOp(Op::LocalSet) || !e.writeVarU32(be.propShapeLocal))
+      return false;                                      // propShapeLocal = objBase
     if (!e.writeOp(Op::I32Const) ||
         !e.writeVarS32(int32_t(offArr + (base + w) * 4)) ||
         !e.writeOp(Op::I32Load) || !e.writeVarU32(2) || !e.writeVarU32(0) ||
@@ -1312,9 +1599,9 @@ static bool EmitGetPropIC(Encoder& e, WJBackend& be, MInstruction* ins,
         !e.writeVarS32(1) || !e.writeOp(Op::I32And))
       return false;
     if (!e.writeOp(Op::If) || !e.writeFixedU8(uint8_t(TypeCode::I32))) return false;
-    if (!GetLocal(e, be.propObjLocal)) return false;
+    if (!GetLocal(e, be.propShapeLocal)) return false;
     if (!e.writeOp(Op::Else)) return false;
-    if (!GetLocal(e, be.propObjLocal) || !e.writeOp(Op::I32Load) ||
+    if (!GetLocal(e, be.propShapeLocal) || !e.writeOp(Op::I32Load) ||
         !e.writeVarU32(2) ||
         !e.writeVarU32(uint32_t(js::NativeObject::offsetOfSlots())))
       return false;
@@ -1443,20 +1730,44 @@ static bool EmitGuardedValuePreBarrier(Encoder& e, WJBackend& be, F emitOldValue
 // EFFECT: it leaves nothing on the stack. `site` must be nonzero.
 static bool EmitPropStoreIC(Encoder& e, WJBackend& be, MInstruction* ins,
                             MDefinition* object, MDefinition* idval,
-                            MDefinition* value, bool strict, uint32_t site) {
+                            MDefinition* value, bool strict, uint32_t site,
+                            uint64_t constKeyValBits = 0) {
   gWJPropStrict[site] = strict ? 1 : 0;
   uint32_t base = site * kWJPropWays;
   uintptr_t shapeArr = uintptr_t(static_cast<void*>(&gWJPropShape[0]));
   uintptr_t offArr = uintptr_t(static_cast<void*>(&gWJPropOff[0]));
-  // propObj = receiver pointer (rematerialized).
-  if (!GetOp(e, be, object)) return false;
-  if (!e.writeOp(Op::LocalSet) || !e.writeVarU32(be.propObjLocal)) return false;
-  // propShape = I32Load(propObj + offsetOfShape).
-  if (!GetLocal(e, be.propObjLocal)) return false;
-  if (!e.writeOp(Op::I32Load) || !e.writeVarU32(2) ||
-      !e.writeVarU32(uint32_t(offsetof(JS::shadow::Object, shape))))
-    return false;
-  if (!e.writeOp(Op::LocalSet) || !e.writeVarU32(be.propShapeLocal)) return false;
+  uint32_t shapeOff = uint32_t(offsetof(JS::shadow::Object, shape));
+  if (object->type() == MIRType::Object) {
+    // propObj = receiver pointer (rematerialized); propShape = its shape.
+    if (!GetOp(e, be, object)) return false;
+    if (!e.writeOp(Op::LocalSet) || !e.writeVarU32(be.propObjLocal)) return false;
+    if (!GetLocal(e, be.propObjLocal)) return false;
+    if (!e.writeOp(Op::I32Load) || !e.writeVarU32(2) || !e.writeVarU32(shapeOff))
+      return false;
+    if (!e.writeOp(Op::LocalSet) || !e.writeVarU32(be.propShapeLocal)) return false;
+  } else {
+    // BOXED (Value) receiver -- richards' polymorphic Task/Packet refs are typed
+    // Value, so the store IC must guard the object tag (mirrors EmitGetPropIC).
+    // propShape = isObject ? load(unbox->shape) : -1 (sentinel never matches a way,
+    // so a non-object receiver cleanly misses -> WJH_SETPROPIC handles it). The
+    // shape load is GUARDED so a non-object's bits are never dereferenced.
+    if (!GetOp(e, be, object) || !e.writeOp(Op::I64Const) || !e.writeVarS64(32) ||
+        !e.writeOp(Op::I64ShrU) || !e.writeOp(Op::I32WrapI64) ||
+        !e.writeOp(Op::I32Const) ||
+        !e.writeVarS32(int32_t(TagWord(JSVAL_TYPE_OBJECT))) || !e.writeOp(Op::I32Eq))
+      return false;
+    if (!e.writeOp(Op::If) || !e.writeFixedU8(uint8_t(TypeCode::I32))) return false;
+    if (!GetOp(e, be, object) || !e.writeOp(Op::I32WrapI64) ||
+        !e.writeOp(Op::LocalSet) || !e.writeVarU32(be.propObjLocal))
+      return false;
+    if (!GetLocal(e, be.propObjLocal) || !e.writeOp(Op::I32Load) ||
+        !e.writeVarU32(2) || !e.writeVarU32(shapeOff))
+      return false;
+    if (!e.writeOp(Op::Else)) return false;
+    if (!e.writeOp(Op::I32Const) || !e.writeVarS32(-1)) return false;
+    if (!e.writeOp(Op::End)) return false;
+    if (!e.writeOp(Op::LocalSet) || !e.writeVarU32(be.propShapeLocal)) return false;
+  }
   // boxed value -> unboxScratch (reused for store + post-barrier inspection).
   if (!EmitSpillValue(e, be, value)) return false;
   if (!e.writeOp(Op::LocalSet) || !e.writeVarU32(be.unboxScratch)) return false;
@@ -1559,9 +1870,15 @@ static bool EmitPropStoreIC(Encoder& e, WJBackend& be, MInstruction* ins,
     if (!emitStore(w)) return false;
     if (!e.writeOp(Op::Else)) return false;
   }
-  // Miss: stage obj, idval, value; call WJH_SETPROPIC (fills + stores); drop.
+  // Miss: stage obj, key, value; call WJH_SETPROPIC (fills + stores); drop.
+  // The key is either an MDefinition (SetPropertyCache) or a constant PropertyKey
+  // value (MegamorphicStoreSlot, which has no idval node).
   if (!EmitStageScratch(e, be, object, 0)) return false;
-  if (!EmitStageScratch(e, be, idval, 1)) return false;
+  if (constKeyValBits) {
+    if (!EmitStageConstBoxed(e, be, constKeyValBits, 1)) return false;
+  } else if (!EmitStageScratch(e, be, idval, 1)) {
+    return false;
+  }
   if (!EmitStageScratch(e, be, value, 2)) return false;
   if (!EmitHelperCallResult(e, be, ins, WJH_SETPROPIC, site)) return false;
   if (!e.writeOp(Op::Drop)) return false;
@@ -1711,7 +2028,8 @@ static bool WJMegaGSLTO(jit::MDefinition* g, jit::MDefinition** objOut,
 // A generic-IC helper (WJH_BINARYARITH/UNARYARITH/...) leaves a BOXED i64 result
 // on the stack. If Warp TYPED the node (Int32/Double/Boolean), coerce the box to
 // that wasm type so it matches the node's local (else host rejects the module).
-static bool EmitHelperResultAsType(Encoder& e, WJBackend& be, jit::MIRType type) {
+static bool EmitHelperResultAsType(Encoder& e, WJBackend& be, jit::MIRType type,
+                                   bool guardTag = false) {
   if (type == jit::MIRType::Value) return true;  // box already matches i64 local
   if (type == jit::MIRType::Double || type == jit::MIRType::Float32) {
     // A numeric box may be int32-tagged (e.g. 2+3=5) or double-tagged. Convert
@@ -1734,14 +2052,58 @@ static bool EmitHelperResultAsType(Encoder& e, WJBackend& be, jit::MIRType type)
     if (!GetLocal(e, s) || !e.writeOp(Op::F64ReinterpretI64)) return false;
     return e.writeOp(Op::End);
   }
-  // Int32 / Boolean: the payload is the low 32 bits of the NUNBOX box.
+  // Int32 / Boolean: the payload is the low 32 bits of the NUNBOX box. When
+  // `guardTag` is set (the mega/by-name PROPERTY-load path -- EmitPropIC for a
+  // speculated-Int32/Boolean property whose value can turn out non-int32, e.g.
+  // undefined/string), tag-GUARD and DEOPT on mismatch first: blindly wrapping a
+  // non-int32 box read its low 32 bits as a bogus int32 with NO deopt (a loop
+  // `t += (s.v+i)|0` with undefined s.v computed `t += i`; box2d/regexp wrong
+  // answers). Sound now that the deopt-resume IC-entry is aligned. The guard is
+  // ONLY for the mega prop-load caller -- arith/CharCodeAt results are genuinely
+  // typed and must NOT guard (guarding them deopt-storms richards/navier to PBL).
+  if (guardTag && (type == jit::MIRType::Int32 || type == jit::MIRType::Boolean) &&
+      !getenv("GECKO_WJ_NOHELPERTYGUARD")) {
+    uint32_t s = be.unboxScratch;
+    uint32_t wantTag = (type == jit::MIRType::Boolean)
+                           ? TagWord(JSVAL_TYPE_BOOLEAN)
+                           : TagWord(JSVAL_TYPE_INT32);
+    if (!e.writeOp(Op::LocalSet) || !e.writeVarU32(s)) return false;
+    if (!GetLocal(e, s) || !e.writeOp(Op::I64Const) || !e.writeVarS64(32) ||
+        !e.writeOp(Op::I64ShrU) || !e.writeOp(Op::I32WrapI64) ||
+        !e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(wantTag)) ||
+        !e.writeOp(Op::I32Ne))
+      return false;
+    if (!e.writeOp(Op::If) || !e.writeFixedU8(0x40)) return false;
+    if (!EmitDeopt(e, be)) return false;
+    if (!e.writeOp(Op::End)) return false;
+    return GetLocal(e, s) && e.writeOp(Op::I32WrapI64);
+  }
   return e.writeOp(Op::I32WrapI64);
+}
+
+// Attribute a potential bail to `ins`: record its op name AND its precise source
+// location (inlinee script + line + bytecode offset from its trackedSite), so the
+// LOGBAIL audit pinpoints the exact failing op rather than just the compiled
+// function's defining line. trackedSite()->pc() can point at a JumpTarget for some
+// ops, so the offset is approximate, but the line is the op's real origin.
+static void WJSetBailOp(MInstruction* ins) {
+  js::wasm::gWJBailReason = WJOpName(ins->op());
+  js::wasm::gWJBailOpLine = 0;
+  js::wasm::gWJBailOpOff = 0;
+  js::wasm::gWJBailOpFile = nullptr;
+  const jit::BytecodeSite* site = ins->trackedSite();
+  if (site && site->script() && site->pc()) {
+    JSScript* s = site->script();
+    js::wasm::gWJBailOpFile = s->filename();
+    js::wasm::gWJBailOpOff = uint32_t(site->pc() - s->code());
+    js::wasm::gWJBailOpLine = js::PCToLineNumber(s, site->pc());
+  }
 }
 
 // Compute a node's value, leaving exactly one wasm value on the stack. (For
 // effectful/void nodes EmitEffect is used instead.) Returns false => unsupported.
 static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
-  js::wasm::gWJBailReason = WJOpName(ins->op());  // attribute an internal bail to this op
+  WJSetBailOp(ins);  // attribute an internal bail to this op (+ precise op line)
   switch (ins->op()) {
     case MDefinition::Opcode::Parameter: {
       MParameter* p = ins->toParameter();
@@ -1854,8 +2216,7 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
       if (inLocal < 0) {
         if (getenv("GECKO_WJ_UNBOXDBG"))
           fprintf(stderr, "[wj-unbox-nolocal] input op=%s ty=%s\n",
-                  WJOpName(u->input()->op()),
-                  StringFromMIRType(u->input()->type()));
+                  WJOpName(u->input()->op()), StringFromMIRType(u->input()->type()));
         return false;
       }
       return EmitUnboxLocal(e, be, uint32_t(inLocal), u->type(),
@@ -1896,24 +2257,26 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
         }
         if (conv) return GetOp(e, be, g->object());
         if (getenv("GECKO_WJ_MEGAFAIL")) {
-          js::Shape* sh = g->shape();
-          const char* badop = (!sh || !sh->isShared()) ? "not-shared" : "?";
-          if (sh && sh->isShared()) {
-            for (jit::MUseIterator u = g->usesBegin(); u != g->usesEnd(); u++) {
-              if (!u->consumer()->isDefinition()) continue;
-              jit::MDefinition::Opcode o = u->consumer()->toDefinition()->op();
-              if (o == jit::MDefinition::Opcode::LoadFixedSlot ||
-                  o == jit::MDefinition::Opcode::LoadFixedSlotAndUnbox)
-                continue;
-              badop = WJOpName(o);
-              break;
-            }
-          }
           JSScript* ms = be.info ? be.info->script() : nullptr;
-          fprintf(stderr, "[wj-megafail] %s:%u GuardShape NOTCONV firstbad=%s\n",
+          fprintf(stderr, "[wj-megafail] %s:%u GuardShape NOTCONV alluses:",
                   ms && ms->filename() ? ms->filename() : "?",
-                  ms ? unsigned(ms->lineno()) : 0, badop);
+                  ms ? unsigned(ms->lineno()) : 0);
+          for (jit::MUseIterator u = g->usesBegin(); u != g->usesEnd(); u++) {
+            if (!u->consumer()->isDefinition()) { fprintf(stderr, " <rp>"); continue; }
+            fprintf(stderr, " %s", WJOpName(u->consumer()->toDefinition()->op()));
+          }
+          fprintf(stderr, "\n");
         }
+      }
+      static int forceDeoptLine =
+          getenv("GECKO_WJ_FORCEDEOPTLINE") ? atoi(getenv("GECKO_WJ_FORCEDEOPTLINE")) : 0;
+      if (forceDeoptLine && be.info && be.info->script() &&
+          uint32_t(be.info->script()->lineno()) == uint32_t(forceDeoptLine)) {
+        if (!e.writeOp(Op::I32Const) || !e.writeVarS32(1)) return false;
+        if (!e.writeOp(Op::If) || !e.writeFixedU8(0x40)) return false;
+        if (!EmitDeopt(e, be)) return false;
+        if (!e.writeOp(Op::End)) return false;
+        return GetOp(e, be, g->object());
       }
       int32_t objLocal = be.local(g->object());
       if (objLocal < 0) return false;
@@ -2168,8 +2531,45 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
     }
     case MDefinition::Opcode::GuardFunctionScript: {
       // Deopt unless the function's BaseScript matches the expected one. This is
-      // the real guard behind polymorphic-call inlining (each inlined target has
-      // a distinct script). Load func->(jitInfoOrScript) and compare.
+      // the real guard behind polymorphic-call INLINING (each inlined target has a
+      // distinct script). BUT if every use of this guard is just the CALLEE of a
+      // real MCall (not an inlined body), the guard is redundant: our call path
+      // dispatches ANY function via its polymorphic IC / wjhelp fallback, so a
+      // mismatched callee does NOT need a deopt. Monomorphic GuardFunctionScript on
+      // a genuinely polymorphic indirect call (gbemu memoryRead's
+      // `this.memoryReader[address](...)` -- 65536 distinct handlers) was deopt-
+      // storming EVERY call (3699 resumes -> the whole emulator memory path in PBL).
+      // Passthrough (no deopt) when safe; keep the deopt when it protects an inlined
+      // region (a use that is NOT a call callee). GECKO_WJ_NOGSFCALLPASS reverts.
+      {
+        bool allCallCallee = ins->hasUses();
+        for (jit::MUseIterator u = ins->usesBegin(); u != ins->usesEnd(); u++) {
+          jit::MNode* c = u->consumer();
+          if (!c->isDefinition()) continue;  // resume points: shape-agnostic
+          jit::MDefinition* d = c->toDefinition();
+          if (d->isCall() && d->toCall()->getCallee() == ins) continue;
+          allCallCallee = false;
+          break;
+        }
+        // OPT-IN (GECKO_WJ_GSFCALLPASS): the passthrough KILLS the memoryRead
+        // deopt storm (gbemu 4000->88 resumes) BUT exposes a latent correctness
+        // bug somewhere in gbemu (ERR=Gameboy) when applied globally. The flag may
+        // be a LINE NUMBER to scope the passthrough to one function (for bisection)
+        // or "1" to apply everywhere. Keep the deopt by default until fixed.
+        const char* gsfEnv = getenv("GECKO_WJ_GSFCALLPASS");
+        bool gsfOn = false;
+        if (gsfEnv && allCallCallee) {
+          int wantLine = atoi(gsfEnv);
+          uint32_t fnLine =
+              be.info && be.info->script() ? be.info->script()->lineno() : 0;
+          gsfOn = (wantLine <= 1) || (uint32_t(wantLine) == fnLine);
+        }
+        if (gsfOn) {
+          int32_t pl = be.local(ins->getOperand(0));
+          if (pl < 0) return false;
+          return GetLocal(e, uint32_t(pl));  // passthrough; call IC dispatches
+        }
+      }
       int32_t fl = be.local(ins->getOperand(0));
       if (fl < 0) return false;
       uintptr_t expected =
@@ -2244,6 +2644,7 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
       if (!obj) return false;
       uintptr_t slot = WJInternConstant(JS::ObjectValue(*obj).asRawBits());
       if (!slot) return false;
+      be.nurseryObjSlot[ins->id()] = slot;  // GetOp rematerializes from this traced slot
       return e.writeOp(Op::I32Const) && e.writeVarS32(int32_t(slot)) &&
              e.writeOp(Op::I64Load) && e.writeVarU32(3) && e.writeVarU32(0) &&
              e.writeOp(Op::I32WrapI64);
@@ -2429,7 +2830,7 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
                             uint32_t(js::NativeObject::getFixedSlotOffset(l->slot())),
                             /*bakedFixed=*/true))
               return false;
-            return EmitHelperResultAsType(e, be, l->type());
+            return EmitHelperResultAsType(e, be, l->type(), /*guardTag=*/true);
           }
         }
         return WJBAIL("mega read couldn't convert (guard removed)\n");
@@ -2466,7 +2867,7 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
                             uint32_t(js::NativeObject::getFixedSlotOffset(l->slot())),
                             /*bakedFixed=*/true))
               return false;
-            return EmitHelperResultAsType(e, be, l->type());
+            return EmitHelperResultAsType(e, be, l->type(), /*guardTag=*/true);
           }
         }
         return WJBAIL("mega read couldn't convert (guard removed)\n");
@@ -2478,7 +2879,7 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
       if (!e.writeOp(Op::LocalSet) || !e.writeVarU32(be.unboxScratch))
         return false;
       return EmitUnboxLocal(e, be, be.unboxScratch, l->type(),
-                            l->mode() == MUnbox::Fallible);
+                            WJSlotFallible(l->type(), l->mode()));
     }
     case MDefinition::Opcode::LoadDynamicSlotAndUnbox: {
       MLoadDynamicSlotAndUnbox* l = ins->toLoadDynamicSlotAndUnbox();
@@ -2503,7 +2904,7 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
                               uint32_t(l->slot() * sizeof(JS::Value)),
                               /*bakedFixed=*/false))
                 return false;
-              return EmitHelperResultAsType(e, be, l->type());
+              return EmitHelperResultAsType(e, be, l->type(), /*guardTag=*/true);
             }
           }
           return WJBAIL("mega read couldn't convert (guard removed)\n");
@@ -2516,7 +2917,7 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
       if (!e.writeOp(Op::LocalSet) || !e.writeVarU32(be.unboxScratch))
         return false;
       return EmitUnboxLocal(e, be, be.unboxScratch, l->type(),
-                            l->mode() == MUnbox::Fallible);
+                            WJSlotFallible(l->type(), l->mode()));
     }
     case MDefinition::Opcode::LoadDynamicSlot: {
       MLoadDynamicSlot* l = ins->toLoadDynamicSlot();
@@ -2536,7 +2937,7 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
                               uint32_t(l->slot() * sizeof(JS::Value)),
                               /*bakedFixed=*/false))
                 return false;
-              return EmitHelperResultAsType(e, be, l->type());
+              return EmitHelperResultAsType(e, be, l->type(), /*guardTag=*/true);
             }
           }
           return WJBAIL("mega read couldn't convert (guard removed)\n");
@@ -2566,7 +2967,7 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
           uint32_t site = WJPropSite(be);
           if (site != 0) {
             if (!EmitPropIC(e, be, ins, obj, keyBits, site)) return false;
-            return EmitHelperResultAsType(e, be, l->type());
+            return EmitHelperResultAsType(e, be, l->type(), /*guardTag=*/true);
           }
           // The GuardShapeListToOffset may have been converted to a DUMMY offset (0)
           // -- then GetOp(offset) reads slots+0 (the WRONG slot). Can't convert (no
@@ -2622,14 +3023,25 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
       }
       return true;
     }
-    case MDefinition::Opcode::ToDouble:
+    case MDefinition::Opcode::ToDouble: {
+      // ToDouble result is a FULL Double (f64). Int32 -> f64 EXACTLY
+      // (f64.convert_i32_s). The old code rounded through f32 (F32ConvertI32S ->
+      // F64PromoteF32), which LOSES precision for |int32| > 2^24 -- e.g. crypto's
+      // bignum limbs up to 2^28 got truncated to f32's 24-bit mantissa -> wrong
+      // double -> wrong reduction -> ~50% wrong crypto checksum (the long-standing
+      // "deopt-resume" heisenbug was actually THIS: a number-typed variant of the
+      // bignum/RC4 fns uses ToDouble, the int32 variant doesn't). Float32 input is
+      // held as a (already-f32-rounded) f64 -> no-op; Double -> no-op.
+      MDefinition* in = ins->getOperand(0);
+      if (!GetOp(e, be, in)) return false;
+      if (in->type() == MIRType::Int32) return e.writeOp(Op::F64ConvertI32S);
+      if (in->type() == MIRType::Double || in->type() == MIRType::Float32)
+        return true;  // already an f64 local
+      return false;
+    }
     case MDefinition::Opcode::ToFloat32: {
-      // Result is Float32 (an f32 local). Produce an f32 value: Int32 -> f32
-      // (convert), Double -> f32 (demote), Float32 -> already f32. The old code
-      // emitted f64 (convert_i32_s / no-op) into the f32 local -> invalid wasm
-      // "local.set expected f32, found f64" (gbemu).
-      // Result Float32 is held as f64 (see WJValType) but ROUNDED to f32 precision:
-      // value -> f32 -> f64. Matches JS Math.fround / Float32 store semantics.
+      // Result is Float32, held as f64 but ROUNDED to f32 precision (value -> f32
+      // -> f64), matching JS Math.fround / Float32 store semantics.
       MDefinition* in = ins->getOperand(0);
       if (!GetOp(e, be, in)) return false;
       if (in->type() == MIRType::Int32) {
@@ -2656,21 +3068,63 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
                                         : Op::F64Mul);
       }
       if (!i) return false;
-      // int32 +/-/* overflow SHOULD bail to a double (Ion does). The i64-overflow-
-      // check version is correct (storerepro a[i]=a[i-1]*3+1 -> JIT==PBL) and the
-      // lastRp resume fix made the bulk of it sound -- but there's a RESIDUAL
-      // mid-statement resume issue (randtest Math.random: 1000693 -> 1000169 with
-      // lastRp, still != 1000024) where a deopt WITHIN a statement (after partial
-      // computation) doesn't perfectly reconstruct. So still reverted to wrapping
-      // (correct for the masked/truncated common case; latently wrong only for a
-      // non-truncated int32 op that overflows, not hit by current benches). RE-LAND
-      // once the residual depth>0 mid-statement expr-stack resume is fixed.
-      if (!GetOp(e, be, ins->getOperand(0)) ||
-          !GetOp(e, be, ins->getOperand(1)))
+      // Operands MUST be i32-repr in wasm. An Int32-result op can have a non-i32
+      // operand (a Value/Int64 local) -- emitting i32.add/sub/mul on an i64
+      // local.get is INVALID wasm and V8 rejects the WHOLE module (gbemu
+      // executeIteration: `i32.sub expected i32, found local.get i64` -> the entire
+      // 100KB function fell to PBL). Guard the operand repr; if either isn't i32,
+      // bail this function cleanly to PBL (correct) instead of poisoning the module.
+      if (WJValType(ins->getOperand(0)->type()) != uint8_t(TypeCode::I32) ||
+          WJValType(ins->getOperand(1)->type()) != uint8_t(TypeCode::I32)) {
+        if (getenv("GECKO_WJ_ARITHDBG"))
+          fprintf(stderr, "[wj-arith-badop] %s op0=%s:%s op1=%s:%s\n",
+                  WJOpName(ins->op()), WJOpName(ins->getOperand(0)->op()),
+                  StringFromMIRType(ins->getOperand(0)->type()),
+                  WJOpName(ins->getOperand(1)->op()),
+                  StringFromMIRType(ins->getOperand(1)->type()));
+        js::wasm::gWJBailReason = "int-arith-nonI32-operand";
         return false;
-      return e.writeOp(ins->isAdd()   ? Op::I32Add
-                       : ins->isSub() ? Op::I32Sub
-                                      : Op::I32Mul);
+      }
+      // int32 +/-/* overflow MUST bail to a double (Ion does): a non-truncated
+      // int32 op that overflows 2^31 and then feeds a shift/compare (crypto's
+      // bignum carry `c=(l>>28)+...` where l overflows) gets a WRONG result from
+      // a wrapping i32.add (negative wrap -> wrong >>). RE-LANDED (was reverted to
+      // wrapping). Compute in i64 (sign-extended operands), deopt if the result
+      // doesn't fit int32, else wrap. GECKO_WJ_NOOVFLCHECK reverts to wrapping.
+      // Correct (Ion-aligned) but BLOCKED by the mid-statement deopt-resume bug:
+      // the overflow deopt fires mid-expression and the depth>0 expr-stack resume
+      // mis-reconstructs (crypto stays ~40% ERR + ~20% slower with it on). Opt-in
+      // (GECKO_WJ_OVFLCHECK) until that resume reconstruction is fixed; then it
+      // becomes the default (the wrapping path below is latently wrong on a
+      // non-truncated overflowing int32 op).
+      static int wantOvfl = getenv("GECKO_WJ_OVFLCHECK") ? 1 : 0;
+      if (!wantOvfl) {
+        if (!GetOp(e, be, ins->getOperand(0)) ||
+            !GetOp(e, be, ins->getOperand(1)))
+          return false;
+        return e.writeOp(ins->isAdd()   ? Op::I32Add
+                         : ins->isSub() ? Op::I32Sub
+                                        : Op::I32Mul);
+      }
+      // i64 sum/diff/prod of sign-extended operands.
+      if (!GetOp(e, be, ins->getOperand(0)) ||
+          !e.writeOp(Op::I64ExtendI32S) ||
+          !GetOp(e, be, ins->getOperand(1)) || !e.writeOp(Op::I64ExtendI32S))
+        return false;
+      if (!e.writeOp(ins->isAdd()   ? Op::I64Add
+                     : ins->isSub() ? Op::I64Sub
+                                    : Op::I64Mul))
+        return false;
+      if (!e.writeOp(Op::LocalSet) || !e.writeVarU32(be.unboxScratch)) return false;
+      // overflow if sext(wrap(s)) != s -> deopt (PBL redoes it as a double)
+      if (!GetLocal(e, be.unboxScratch) || !e.writeOp(Op::I32WrapI64) ||
+          !e.writeOp(Op::I64ExtendI32S) || !GetLocal(e, be.unboxScratch) ||
+          !e.writeOp(Op::I64Ne))
+        return false;
+      if (!e.writeOp(Op::If) || !e.writeFixedU8(0x40)) return false;
+      if (!EmitDeopt(e, be)) return false;
+      if (!e.writeOp(Op::End)) return false;
+      return GetLocal(e, be.unboxScratch) && e.writeOp(Op::I32WrapI64);
     }
     case MDefinition::Opcode::Div: {
       if (ins->type() == MIRType::Double) {
@@ -2905,9 +3359,11 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
     case MDefinition::Opcode::BooleanToInt32: {
       // A Boolean is already an i32 0/1 in our unboxed representation, so the
       // Int32 result is the same value -- pass it through. (Absent, this forced
-      // hot driver loops with a `cond|0`/`+true` idiom entirely into PBL.)
+      // hot driver loops with a `cond|0`/`+true` idiom entirely into PBL.) An
+      // Int32 input is likewise identity (both no-deopt, sound).
       MDefinition* in = ins->getOperand(0);
-      if (in->type() != MIRType::Boolean) return false;
+      if (in->type() != MIRType::Boolean && in->type() != MIRType::Int32)
+        return false;
       return GetOp(e, be, in);
     }
     case MDefinition::Opcode::TruncateToInt32: {
@@ -2919,10 +3375,52 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
       // defined semantics here; deopting was UNSOUND -- re-ran committed stores).
       MDefinition* in = ins->getOperand(0);
       if (in->type() == MIRType::Int32) return GetOp(e, be, in);
-      // NB: a Value operand (`x|0` on a boxed number) was tried via a
-      // number-unbox-to-double + deopt-on-non-number, but its deopt resumed
-      // incorrectly -> gbemu checksum NaN. Left to bail until deopt-resume here is
-      // sound; mandreel (the main user) is already >=2x without it.
+      // A boxed Value operand (`x|0` / `& 0xFF` on a boxed number -- gbemu's CPU
+      // register/memory ops are pervasively this; executeIteration, the main opcode
+      // loop, bailed entirely to PBL for it). Inline number fast path with NO deopt:
+      //   int32 tag  -> ToInt32(int32) = the int32 (low 32 bits)
+      //   double     -> modular truncate (trunc_sat_f64_s; wrap)
+      //   non-number -> WJH_TOINT32 helper (full JS ToInt32; undefined/null->0, etc.)
+      // The non-number case routes to a HELPER, not a deopt. NOW DEFAULT-ON: the
+      // separate miscompile that previously made enabling this give ERR=Gameboy was
+      // the unsound deopt-resume + mega-load blind-wrap, both since fixed (icEntry
+      // alignment + EmitHelperResultAsType guardTag). Verified gbemu correct with it
+      // on (113->116). GECKO_WJ_NOTRUNCVALUE reverts to bailing (whole fn -> PBL).
+      if (in->type() == MIRType::Value && !getenv("GECKO_WJ_NOTRUNCVALUE")) {
+        int32_t inLocal = be.local(in);
+        if (inLocal < 0) return false;
+        const uint8_t kI32bt = 0x7F;  // wasm i32 blocktype
+        auto pushTag = [&]() -> bool {
+          return GetLocal(e, uint32_t(inLocal)) && e.writeOp(Op::I64Const) &&
+                 e.writeVarS64(32) && e.writeOp(Op::I64ShrU) &&
+                 e.writeOp(Op::I32WrapI64);
+        };
+        // tag == INT32 ?  (the common gbemu case: small integer registers)
+        if (!pushTag() || !e.writeOp(Op::I32Const) ||
+            !e.writeVarS32(int32_t(TagWord(JSVAL_TYPE_INT32))) ||
+            !e.writeOp(Op::I32Eq))
+          return false;
+        if (!e.writeOp(Op::If) || !e.writeFixedU8(kI32bt)) return false;
+        if (!GetLocal(e, uint32_t(inLocal)) || !e.writeOp(Op::I32WrapI64))
+          return false;  // int32: low 32 bits
+        if (!e.writeOp(Op::Else)) return false;
+        // tag <= CLEAR ?  (double)
+        if (!pushTag() || !e.writeOp(Op::I32Const) ||
+            !e.writeVarS32(int32_t(uint32_t(JSVAL_TAG_CLEAR))) ||
+            !e.writeOp(Op::I32LeU))
+          return false;
+        if (!e.writeOp(Op::If) || !e.writeFixedU8(kI32bt)) return false;
+        if (!GetLocal(e, uint32_t(inLocal)) || !e.writeOp(Op::F64ReinterpretI64) ||
+            !e.writeOp(MiscOp::I64TruncSatF64S) || !e.writeOp(Op::I32WrapI64))
+          return false;  // double: modular trunc
+        if (!e.writeOp(Op::Else)) return false;
+        // non-number: full ToInt32 via helper (no deopt, no resume)
+        if (!EmitStageScratch(e, be, in, 0)) return false;
+        if (!EmitHelperCallResult(e, be, ins, WJH_TOINT32, 0)) return false;
+        if (!EmitHelperResultAsType(e, be, MIRType::Int32)) return false;
+        if (!e.writeOp(Op::End)) return false;  // end double-if
+        return e.writeOp(Op::End);              // end int32-if
+      }
       // Float32 is held as f64 (see WJValType) -> same wrapping trunc as Double.
       if (in->type() != MIRType::Double && in->type() != MIRType::Float32)
         return false;
@@ -2958,7 +3456,7 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
       // per-site shape->offset cache, inline slot load on hit, WJH_PROPIC on miss/
       // non-object. NO deopt, and FAST for repeated shapes (gbemu's `a.b.c` wall
       // was the bare WJH_GETPROP helper per access). GECKO_WJ_GETPROPIC gates it.
-      static int getPropIC = getenv("GECKO_WJ_GETPROPIC") ? 1 : 0;
+      static int getPropIC = getenv("GECKO_WJ_NOGETPROPIC") ? 0 : 1;
       MDefinition* idv = g->idval();
       if (getPropIC && idv->isConstant() &&
           idv->type() == MIRType::String) {
@@ -3372,14 +3870,76 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
     }
     case MDefinition::Opcode::CreateThis: {
       MCreateThis* c = ins->toCreateThis();
-      if (!EmitStageScratch(e, be, c->getOperand(0), 0)) return false;  // callee
-      if (!EmitStageScratch(e, be, c->getOperand(1), 1)) return false;  // newTarget
+      // If this CreateThis is the `this` of a constructing call, pre-stage that
+      // call's object/value args into scratch[0..argc) while their locals are
+      // still fresh -- WJH_CREATETHIS allocates and a GC would otherwise stale
+      // them (raytrace getRay/rayTrace `new Vector(...)` with object args ->
+      // "rendered incorrectly"). callee/newTarget go into the TRACED 62/63 slots
+      // (NOT scratch 0/1, which now hold pre-staged args); WJH_CREATETHIS reads
+      // 62/63 and the construct call reuses them.
+      if (MCall* cc = WJConstructConsumer(ins)) {
+        uint32_t ccargc = cc->numActualArgs();
+        if (ccargc > kWJMaxArgs) return false;
+        for (uint32_t i = 0; i < ccargc; i++) {
+          MDefinition* a = cc->getArg(1 + i);
+          if (a->type() == MIRType::Object || a->type() == MIRType::Value) {
+            if (!EmitStageOperandLocal(e, be, a, i)) return false;
+          } else if (!EmitStageScratch(e, be, a, i)) {
+            return false;
+          }
+        }
+      }
+      if (!EmitStageOperandLocal(e, be, c->getOperand(0), kWJCalleeSlot))
+        return false;  // callee -> 62
+      if (!EmitStageOperandLocal(e, be, c->getOperand(1), kWJNewTargetSlot))
+        return false;  // newTarget -> 63
+      // FUSE CreateThis into the construct call: instead of a separate
+      // WJH_CREATETHIS helper hop (CreateThisFromIon) per `new`, emit the
+      // JS_IS_CONSTRUCTING sentinel and let the single WJH_CONSTRUCT call allocate
+      // `this`. Halves the construct helper-boundary crossings (raytrace did 2.45M
+      // CreateThis calls/run). Sentinel `this` is also the spec-faithful
+      // uninitialized-this state, so a deopt-resume captures it correctly.
+      // GECKO_WJ_NOFUSECTOR reverts to the separate helper.
+      static int fuseCtor = getenv("GECKO_WJ_NOFUSECTOR") ? 0 : 1;
+      if (fuseCtor) {
+        return e.writeOp(Op::I64Const) &&
+               e.writeVarS64(int64_t(
+                   JS::MagicValue(JS_IS_CONSTRUCTING).asRawBits()));
+      }
       return EmitHelperCallResult(e, be, ins, WJH_CREATETHIS, 0);
     }
     case MDefinition::Opcode::NewObject:
     case MDefinition::Opcode::NewPlainObject:
     case MDefinition::Opcode::NewArrayObject:
     case MDefinition::Opcode::NewArray: {
+      // If this allocation is the inline `this` of a constructing call, the
+      // call's callee/newTarget wasm locals will be STALE by the time the call
+      // emits (this alloc can GC and wasm locals aren't GC-traced). Pre-stage
+      // them into the traced 62/63 scratch slots NOW, while their locals are
+      // still fresh (no GC has happened yet) -- the traced slots are then
+      // relocated by any GC this alloc triggers, so the construct reads a
+      // GC-current callee. This is the raytrace `new Vector` construct crash fix.
+      if (MCall* cc = WJConstructConsumer(ins)) {
+        uint32_t ccargc = cc->numActualArgs();
+        if (ccargc > kWJMaxArgs) return false;
+        // Pre-stage ALL construct operands while their locals are still fresh:
+        // object/value args (and the callee/newTarget) read their cached local
+        // directly (NOT rematerialized -- a remat would re-read a now-dead
+        // source). Number args don't move, so stage them the normal way.
+        for (uint32_t i = 0; i < ccargc; i++) {
+          MDefinition* a = cc->getArg(1 + i);
+          if (a->type() == MIRType::Object || a->type() == MIRType::Value) {
+            if (!EmitStageOperandLocal(e, be, a, i)) return false;
+          } else if (!EmitStageScratch(e, be, a, i)) {
+            return false;
+          }
+        }
+        if (!EmitStageOperandLocal(e, be, cc->getCallee(), kWJCalleeSlot))
+          return false;
+        if (!EmitStageOperandLocal(e, be, cc->getArg(cc->numStackArgs() - 1),
+                                   kWJNewTargetSlot))
+          return false;
+      }
       // Object/array allocation -> wjhelp(WJH_NEW*) which calls the same VM
       // fallback Ion uses (NewPlainObjectOptimizedFallback / NewArrayObject-
       // OptimizedFallback / NewArrayOperation). Keeps the allocating function in
@@ -3617,20 +4177,47 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
         if (noConstruct) return false;
         uint32_t cargc = call->numActualArgs();
         if (cargc > kWJMaxArgs) return false;
-        for (uint32_t i = 0; i < cargc; i++) {
-          if (!EmitStageScratch(e, be, call->getArg(1 + i), i)) return false;
+        // If `this` (arg0) is an allocating op, the alloc site already pre-staged
+        // the args + callee + newTarget into the traced scratch slots (while
+        // their locals were fresh; the alloc can GC and wasm locals aren't
+        // traced, so re-staging here would spill stale/moved pointers -- the
+        // raytrace construct crash / "rendered incorrectly"). Otherwise no GC
+        // occurs between operand load and here, so stage everything now.
+        MDefinition* thisDef = call->getArg(0);
+        bool thisAllocates =
+            thisDef->op() == MDefinition::Opcode::NewObject ||
+            thisDef->op() == MDefinition::Opcode::NewPlainObject ||
+            thisDef->op() == MDefinition::Opcode::NewArrayObject ||
+            thisDef->op() == MDefinition::Opcode::NewArray;
+        bool thisIsCreateThis = thisDef->op() == MDefinition::Opcode::CreateThis;
+        if (thisAllocates || thisIsCreateThis) {
+          // callee/newTarget were pre-staged at the allocating `this` instruction
+          // (traced 62/63, GC-current). BUT RE-STAGE the object/value ARGS here from
+          // their now-current locals: the pre-stage at CreateThis/NewObject captured
+          // the arg locals "while fresh", which is WRONG if CreateThis was scheduled
+          // BEFORE an arg-producing call (raytrace getRay `new Ray(pos, dir.normalize())`
+          // -- the pre-stage spilled a STALE local from a prior invocation; under a
+          // minor GC that old object is freed -> wrong render). rootAll reloaded the
+          // arg locals across the CreateThis/alloc helper, so they are GC-current here.
+          for (uint32_t i = 0; i < cargc; i++) {
+            MDefinition* a = call->getArg(1 + i);
+            if (a->type() == MIRType::Object || a->type() == MIRType::Value) {
+              if (!EmitStageScratch(e, be, a, i)) return false;
+            }
+          }
+        } else {
+          // No allocation between operand load and here (e.g. MagicIsConstructing
+          // `this`); locals are fresh -> stage everything normally.
+          for (uint32_t i = 0; i < cargc; i++) {
+            if (!EmitStageScratch(e, be, call->getArg(1 + i), i)) return false;
+          }
+          if (!EmitStageScratch(e, be, call->getCallee(), kWJCalleeSlot))
+            return false;
+          if (!EmitStageScratch(e, be, call->getArg(call->numStackArgs() - 1),
+                                kWJNewTargetSlot))
+            return false;
         }
         if (!EmitStageScratch(e, be, call->getArg(0), kWJThisSlot)) return false;
-        uintptr_t cAddr = uintptr_t(static_cast<void*>(&gWJCallCallee));
-        if (!e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(cAddr)) ||
-            !EmitSpillValue(e, be, call->getCallee()) ||
-            !e.writeOp(Op::I64Store) || !e.writeVarU32(3) || !e.writeVarU32(0))
-          return false;
-        uintptr_t ntAddr = uintptr_t(static_cast<void*>(&gWJConstructNewTarget));
-        if (!e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(ntAddr)) ||
-            !EmitSpillValue(e, be, call->getArg(call->numStackArgs() - 1)) ||
-            !e.writeOp(Op::I64Store) || !e.writeVarU32(3) || !e.writeVarU32(0))
-          return false;
         uintptr_t aAddr = uintptr_t(static_cast<void*>(&gWJCallArgc));
         if (!e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(aAddr)) ||
             !e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(cargc)) ||
@@ -3714,8 +4301,15 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
       // next way, then to the slow wjhelp hop }. Way 0 first => monomorphic
       // calls cost one compare; polymorphic dispatch (task.run) stays in wasm.
       if (!e.writeOp(Op::Block) || !e.writeFixedU8(0x40)) return false;  // void
-      static int forceSlowCall = getenv("GECKO_WJ_FORCESLOWCALL") ? 1 : 0;
-      for (uint32_t w = 0; w < kWJCallWays && !forceSlowCall; w++) {
+      static int forceSlowCallEnv = getenv("GECKO_WJ_FORCESLOWCALL") ? 1 : 0;
+      // Inlining-containing functions route calls through the slow (clean-boundary)
+      // path: the fast call_indirect corrupts on a deopt nested under an inlined
+      // caller. NOINLINESLOWCALL disables this targeted guard (for A/B).
+      static int noInlineSlowCall = getenv("GECKO_WJ_NOINLINESLOWCALL") ? 1 : 0;
+      bool forceSlowCall =
+          forceSlowCallEnv || (be.hasInlinedFrames && !noInlineSlowCall);
+      static uint32_t maxWays = getenv("GECKO_WJ_MONOCALL") ? 1 : kWJCallWays;
+      for (uint32_t w = 0; w < maxWays && !forceSlowCall; w++) {
         uintptr_t fnW =
             uintptr_t(static_cast<void*>(&gWJCallFn[site * kWJCallWays + w]));
         uintptr_t tblW =
@@ -3907,12 +4501,107 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
   }
 }
 
+// Conservative whole-cell post-write barrier on `objDef`'s container: store the
+// (current, rematerialized) object pointer to gWJHelpObj and call WJH_POSTBARRIER,
+// which buffers it ONLY if tenured. Safe to call after any store whose value may be
+// a GC pointer; over-buffers harmlessly. Used to repair barriers that Warp's
+// MPostWriteBarrier insertion/elimination may have dropped under trial inlining
+// (the deltablue-under-COLDCALL heap-slot staleness: NO_NURSERY fixes it, ROOTALL
+// -- which roots locals, not heap slots -- does not). Returns false on emit failure.
+static bool WJValueMightBeGCThing(jit::MIRType t);  // fwd
+static bool EmitForcePostBarrier(Encoder& e, WJBackend& be, jit::MDefinition* objDef,
+                                 jit::MDefinition* valDef = nullptr) {
+  // Inline the isTenured() gate (Ion's branchPtrInNurseryChunk) so we STAY IN
+  // WASM for the common case: a NURSERY container needs no store-buffer entry, so
+  // skip the C++ WJH_POSTBARRIER helper entirely for it. chunk(obj)->storeBuffer
+  // == 0  <=>  obj is tenured  <=>  barrier needed. This is exactly equivalent to
+  // the helper's own `if (obj->isTenured())` guard, just moved inline -- raytrace
+  // makes ~13.7M of these calls/run, ~all on nursery Vectors/Colors, so the helper
+  // boundary crossing (not the GC work) was ~65% of its C++-helper traffic.
+  // When valDef is given, ALSO require the value to be a nursery GC cell (the full
+  // Ion condition objTenured && valNursery): a tenured/non-GC value needs no barrier.
+  // This eliminates the helper call for tenured->tenured stores -- and ALL stores
+  // under NO_NURSERY (every value tenured -> never buffer), which was 3.7M pointless
+  // POSTBAR calls/run in richards under NO_NURSERY.
+  // No nursery -> no tenured->nursery edges ever exist -> post-write barriers are
+  // entirely unnecessary. Skip them (sound). Speeds up NO_NURSERY runs (richards
+  // paid ~1.9M pointless WJH_POSTBARRIER calls). Compile-time: GECKO_NO_NURSERY is
+  // fixed at startup.
+  static int noNursery = getenv("GECKO_NO_NURSERY") ? 1 : 0;
+  if (noNursery) return true;
+  static int noInlineBar = getenv("GECKO_WJ_NOINLINEBARRIER") ? 1 : 0;
+  uintptr_t objAddr = uintptr_t(static_cast<void*>(&gWJHelpObj));
+  const uint32_t chunkMaskInv = uint32_t(~js::gc::ChunkMask);
+  const uint32_t sbOff = uint32_t(js::gc::ChunkStoreBufferOffset);
+  // valNursery skip DISABLED: it broke raytrace/deltablue/splay (missed barriers ->
+  // GC corruption/crash at default nursery). The objTenured-only gate is the proven-
+  // correct version. Revisit in the GC sweep. valDef kept for a future correct impl.
+  (void)valDef;
+  bool valGuard = false;
+  if (!noInlineBar) {
+    // tenured = (chunk(obj)->storeBuffer == 0)
+    if (!GetOp(e, be, objDef) || !e.writeOp(Op::I32Const) ||
+        !e.writeVarS32(int32_t(chunkMaskInv)) || !e.writeOp(Op::I32And) ||
+        !e.writeOp(Op::I32Load) || !e.writeVarU32(2) || !e.writeVarU32(sbOff) ||
+        !e.writeOp(Op::I32Eqz))
+      return false;
+    if (valGuard) {
+      // valNursery = isGCThing(value) && chunk(payload)->storeBuffer != 0
+      if (valDef->type() == jit::MIRType::Value) {
+        // payload = wrap(boxed); guard tag>=STRING (GC thing). The chunk load on a
+        // non-GC payload reads garbage but is masked to 0 by the isGCThing AND.
+        if (!GetOp(e, be, valDef) || !e.writeOp(Op::I32WrapI64) ||
+            !e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(chunkMaskInv)) ||
+            !e.writeOp(Op::I32And) || !e.writeOp(Op::I32Load) || !e.writeVarU32(2) ||
+            !e.writeVarU32(sbOff) || !e.writeOp(Op::I32Const) || !e.writeVarS32(0) ||
+            !e.writeOp(Op::I32Ne))
+          return false;  // chunk(payload)->sb != 0
+        if (!GetOp(e, be, valDef) || !e.writeOp(Op::I64Const) || !e.writeVarS64(32) ||
+            !e.writeOp(Op::I64ShrU) || !e.writeOp(Op::I32WrapI64) ||
+            !e.writeOp(Op::I32Const) ||
+            !e.writeVarS32(int32_t(uint32_t(JSVAL_TAG_STRING))) ||
+            !e.writeOp(Op::I32GeU))
+          return false;  // tag >= STRING (isGCThing)
+        if (!e.writeOp(Op::I32And)) return false;  // isGCThing && valNursery
+      } else {
+        // Object/String/Symbol/BigInt: always GC; payload = the pointer directly.
+        if (!GetOp(e, be, valDef) || !e.writeOp(Op::I32Const) ||
+            !e.writeVarS32(int32_t(chunkMaskInv)) || !e.writeOp(Op::I32And) ||
+            !e.writeOp(Op::I32Load) || !e.writeVarU32(2) || !e.writeVarU32(sbOff) ||
+            !e.writeOp(Op::I32Const) || !e.writeVarS32(0) || !e.writeOp(Op::I32Ne))
+          return false;  // chunk(payload)->sb != 0
+      }
+      if (!e.writeOp(Op::I32And)) return false;  // objTenured && valNursery
+    }
+    if (!e.writeOp(Op::If) || !e.writeFixedU8(0x40)) return false;
+  }
+  if (!e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(objAddr)) ||
+      !GetOp(e, be, objDef) || !e.writeOp(Op::I32Store) || !e.writeVarU32(2) ||
+      !e.writeVarU32(0))
+    return false;
+  if (!(e.writeOp(Op::F64Const) && e.writeFixedF64(double(WJH_POSTBARRIER)) &&
+        e.writeOp(Op::F64Const) && e.writeFixedF64(0.0) && e.writeOp(Op::Call) &&
+        e.writeVarU32(0) && e.writeOp(Op::Drop)))
+    return false;
+  if (!noInlineBar && !e.writeOp(Op::End)) return false;  // close the tenured `if`
+  return true;
+}
+
+// True if a value of this MIRType could be a GC pointer (object/string/symbol/
+// bigint, or an untyped Value box which may contain one) -- i.e. a store of it
+// may need a post-write barrier. Numbers/booleans/null/undefined never do.
+static bool WJValueMightBeGCThing(jit::MIRType t) {
+  return t == jit::MIRType::Object || t == jit::MIRType::Value ||
+         t == jit::MIRType::String || t == jit::MIRType::Symbol ||
+         t == jit::MIRType::BigInt;
+}
+
 // True if the node has a side effect we must emit even though it produces no
 // wasm value (or its value is unused). Returns false from EmitEffect => skip.
 enum class EffectKind { Skip, Emitted, Fail };
 
 static EffectKind EmitEffect(Encoder& e, WJBackend& be, MInstruction* ins) {
-  js::wasm::gWJBailReason = WJOpName(ins->op());  // attribute an internal bail to this op
+  WJSetBailOp(ins);  // attribute an internal bail to this op (+ precise op line)
   switch (ins->op()) {
     case MDefinition::Opcode::Bail:
     case MDefinition::Opcode::Unreachable:
@@ -3958,7 +4647,7 @@ static EffectKind EmitEffect(Encoder& e, WJBackend& be, MInstruction* ins) {
         return EffectKind::Fail;
       // store value at the slot (fixed: obj+offset; dynamic: slots+offset).
       if (a->kind() == MAddAndStoreSlot::Kind::FixedSlot) {
-        if (!GetOp(e, be, a->object()) || !EmitSpillValue(e, be, a->value()) ||
+        if (!GetOp(e, be, a->object()) || !EmitCanonStoreValue(e, be, a->value()) ||
             !e.writeOp(Op::I64Store) || !e.writeVarU32(3) ||
             !e.writeVarU32(slotOffset))
           return EffectKind::Fail;
@@ -3966,10 +4655,20 @@ static EffectKind EmitEffect(Encoder& e, WJBackend& be, MInstruction* ins) {
         if (!GetOp(e, be, a->object()) || !e.writeOp(Op::I32Load) ||
             !e.writeVarU32(2) ||
             !e.writeVarU32(uint32_t(js::NativeObject::offsetOfSlots())) ||
-            !EmitSpillValue(e, be, a->value()) || !e.writeOp(Op::I64Store) ||
+            !EmitCanonStoreValue(e, be, a->value()) || !e.writeOp(Op::I64Store) ||
             !e.writeVarU32(3) || !e.writeVarU32(slotOffset))
           return EffectKind::Fail;
       }
+      // POST-WRITE BARRIER: Warp folds the barrier into the store op for
+      // AddAndStoreSlot rather than emitting a separate MPostWriteBarrier node, so
+      // we MUST emit it here. Without it, storing a nursery value into a promoted
+      // (tenured) object leaves the slot out of the store buffer -> a later minor
+      // GC doesn't update it -> stale pointer (raytrace's intermittent "rendered
+      // incorrectly"; huge nursery / NO_NURSERY masks it). Only for GC-typed values
+      // (numbers/booleans need no barrier -> keeps Vector.x/y/z field init fast).
+      if (WJValueMightBeGCThing(a->value()->type()) &&
+          !EmitForcePostBarrier(e, be, a->object(), a->value()))
+        return EffectKind::Fail;
       return EffectKind::Emitted;
     }
     case MDefinition::Opcode::AllocateAndStoreSlot: {
@@ -4004,8 +4703,12 @@ static EffectKind EmitEffect(Encoder& e, WJBackend& be, MInstruction* ins) {
       if (!GetOp(e, be, a->object()) || !e.writeOp(Op::I32Load) ||
           !e.writeVarU32(2) ||
           !e.writeVarU32(uint32_t(js::NativeObject::offsetOfSlots())) ||
-          !EmitSpillValue(e, be, a->value()) || !e.writeOp(Op::I64Store) ||
+          !EmitCanonStoreValue(e, be, a->value()) || !e.writeOp(Op::I64Store) ||
           !e.writeVarU32(3) || !e.writeVarU32(slotOffset))
+        return EffectKind::Fail;
+      // POST-WRITE BARRIER (see AddAndStoreSlot): emit for GC-typed values.
+      if (WJValueMightBeGCThing(a->value()->type()) &&
+          !EmitForcePostBarrier(e, be, a->object(), a->value()))
         return EffectKind::Fail;
       return EffectKind::Emitted;
     }
@@ -4021,10 +4724,27 @@ static EffectKind EmitEffect(Encoder& e, WJBackend& be, MInstruction* ins) {
         uint64_t keyBits = 0;
         if (WJDerivePropKey(WJGuardRepShape(gs), uint32_t(s->slot()), &keyBits) &&
             WJGuardObject(gs)->type() == MIRType::Object) {
-          // WJH_SETPROP does ToPropertyKey(scratch[1]) -> needs the key as a
-          // VALUE (StringValue), not the jsid bits WJDerivePropKey returns.
           uint64_t keyVal = js::IdToValue(
               JS::PropertyKey::fromRawBits(uintptr_t(keyBits))).asRawBits();
+          // Per-access mega: route through the inline multi-way store IC instead of
+          // the generic WJH_SETPROP helper. Monomorphic receivers (richards' Task/
+          // Packet field stores -- 1.9M/run) get a fast inline shape-guard + slot
+          // store; polymorphic ones use up to kWJPropWays cached shapes; only true
+          // mega misses hit WJH_SETPROPIC. The IC self-guards on shape so it's sound
+          // for the passthrough'd (polymorphic) guard. HUGE win (richards 152->351,
+          // SETPROP 1.9M->0) BUT has a GC-nursery-triggered staleness crash (NO_NURSERY
+          // 100% correct; default/minor-GC crashes "null function") -- a post-write-
+          // barrier/store-staleness bug for the GC sweep. DEFAULT-OFF until fixed;
+          // GECKO_WJ_MEGASTOREIC enables.
+          static int megaStoreIC = getenv("GECKO_WJ_MEGASTOREIC") ? 1 : 0;
+          uint32_t site = megaStoreIC ? WJPropSite(be) : 0;
+          if (site != 0) {
+            return EmitPropStoreIC(e, be, ins, WJGuardObject(gs), nullptr,
+                                   s->value(), /*strict=*/false, site, keyVal)
+                       ? EffectKind::Emitted
+                       : EffectKind::Fail;
+          }
+          // Site pool exhausted (or reverted): generic helper.
           if (!EmitStageScratch(e, be, WJGuardObject(gs), 0)) return EffectKind::Fail;
           if (!EmitStageConstBoxed(e, be, keyVal, 1)) return EffectKind::Fail;
           if (!EmitStageScratch(e, be, s->value(), 2)) return EffectKind::Fail;
@@ -4047,8 +4767,30 @@ static EffectKind EmitEffect(Encoder& e, WJBackend& be, MInstruction* ins) {
       if (objLocal < 0) return EffectKind::Fail;
       MDefinition* v = s->value();
       if (s->needsBarrier()) {
-        // Route through wjhelp(WJH_SETSLOT) -> NativeObject::setSlot, which runs
-        // the proper post-write barrier. gWJHelpObj/Slot/Val carry the operands.
+        // Was: route through wjhelp(WJH_SETSLOT) -> NativeObject::setSlot (a C++ hop
+        // per store). Now INLINE (stay in wasm), mirroring StoreDynamicSlot: gated
+        // incremental pre-write barrier on the OLD value + inline store + inline-
+        // gated post-write barrier. EmitGuardedValuePreBarrier only fires when the
+        // zone is mid-incremental-marking; EmitForcePostBarrier skips nursery
+        // containers inline. raytrace did ~1.2M of these helper calls/run.
+        // GECKO_WJ_NOINLINESETSLOT reverts to the helper for A/B.
+        static int noInline = getenv("GECKO_WJ_NOINLINESETSLOT") ? 1 : 0;
+        if (!noInline) {
+          uint32_t off = uint32_t(js::NativeObject::getFixedSlotOffset(s->slot()));
+          if (!EmitGuardedValuePreBarrier(e, be, [&]() {
+                return GetOp(e, be, s->object()) && e.writeOp(Op::I64Load) &&
+                       e.writeVarU32(3) && e.writeVarU32(off);
+              }))
+            return EffectKind::Fail;
+          if (!GetOp(e, be, s->object())) return EffectKind::Fail;
+          if (!EmitCanonStoreValue(e, be, v)) return EffectKind::Fail;
+          if (!e.writeOp(Op::I64Store) || !e.writeVarU32(3) || !e.writeVarU32(off))
+            return EffectKind::Fail;
+          if (WJValueMightBeGCThing(v->type()) &&
+              !EmitForcePostBarrier(e, be, s->object(), v))
+            return EffectKind::Fail;
+          return EffectKind::Emitted;
+        }
         uintptr_t objAddr = uintptr_t(static_cast<void*>(&gWJHelpObj));
         uintptr_t slotAddr = uintptr_t(static_cast<void*>(&gWJHelpSlot));
         uintptr_t valAddr = uintptr_t(static_cast<void*>(&gWJHelpVal));
@@ -4076,8 +4818,12 @@ static EffectKind EmitEffect(Encoder& e, WJBackend& be, MInstruction* ins) {
         fprintf(stderr, "[wb-slot] StoreFixedSlot slot=%zu off=%u objOp=%s barrier=%d\n",
                 s->slot(), off, WJOpName(s->object()->op()), s->needsBarrier());
       if (!GetOp(e, be, s->object())) return EffectKind::Fail;  // addr (current)
-      if (!EmitSpillValue(e, be, v)) return EffectKind::Fail;         // boxed value
+      if (!EmitCanonStoreValue(e, be, v)) return EffectKind::Fail;    // boxed value
       if (!e.writeOp(Op::I64Store) || !e.writeVarU32(3) || !e.writeVarU32(off))
+        return EffectKind::Fail;
+      static int forceBarrier = getenv("GECKO_WJ_FORCEBARRIER") ? 1 : 0;
+      if (forceBarrier && WJTypeMaybeGC(v->type()) &&
+          !EmitForcePostBarrier(e, be, s->object()))
         return EffectKind::Fail;
       return EffectKind::Emitted;
     }
@@ -4099,8 +4845,12 @@ static EffectKind EmitEffect(Encoder& e, WJBackend& be, MInstruction* ins) {
       if (!GetOp(e, be, s->object())) return EffectKind::Fail;
       if (!GetOp(e, be, s->offset())) return EffectKind::Fail;
       if (!e.writeOp(Op::I32Add)) return EffectKind::Fail;
-      if (!EmitSpillValue(e, be, v)) return EffectKind::Fail;
+      if (!EmitCanonStoreValue(e, be, v)) return EffectKind::Fail;
       if (!e.writeOp(Op::I64Store) || !e.writeVarU32(3) || !e.writeVarU32(0))
+        return EffectKind::Fail;
+      static int forceBarrier = getenv("GECKO_WJ_FORCEBARRIER") ? 1 : 0;
+      if (forceBarrier && WJTypeMaybeGC(v->type()) &&
+          !EmitForcePostBarrier(e, be, s->object()))
         return EffectKind::Fail;
       return EffectKind::Emitted;
     }
@@ -4119,8 +4869,13 @@ static EffectKind EmitEffect(Encoder& e, WJBackend& be, MInstruction* ins) {
           return EffectKind::Fail;
       }
       if (!GetOp(e, be, s->slots())) return EffectKind::Fail;
-      if (!EmitSpillValue(e, be, s->value())) return EffectKind::Fail;
+      if (!EmitCanonStoreValue(e, be, s->value())) return EffectKind::Fail;
       if (!e.writeOp(Op::I64Store) || !e.writeVarU32(3) || !e.writeVarU32(off))
+        return EffectKind::Fail;
+      static int forceBarrier = getenv("GECKO_WJ_FORCEBARRIER") ? 1 : 0;
+      if (forceBarrier && WJTypeMaybeGC(s->value()->type()) &&
+          s->slots()->isSlots() &&
+          !EmitForcePostBarrier(e, be, s->slots()->toSlots()->object()))
         return EffectKind::Fail;
       return EffectKind::Emitted;
     }
@@ -4236,6 +4991,44 @@ static EffectKind EmitEffect(Encoder& e, WJBackend& be, MInstruction* ins) {
       if (!EmitSpillValue(e, be, s->value())) return EffectKind::Fail;
       if (!e.writeOp(Op::I64Store) || !e.writeVarU32(3) || !e.writeVarU32(0))
         return EffectKind::Fail;
+      static int forceBarrierE = getenv("GECKO_WJ_FORCEBARRIER") ? 1 : 0;
+      if (forceBarrierE && WJTypeMaybeGC(s->value()->type()) &&
+          s->elements()->isElements() &&
+          !EmitForcePostBarrier(e, be, s->elements()->toElements()->object()))
+        return EffectKind::Fail;
+      return EffectKind::Emitted;
+    }
+    case MDefinition::Opcode::StoreElementHole: {
+      if (getenv("GECKO_WJ_NONEWSTORE")) return EffectKind::Fail;
+      // arr[i] = v where i may be at/just past the dense initialized length (append)
+      // or over a hole. In-bounds dense store stays in JIT (gbemu's pre-sized
+      // this.memory[addr]=v writes + the memoryRead/WriteJumpCompile cache tables);
+      // the grow/append/hole case (index >= initializedLength) deopts to PBL which
+      // grows the array correctly. An object VALUE would need a (currently unreliable)
+      // post-write barrier, so bail those to PBL -- gbemu's element values are numbers.
+      MStoreElementHole* s = ins->toStoreElementHole();
+      if (WJTypeMaybeGC(s->value()->type())) return EffectKind::Fail;
+      int32_t idx = be.local(s->index());
+      if (idx < 0) return EffectKind::Fail;
+      // bounds guard: deopt unless (uint32)index < (uint32)initializedLength
+      if (!GetOp(e, be, s->elements()) || !e.writeOp(Op::I32Const) ||
+          !e.writeVarS32(js::ObjectElements::offsetOfInitializedLength()) ||
+          !e.writeOp(Op::I32Add) || !e.writeOp(Op::I32Load) ||
+          !e.writeVarU32(2) || !e.writeVarU32(0))
+        return EffectKind::Fail;
+      if (!GetLocal(e, uint32_t(idx)) || !e.writeOp(Op::I32LeU))
+        return EffectKind::Fail;  // initLen <= index -> grow/hole -> deopt
+      if (!e.writeOp(Op::If) || !e.writeFixedU8(0x40)) return EffectKind::Fail;
+      if (!EmitDeopt(e, be)) return EffectKind::Fail;
+      if (!e.writeOp(Op::End)) return EffectKind::Fail;
+      // addr = elements + index*8; store the boxed value
+      if (!GetOp(e, be, s->elements()) || !GetLocal(e, uint32_t(idx)) ||
+          !e.writeOp(Op::I32Const) || !e.writeVarS32(8) ||
+          !e.writeOp(Op::I32Mul) || !e.writeOp(Op::I32Add))
+        return EffectKind::Fail;
+      if (!EmitSpillValue(e, be, s->value())) return EffectKind::Fail;
+      if (!e.writeOp(Op::I64Store) || !e.writeVarU32(3) || !e.writeVarU32(0))
+        return EffectKind::Fail;
       return EffectKind::Emitted;
     }
     case MDefinition::Opcode::SetInitializedLength: {
@@ -4262,8 +5055,27 @@ static EffectKind EmitEffect(Encoder& e, WJBackend& be, MInstruction* ins) {
     case MDefinition::Opcode::MegamorphicStoreSlot: {
       if (getenv("GECKO_WJ_NONEWSTORE")) return EffectKind::Fail;
       MMegamorphicStoreSlot* m = ins->toMegamorphicStoreSlot();
-      if (!EmitStageScratch(e, be, m->object(), 0)) return EffectKind::Fail;
+      if (getenv("GECKO_WJ_STOREDBG"))
+        fprintf(stderr, "[wj-store] MegamorphicStoreSlot objType=%s\n",
+                StringFromMIRType(m->object()->type()));
       uint64_t nameBits = js::IdToValue(m->name()).asRawBits();
+      // Inline per-site polymorphic store IC (shape-compare -> direct slot store, no
+      // C++ hop) -- richards' scheduler does 1.56M of these "megamorphic" named
+      // stores, which were each a full VM SetObjectElement. Warp's megamorphic mark
+      // is conservative; the real shape count per site is small, so the 4-way IC
+      // mostly hits. WJH_SETPROPIC fills on miss. GECKO_WJ_NOMEGAIC reverts.
+      static int noMegaIC = getenv("GECKO_WJ_NOMEGAIC") ? 1 : 0;
+      if (!noMegaIC && (m->object()->type() == MIRType::Object ||
+                        m->object()->type() == MIRType::Value)) {
+        uint32_t site = WJPropSite(be);
+        if (site != 0) {
+          return EmitPropStoreIC(e, be, ins, m->object(), nullptr, m->rhs(),
+                                 m->strict(), site, nameBits)
+                     ? EffectKind::Emitted
+                     : EffectKind::Fail;
+        }
+      }
+      if (!EmitStageScratch(e, be, m->object(), 0)) return EffectKind::Fail;
       if (!EmitStageConstBoxed(e, be, nameBits, 1)) return EffectKind::Fail;
       if (!EmitStageScratch(e, be, m->rhs(), 2)) return EffectKind::Fail;
       if (!EmitHelperCallResult(e, be, ins, WJH_SETPROP, m->strict() ? 1 : 0))
@@ -4276,7 +5088,11 @@ static EffectKind EmitEffect(Encoder& e, WJBackend& be, MInstruction* ins) {
       // Inline the per-site store IC for object receivers (writable own data
       // property -> direct slot store + barriers, no C++ hop); else generic set.
       static int noPropIC = getenv("GECKO_WJ_NOPROPIC") ? 1 : 0;
-      if (!noPropIC && s->object()->type() == MIRType::Object) {
+      if (getenv("GECKO_WJ_STOREDBG"))
+        fprintf(stderr, "[wj-store] SetPropertyCache objType=%s idvalConst=%d\n",
+                StringFromMIRType(s->object()->type()), s->idval()->isConstant());
+      if (!noPropIC && (s->object()->type() == MIRType::Object ||
+                        s->object()->type() == MIRType::Value)) {
         uint32_t site = WJPropSite(be);
         if (site != 0) {
           return EmitPropStoreIC(e, be, ins, s->object(), s->idval(), s->value(),
@@ -4299,14 +5115,8 @@ static EffectKind EmitEffect(Encoder& e, WJBackend& be, MInstruction* ins) {
       // value -> the slot reads back garbage (was the raytrace `dot` crash).
       int32_t ol = be.local(ins->getOperand(0));
       if (ol < 0) return EffectKind::Fail;
-      uintptr_t objAddr = uintptr_t(static_cast<void*>(&gWJHelpObj));
-      if (!e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(objAddr)) ||
-          !GetLocal(e, uint32_t(ol)) || !e.writeOp(Op::I32Store) ||
-          !e.writeVarU32(2) || !e.writeVarU32(0))
-        return EffectKind::Fail;
-      if (!e.writeOp(Op::F64Const) || !e.writeFixedF64(double(WJH_POSTBARRIER)) ||
-          !e.writeOp(Op::F64Const) || !e.writeFixedF64(0.0) ||
-          !e.writeOp(Op::Call) || !e.writeVarU32(0) || !e.writeOp(Op::Drop))
+      // Inline isTenured() gate (skip the helper for nursery containers).
+      if (!EmitForcePostBarrier(e, be, ins->getOperand(0), ins->getOperand(1)))
         return EffectKind::Fail;
       return EffectKind::Emitted;
     }
@@ -4434,7 +5244,59 @@ static bool EmitValueTruthy(Encoder& e, WJBackend& be, uint32_t v) {
 }
 
 // Emit one block's non-control instructions. Returns false on unsupported node.
+// Op/block-level BISECTION tool: GECKO_WJ_FORCEDEOPTOFF=<byteoff> (+ optional
+// GECKO_WJ_FORCEDEOPTLINE=<fn lineno> to scope to one function) forces a
+// deopt-at-entry (run the rest in PBL, like alwaysBails) for every block whose
+// entry bytecode offset >= <byteoff>. Blocks BEFORE the offset stay in JIT; blocks
+// at/after run PBL. Binary-search <byteoff> to localize a miscompiled op: the
+// smallest offset at which the result becomes WRONG is just past the bad op (it
+// just entered JIT). Deterministic from (block, env), so the terminator-skip sites
+// check it too (a force-deopted block emits no terminator, like alwaysBails).
+static bool WJBlockForceDeopt(WJBackend& be, MBasicBlock* b) {
+  static int off = getenv("GECKO_WJ_FORCEDEOPTOFF")
+                       ? atoi(getenv("GECKO_WJ_FORCEDEOPTOFF"))
+                       : -1;
+  // RANGE mode (GECKO_WJ_FORCEDEOPTRANGE=lo,hi): deopt ONLY blocks whose entry
+  // offset is in [lo,hi), keeping the rest (incl. the loop latch) in JIT. This
+  // isolates a single bad block WITHOUT the loop-escape confound of the suffix
+  // (>=off) mode -- correct result iff the bad block is in [lo,hi).
+  static int rlo = -1, rhi = -1;
+  static bool rangeInit = false;
+  if (!rangeInit) {
+    rangeInit = true;
+    if (const char* r = getenv("GECKO_WJ_FORCEDEOPTRANGE")) {
+      rlo = atoi(r);
+      const char* c = strchr(r, ',');
+      rhi = c ? atoi(c + 1) : (rlo + 1);
+    }
+  }
+  if (off < 0 && rlo < 0) return false;
+  static int wantLine = getenv("GECKO_WJ_FORCEDEOPTLINE")
+                            ? atoi(getenv("GECKO_WJ_FORCEDEOPTLINE"))
+                            : 0;
+  uint32_t fnLine =
+      be.info && be.info->script() ? be.info->script()->lineno() : 0;
+  if (wantLine && fnLine != uint32_t(wantLine)) return false;
+  if (b->alwaysBails()) return false;  // already handled
+  MResumePoint* rp = b->entryResumePoint();
+  if (!rp || !rp->pc()) return false;
+  JSScript* s = rp->block()->info().script();
+  if (!s) return false;
+  uint32_t boff = uint32_t(rp->pc() - s->code());
+  if (rlo >= 0) return boff >= uint32_t(rlo) && boff < uint32_t(rhi);
+  return boff >= uint32_t(off);
+}
+
 static bool EmitBlockBody(Encoder& e, WJBackend& be, MBasicBlock* b) {
+  // Bisection: force this block to deopt-at-entry (see WJBlockForceDeopt).
+  if (WJBlockForceDeopt(be, b)) {
+    be.curRp = b->entryResumePoint();
+    bool sd = be.inDispatchBody;
+    be.inDispatchBody = false;
+    bool ok = EmitDeopt(e, be);
+    be.inDispatchBody = sd;
+    return ok;
+  }
   // alwaysBails block: Warp couldn't type this (cold) path and marked it to bail
   // unconditionally. Emit a deopt-at-entry (resume to PBL from the block's entry
   // pc) and skip the body+terminator -- the caller checks alwaysBails() to elide
@@ -4451,6 +5313,7 @@ static bool EmitBlockBody(Encoder& e, WJBackend& be, MBasicBlock* b) {
         fprintf(stderr, "[wj-abdbg] %s:%u alwaysBails block has NO entry RP\n",
                 s ? s->filename() : "?", s ? unsigned(s->lineno()) : 0);
       }
+      js::wasm::gWJBailReason = "alwaysbails-no-entry-rp";
       return false;
     }
     bool savedDispatch = be.inDispatchBody;
@@ -4491,7 +5354,10 @@ static bool EmitBlockBody(Encoder& e, WJBackend& be, MBasicBlock* b) {
   // shadow currently reflects (null => nothing spilled yet => full spill).
   MResumePoint* spilledRp = nullptr;
   if (be.shadowDeopt && be.inDispatchBody) {
-    if (!EmitFrameSpillDelta(e, be, lastRp, nullptr)) return false;
+    if (!EmitFrameSpillDelta(e, be, lastRp, nullptr)) {
+      js::wasm::gWJBailReason = "framespill-entry";
+      return false;
+    }
     spilledRp = lastRp;
   }
   for (MInstructionIterator it = b->begin(); it != b->end(); it++) {
@@ -4522,7 +5388,11 @@ static bool EmitBlockBody(Encoder& e, WJBackend& be, MBasicBlock* b) {
     be.curOp = uint32_t(ins->op());
     bool doShadow = be.shadowDeopt && be.inDispatchBody;
     if (doShadow && !spillAfter && lastRp != spilledRp) {
-      if (!EmitFrameSpillDelta(e, be, lastRp, spilledRp)) return false;
+      if (!EmitFrameSpillDelta(e, be, lastRp, spilledRp)) {
+        WJSetBailOp(ins);
+        js::wasm::gWJBailReason = "framespill-delta";
+        return false;
+      }
       spilledRp = lastRp;
     }
     int32_t l = be.local(ins);
@@ -4539,7 +5409,11 @@ static bool EmitBlockBody(Encoder& e, WJBackend& be, MBasicBlock* b) {
                 unsigned(ins->op()), unsigned(ins->type()));
         return false;
       }
-      if (!e.writeOp(Op::LocalSet) || !e.writeVarU32(uint32_t(l))) return false;
+      if (!e.writeOp(Op::LocalSet) || !e.writeVarU32(uint32_t(l))) {
+        WJSetBailOp(ins);
+        js::wasm::gWJBailReason = "value-localset";
+        return false;
+      }
     }
     // Resume-AFTER op completed: its result is now in-local, so the resume-after
     // frame is consistent. Advance the deopt rp for subsequent ops, the terminator
@@ -4549,7 +5423,11 @@ static bool EmitBlockBody(Encoder& e, WJBackend& be, MBasicBlock* b) {
       be.curRp = lastRp;
     }
     if (doShadow && spillAfter && lastRp != spilledRp) {
-      if (!EmitFrameSpillDelta(e, be, lastRp, spilledRp)) return false;
+      if (!EmitFrameSpillDelta(e, be, lastRp, spilledRp)) {
+        WJSetBailOp(ins);
+        js::wasm::gWJBailReason = "framespill-after";
+        return false;
+      }
       spilledRp = lastRp;
     }
   }
@@ -4597,6 +5475,77 @@ static bool EmitTerminator(Encoder& e, WJBackend& be,
     if (!GotoBlock(e, bidLocal, loopDepth + 1, blockIdx[fb])) return false;
     if (!e.writeOp(Op::End)) return false;
     return e.writeOp(Op::Unreachable);
+  }
+  if (t->isTableSwitch()) {
+    // switch(value): case k (k in [0,numCases)) -> case block; else -> default.
+    // Lower to a wasm br_table over (value - low): open numCases+1 nested blocks
+    // (default outermost, case0 innermost), br_table inside the innermost, then
+    // close each block and emit that case's edge-copies + GotoBlock($L). br_table
+    // treats the index as UNSIGNED, so value<low wraps huge -> hits the default.
+    // (gbemu executeIteration's `switch(this.IRQEnableDelay)` -- was bailing the
+    // whole hot CPU loop to PBL on the unhandled terminator.)
+    MTableSwitch* ts = t->toTableSwitch();
+    uint32_t n = uint32_t(ts->numCases());
+    for (uint32_t i = 0; i <= n; i++) {
+      if (!e.writeOp(Op::Block) || !e.writeFixedU8(0x40)) return false;
+    }
+    MDefinition* disc = ts->getOperand(0);
+    // The br_table index is `value - low` as i32. If the discriminant is an i32
+    // node, read it directly. If it is a boxed Value (i64) -- e.g. gbemu
+    // executeIteration's `switch(this.IRQEnableDelay)` where `this` is polymorphic
+    // so the field loads boxed -- emitting i32.sub on the i64 is INVALID wasm and
+    // V8 rejects the WHOLE module (the entire CPU loop fell to PBL). Extract an i32
+    // index from the Value: an INT32-tagged value uses its payload; anything else
+    // (double / non-number) is routed to the default (push low+n so the `- low`
+    // below yields n). JS `switch` is `===`, so only an int32 matches an integer
+    // case label here (an integer-valued double discriminant would go to default --
+    // acceptable: switch discriminants reaching this path are int32 in practice).
+    if (WJValType(disc->type()) == uint8_t(TypeCode::I32)) {
+      if (!GetOp(e, be, disc)) return false;  // i32 value
+    } else if (disc->type() == MIRType::Value) {
+      int32_t dl = be.local(disc);
+      if (dl < 0) { js::wasm::gWJBailReason = "tableswitch-value-nolocal"; return false; }
+      auto pushTag = [&]() -> bool {
+        return GetLocal(e, uint32_t(dl)) && e.writeOp(Op::I64Const) &&
+               e.writeVarS64(32) && e.writeOp(Op::I64ShrU) &&
+               e.writeOp(Op::I32WrapI64);
+      };
+      if (!pushTag() || !e.writeOp(Op::I32Const) ||
+          !e.writeVarS32(int32_t(TagWord(JSVAL_TYPE_INT32))) ||
+          !e.writeOp(Op::I32Eq))
+        return false;
+      if (!e.writeOp(Op::If) || !e.writeFixedU8(uint8_t(TypeCode::I32))) return false;
+      if (!GetLocal(e, uint32_t(dl)) || !e.writeOp(Op::I32WrapI64)) return false;  // int32 payload
+      if (!e.writeOp(Op::Else)) return false;
+      if (!e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(ts->low()) + int32_t(n)))
+        return false;  // -> (after `- low`) = n = default
+      if (!e.writeOp(Op::End)) return false;
+    } else {
+      js::wasm::gWJBailReason = "tableswitch-nonI32-disc";
+      return false;
+    }
+    if (ts->low() != 0) {
+      if (!e.writeOp(Op::I32Const) || !e.writeVarS32(ts->low()) ||
+          !e.writeOp(Op::I32Sub))
+        return false;
+    }
+    if (!e.writeOp(Op::BrTable) || !e.writeVarU32(n)) return false;
+    for (uint32_t i = 0; i < n; i++) {
+      if (!e.writeVarU32(i)) return false;  // case i -> label $case_i (depth i)
+    }
+    if (!e.writeVarU32(n)) return false;  // default -> label $default (depth n)
+    for (uint32_t i = 0; i < n; i++) {
+      if (!e.writeOp(Op::End)) return false;  // close $case_i; now in $case_{i+1}
+      MBasicBlock* tgt = ts->getCase(i);
+      if (!EmitEdgeCopies(e, be, b, tgt)) return false;
+      // n+1 blocks opened, i+1 closed -> n-i still open between here and $L.
+      if (!GotoBlock(e, bidLocal, loopDepth + (n - i), blockIdx[tgt]))
+        return false;
+    }
+    if (!e.writeOp(Op::End)) return false;  // close $default
+    MBasicBlock* dflt = ts->getDefault();
+    if (!EmitEdgeCopies(e, be, b, dflt)) return false;
+    return GotoBlock(e, bidLocal, loopDepth, blockIdx[dflt]);
   }
   return false;
 }
@@ -4691,7 +5640,6 @@ static bool WJEmitStructured(Encoder& e, WJBackend& be,
               [](const Rec& a, const Rec& b) { return a.end < b.end; });
   }
 
-  *started = true;
   std::vector<Rec> stk;
   auto depthOfBlock = [&](uint32_t tIdx) -> int32_t {
     for (int32_t k = int32_t(stk.size()) - 1; k >= 0; k--)
@@ -4708,7 +5656,67 @@ static bool WJEmitStructured(Encoder& e, WJBackend& be,
     int32_t d = (sIdx > pos) ? depthOfBlock(sIdx) : depthOfLoop(sIdx);
     return d < 0 ? -1 : int32_t(uint32_t(d) + extra);
   };
+  // PRE-VALIDATE (no bytes emitted, *started still false): dry-run the same
+  // scope-stack walk and confirm every terminator branch target resolves to an
+  // open scope. If a branch can't (irreducible/forward edge the structuring
+  // can't express -> brTo == -1), return false here so the caller falls back to
+  // the dispatch loop. Without this, such CFGs strand mid-emit (*started=true ->
+  // whole-compile failure), and because a failed compile is retried on the next
+  // warm-up tick, the function recompile-storms (deltablue hung under reloop).
+  // This is the gate-widening enabler: with depth bails caught up-front, call-
+  // heavy shallow-loop functions can safely reloop (crypto/splay/richards win).
+  for (uint32_t pos = 0; pos <= n; pos++) {
+    for (size_t i = 0; i < endsAt[pos].size(); i++) {
+      if (stk.empty()) { js::wasm::gWJBailReason = "reloop-pv-underflow"; return false; }
+      stk.pop_back();
+    }
+    for (Rec& r : beginsAt[pos]) stk.push_back(r);
+    if (pos == n) break;
+    MBasicBlock* b = blocks[pos];
+    if (b->alwaysBails() || WJBlockForceDeopt(be, b)) continue;
+    MControlInstruction* t = b->lastIns();
+    if (t->isGoto()) {
+      if (brTo(t->toGoto()->target(), pos, 0) < 0) {
+        js::wasm::gWJBailReason = "reloop-goto-depth"; return false;
+      }
+    } else if (t->isTest()) {
+      if (brTo(t->toTest()->ifTrue(), pos, 1) < 0 ||
+          brTo(t->toTest()->ifFalse(), pos, 1) < 0) {
+        js::wasm::gWJBailReason = "reloop-test-depth"; return false;
+      }
+    }
+  }
+  if (!stk.empty()) { js::wasm::gWJBailReason = "reloop-pv-residual"; return false; }
+  stk.clear();
+
+  *started = true;
   const uint8_t kVoid = 0x40;
+  // Out-of-line deopt: wrap the whole structured body in `block $D`. A guard miss
+  // inside a hot block body records its resume site and brs to $D (depth =
+  // open-relooper-scopes + the guard `if`), where the post-body dispatcher runs the
+  // matching resume -- keeping the hot block bodies tiny (no inline spill bloat).
+  // This is what makes the relooper viable for call-heavy functions (inline deopt
+  // at every guard regressed richards under reloop). NORELOOPOOL/NOOOL revert.
+  // OOL deopt in the relooper is opt-in: it adds the $D wrapper + dispatcher, which
+  // is a net win only for call-heavy / guard-heavy functions (where inline deopt at
+  // every guard bloats the body). For the small tight loops the gate currently
+  // reloops (crypto/splay), inline deopt is leaner -- so default to it and enable
+  // OOL only under GECKO_WJ_RELOOPOOL (used when the gate is widened to call-heavy
+  // functions). NOOOL/NORELOOPOOL force it off.
+  static int noOol = getenv("GECKO_WJ_NOOOL") ? 1 : 0;
+  static int wantReloopOol = getenv("GECKO_WJ_RELOOPOOL") ? 1 : 0;
+  // NOTE: auto-enabling OOL for call-heavy reloop'd functions recovered the
+  // richards/navier regression from the widened gate BUT exposed a correctness
+  // bug in the OOL deopt-resume path for crypto (ERR=Crypto). So OOL stays
+  // opt-in (GECKO_WJ_RELOOPOOL). The widened-gate path (GECKO_WJ_RELOOPCALLS)
+  // therefore uses INLINE deopt -- correct + fast for crypto (+61%) but a net
+  // loss for richards/navier; making it default-safe needs either the OOL
+  // resume bug fixed or a reliable per-function inline-vs-OOL discriminator.
+  be.oolDeopt = wantReloopOol && !noOol;
+  be.reloopOol = be.oolDeopt;
+  if (be.reloopOol) {
+    if (!e.writeOp(Op::Block) || !e.writeFixedU8(kVoid)) return false;  // $D
+  }
   for (uint32_t pos = 0; pos <= n; pos++) {
     for (size_t i = 0; i < endsAt[pos].size(); i++) {
       if (stk.empty()) return false;
@@ -4722,8 +5730,12 @@ static bool WJEmitStructured(Encoder& e, WJBackend& be,
     }
     if (pos == n) break;
     MBasicBlock* b = blocks[pos];
-    if (!EmitBlockBody(e, be, b)) return false;
-    if (b->alwaysBails()) continue;  // emitted its own deopt (returns); no terminator
+    be.reloopScopeDepth = uint32_t(stk.size());  // scopes enclosing this body (excl $D)
+    be.inDispatchBody = be.reloopOol;             // in-body guards go out-of-line to $D
+    bool bodyOk = EmitBlockBody(e, be, b);
+    be.inDispatchBody = false;                    // terminator deopts stay inline
+    if (!bodyOk) return false;
+    if (b->alwaysBails() || WJBlockForceDeopt(be, b)) continue;  // emitted its own deopt; no terminator
     MControlInstruction* t = b->lastIns();
     if (t->resumePoint()) be.curRp = t->resumePoint();  // else keep body last RP
     if (t->isReturn()) {
@@ -4739,16 +5751,23 @@ static bool WJEmitStructured(Encoder& e, WJBackend& be,
     } else if (t->isTest()) {
       MTest* test = t->toTest();
       MDefinition* cond = test->getOperand(0);
-      if (WJValType(cond->type()) != uint8_t(TypeCode::I32)) {
-        // Value-typed conditions need EmitValueTruthy; deferred -- the relooper has
-        // a separate br-depth bug (invalid wasm) that surfaced when these compiled,
-        // and it wasn't faster than dispatch anyway. Bail to dispatch.
+      MBasicBlock* tb = test->ifTrue();
+      MBasicBlock* fb = test->ifFalse();
+      // Push the i32 condition. I32-typed conditions are read directly; Value-typed
+      // ones go through EmitValueTruthy (which emits its own balanced if-chain and
+      // leaves a single i32, possibly an inline deopt for string/symbol/bigint).
+      // Terminator deopts are inline (inDispatchBody was cleared above), so the
+      // EmitValueTruthy deopt path's br-depth is irrelevant here.
+      if (WJValType(cond->type()) == uint8_t(TypeCode::I32)) {
+        if (!GetOp(e, be, cond)) return false;
+      } else if (cond->type() == MIRType::Value) {
+        int32_t cl = be.local(cond);
+        if (cl < 0) { js::wasm::gWJBailReason = "reloop-test-cond-local"; return false; }
+        if (!EmitValueTruthy(e, be, uint32_t(cl))) return false;
+      } else {
         js::wasm::gWJBailReason = "reloop-test-cond";
         return false;
       }
-      MBasicBlock* tb = test->ifTrue();
-      MBasicBlock* fb = test->ifFalse();
-      if (!GetOp(e, be, cond)) return false;
       if (!e.writeOp(Op::If) || !e.writeFixedU8(kVoid)) return false;
       if (!EmitEdgeCopies(e, be, b, tb)) return false;
       int32_t dt = brTo(tb, pos, 1);
@@ -4768,6 +5787,26 @@ static bool WJEmitStructured(Encoder& e, WJBackend& be,
   }
   if (!stk.empty()) return false;
   if (!e.writeOp(Op::Unreachable)) return false;
+  if (be.reloopOol) {
+    if (!e.writeOp(Op::End)) return false;  // end $D
+    be.inDispatchBody = false;
+    for (uint32_t s = 0; s < be.deoptSites.size(); s++) {
+      if (!GetLocal(e, be.deoptSiteLocal) || !e.writeOp(Op::I32Const) ||
+          !e.writeVarS32(int32_t(s)) || !e.writeOp(Op::I32Eq) ||
+          !e.writeOp(Op::If) || !e.writeFixedU8(0x40))
+        return false;
+      be.curRp = std::get<0>(be.deoptSites[s]);
+      be.curOp = std::get<1>(be.deoptSites[s]);
+      if (!EmitDeoptResumeInline(e, be, /*skipFrameSpill=*/false)) {
+        if (!js::wasm::gWJBailReason ||
+            !strstr(js::wasm::gWJBailReason, "resume"))
+          js::wasm::gWJBailReason = "reloop-deopt-resume";
+        return false;
+      }
+      if (!e.writeOp(Op::End)) return false;
+    }
+    if (!e.writeOp(Op::Unreachable)) return false;
+  }
   return e.writeOp(Op::End);  // function body end
 }
 
@@ -4915,6 +5954,48 @@ static bool WJWidenInt32Values(MIRGenerator& mir, MIRGraph& graph) {
   for (auto bIt = graph.rpoBegin(); bIt != graph.rpoEnd(); bIt++)
     for (auto it = bIt->begin(); it != bIt->end(); it++)
       if (isFP(*it)) tainted.insert(*it);  // seed: every Double/Float node
+  // CMP-SEED: also seed an Int32 value-unbox whose uses are ALL Double-safe sinks
+  // (number compares / Double arith), even with no FP node nearby. These are number
+  // properties Warp mis-typed Int32 because it observed an int32 0 first (raytrace
+  // material.reflection = 0 for matte, 0.5 for shiny) -> the strict Int32 unbox
+  // deopt-STORMS on the double, dragging the whole hot function (rayTrace) to PBL.
+  // Widening to a number (Double) unbox is sound -- 0 and 0.5 compare/arith
+  // identically as doubles -- and kills the storm. Restricting the seed to nodes
+  // whose every use is Double-safe. DEFAULT OFF (opt-in GECKO_WJ_WIDENCMP):
+  // FUNDAMENTALLY too broad -- pure-integer code (richards scheduler counters,
+  // navier loop/index values) also feeds only compares + int arithmetic, which
+  // ARE "Double-safe" sinks, so this widens genuine Int32 to Double (richards
+  // 120->13, navier 3900->26, deltablue hang). There is no STATIC signal that
+  // separates "an Int32 that's really a float at runtime" (raytrace
+  // material.reflection = 0 | 0.5) from "a genuine Int32 that happens to feed
+  // number ops" -- only float-taint (an actual FP connection) is sound. The
+  // reflection deopt storm needs an IC-level number-speculation fix, not widening.
+  if (getenv("GECKO_WJ_WIDENCMP")) {
+    auto allUsesDoubleSafe = [&](MDefinition* d) -> bool {
+      bool any = false;
+      for (auto u = d->usesBegin(); u != d->usesEnd(); u++) {
+        if (!u->consumer()->isDefinition()) continue;  // resume pt: boxed by type
+        MDefinition* user = u->consumer()->toDefinition();
+        any = true;
+        switch (user->op()) {
+          case Op_::Compare:
+          case Op_::Add: case Op_::Sub: case Op_::Mul: case Op_::Div: case Op_::Mod:
+          case Op_::ToDouble: case Op_::ToFloat32:
+            if (user->type() == MIRType::Int32) return false;  // int sink -> unsafe
+            break;
+          default:
+            return false;
+        }
+      }
+      return any;
+    };
+    for (MDefinition* c : cand)
+      if ((c->op() == Op_::Unbox || c->op() == Op_::LoadElementAndUnbox ||
+           c->op() == Op_::LoadFixedSlotAndUnbox ||
+           c->op() == Op_::LoadDynamicSlotAndUnbox) &&
+          allUsesDoubleSafe(c))
+        tainted.insert(c);
+  }
   bool changed = true;
   while (changed) {
     changed = false;
@@ -5308,6 +6389,9 @@ bool js::wasm::WJEmitBody(MIRGenerator& mir, MIRGraph& graph, uint32_t nargs,
       MInstruction* ins = *it;
       if (ins->op() == MDefinition::Opcode::FunctionEnvironment)
         be.useEnvRoot = true;  // env in envLocal must be rooted across calls
+      if (MResumePoint* rp = ins->resumePoint()) {
+        if (rp->caller()) be.hasInlinedFrames = true;  // multi-frame => inlined callee
+      }
       switch (ins->op()) {
         case MDefinition::Opcode::Call:
         case MDefinition::Opcode::GetPropertyCache:
@@ -5474,10 +6558,29 @@ bool js::wasm::WJEmitBody(MIRGenerator& mir, MIRGraph& graph, uint32_t nargs,
     }
   };
 
-  // Single-block fast path: straight-line, no dispatch loop.
+  // Single-block fast path: straight-line, no dispatch loop. OOL deopt by default:
+  // wrap the body in `block $D` so each guard miss is just `cmp; br $D` and the full
+  // deopt spill+resume sequence lives out-of-line after $D (a dispatcher keyed on the
+  // site) -- exactly like Ion's `jcc bailout_stub`. Without this, EVERY guard in a
+  // leaf function (raytrace's dot/add/etc.) carried a ~13-store inline deopt sequence
+  // in the hot path, bloating it and pinning values out of registers. GECKO_WJ_NOOOL /
+  // NOSINGLEOOL revert to inline deopt.
   if (n == 1) {
     MBasicBlock* b = blocks[0];
-    if (!EmitBlockBody(e, be, b)) return false;
+    static int noOolS = getenv("GECKO_WJ_NOOOL") ? 1 : 0;
+    static int noSingleOol = getenv("GECKO_WJ_NOSINGLEOOL") ? 1 : 0;
+    bool singleOol = !noOolS && !noSingleOol;
+    be.oolDeopt = singleOol;
+    be.reloopOol = singleOol;       // reuse the reloop OOL br-depth formula
+    be.reloopScopeDepth = 0;        // body sits directly inside $D
+    const uint8_t kVoidB = 0x40;
+    if (singleOol) {
+      if (!e.writeOp(Op::Block) || !e.writeFixedU8(kVoidB)) return false;  // $D
+    }
+    be.inDispatchBody = singleOol;  // in-body guard misses br to $D
+    bool bodyOk = EmitBlockBody(e, be, b);
+    be.inDispatchBody = false;      // terminator deopts stay inline
+    if (!bodyOk) return false;
     MControlInstruction* t = b->lastIns();
     if (t->resumePoint()) be.curRp = t->resumePoint();  // else keep body last RP
     if (t->isReturn()) {
@@ -5487,6 +6590,26 @@ bool js::wasm::WJEmitBody(MIRGenerator& mir, MIRGraph& graph, uint32_t nargs,
     } else {
       js::wasm::gWJBailReason = "single-bad-term";
       return false;
+    }
+    if (singleOol) {
+      if (!e.writeOp(Op::Unreachable)) return false;  // dead (body returned/deopted)
+      if (!e.writeOp(Op::End)) return false;          // end $D
+      for (uint32_t s = 0; s < be.deoptSites.size(); s++) {
+        if (!GetLocal(e, be.deoptSiteLocal) || !e.writeOp(Op::I32Const) ||
+            !e.writeVarS32(int32_t(s)) || !e.writeOp(Op::I32Eq) ||
+            !e.writeOp(Op::If) || !e.writeFixedU8(kVoidB))
+          return false;
+        be.curRp = std::get<0>(be.deoptSites[s]);
+        be.curOp = std::get<1>(be.deoptSites[s]);
+        if (!EmitDeoptResumeInline(e, be, /*skipFrameSpill=*/false)) {
+          if (!js::wasm::gWJBailReason ||
+              !strstr(js::wasm::gWJBailReason, "resume"))
+            js::wasm::gWJBailReason = "single-deopt-resume";
+          return false;
+        }
+        if (!e.writeOp(Op::End)) return false;
+      }
+      if (!e.writeOp(Op::Unreachable)) return false;
     }
     cfReport("single");
     return e.writeOp(Op::End);
@@ -5528,13 +6651,35 @@ bool js::wasm::WJEmitBody(MIRGenerator& mir, MIRGraph& graph, uint32_t nargs,
   // under removed guards (wrong slot -> "Cycle"); full mega is consistent. Measured
   // no regression to the others (crypto 124->174, raytrace 40->52, richards/splay/
   // navier comparable). GECKO_WJ_NOMEGA reverts to fixed-slot+deopt codegen.
-  be.forceMega = !getenv("GECKO_WJ_NOMEGA");
+  // forceMega DEFAULT-ON (every compile). Honest -O2 measurements show this is a
+  // DOUBLE-EDGED keystone: it is REQUIRED for deltablue (selective/valve-only mega
+  // makes deltablue storm+HANG -- its runtime-polymorphic constraint methods need
+  // by-name reads from first compile), but it HALVES richards (126 vs 242 = -48%,
+  // mono code paying mega cache/helper bloat) and CORRUPTS box2d (memory-OOB via
+  // the EmitPropIC path). The proper fix is PER-ACCESS mega (mono accesses keep a
+  // fast guarded read, only polymorphic ones go mega) -- not landed yet.
+  // GECKO_WJ_MEGAVALVE = selective (valve-driven) mode for experiments;
+  // GECKO_WJ_NOMEGA = fully off.
+  be.forceMega = !getenv("GECKO_WJ_NOMEGA") &&
+                 (!getenv("GECKO_WJ_MEGAVALVE") || js::wasm::gWJForceMega);
   static int forceReloop = getenv("GECKO_WJ_RELOOP") ? 1 : 0;
   static int noReloop = getenv("GECKO_WJ_NORELOOP") ? 1 : 0;
   static int reloopNest = getenv("GECKO_WJ_RELOOPNEST") ? 1 : 0;
+  // Gate: reloop functions with no nested loops (maxLoopDepth<=1; the relooper
+  // mis-handles nested loops -> navier) AND no calls. The `!hasCalls` restriction
+  // is kept as the DEFAULT because widening to call-heavy functions is net-mixed:
+  // crypto +61% (inline deopt, correct) but richards -27%/navier -12% (inline
+  // deopt bloat), and OOL deopt (the documented cure for the call-heavy bloat)
+  // currently miscompiles crypto (ERR). Opt-in via GECKO_WJ_RELOOPCALLS to widen
+  // the gate to call-having shallow functions (uses inline deopt) -- correct
+  // everywhere measured EXCEPT it regresses richards/navier. The pre-validation
+  // in WJEmitStructured makes this safe from the deltablue compile-storm.
+  static int reloopCalls = getenv("GECKO_WJ_RELOOPCALLS") ? 1 : 0;
   bool useReloop = forceReloop ||
-                   (!noReloop && (reloopNest || (maxLoopDepth <= 1 && !hasCalls)));
+                   (!noReloop && (reloopNest ||
+                                  (maxLoopDepth <= 1 && (!hasCalls || reloopCalls))));
   if (useReloop) {
+    be.reloopHasCalls = hasCalls;  // call-heavy -> OOL deopt inside the relooper
     bool started = false;
     if (WJEmitStructured(e, be, blocks, blockIdx, &started)) {
       cfReport("reloop");
@@ -5598,22 +6743,30 @@ bool js::wasm::WJEmitBody(MIRGenerator& mir, MIRGraph& graph, uint32_t nargs,
   for (uint32_t ri = 0; ri < n; ri++) {
     uint32_t bi = n - 1 - ri;
     MBasicBlock* b = blocks[bi];
-    if (!e.writeOp(Op::End)) return false;  // close block $b_{bi}
+    if (!e.writeOp(Op::End)) { js::wasm::gWJBailReason = "dispatch-blockclose-enc"; return false; }  // close block $b_{bi}
     uint32_t loopDepthHere = n - 1 - ri;
     be.bodyLoopIdx = loopDepthHere;  // br index of $L from this body base
     be.inDispatchBody = be.oolDeopt;  // in-body guards go out-of-line
-    if (!EmitBlockBody(e, be, b)) return false;
+    if (!EmitBlockBody(e, be, b)) {
+      if (getenv("GECKO_WJ_CFINFO")) {
+        JSScript* s = be.info ? be.info->script() : nullptr;
+        fprintf(stderr, "[wj-blockbody-bail] %s:%u block bi=%u id=%u reason=%s\n",
+                s ? s->filename() : "?", s ? unsigned(s->lineno()) : 0, bi, b->id(),
+                js::wasm::gWJBailReason ? js::wasm::gWJBailReason : "?");
+      }
+      return false;
+    }
     be.inDispatchBody = false;  // terminator deopts stay inline (at body base)
     // alwaysBails blocks emitted their own deopt (which exits); no terminator.
-    if (b->alwaysBails()) continue;
+    if (b->alwaysBails() || WJBlockForceDeopt(be, b)) continue;
     if (!EmitTerminator(e, be, blockIdx, bidLocal, loopDepthHere, b)) {
       js::wasm::gWJBailReason = "terminator";
       return false;
     }
   }
 
-  if (!e.writeOp(Op::Unreachable)) return false;
-  if (!e.writeOp(Op::End)) return false;  // end loop $L
+  if (!e.writeOp(Op::Unreachable)) { js::wasm::gWJBailReason = "dispatch-postloop-enc"; return false; }
+  if (!e.writeOp(Op::End)) { js::wasm::gWJBailReason = "dispatch-endloop-enc"; return false; }  // end loop $L
 
   // Out-of-line deopt dispatcher: `br $D` from a guard lands here (just past the
   // loop). Switch on deoptSiteLocal and run the matching site's full resume.

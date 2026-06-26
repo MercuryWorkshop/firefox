@@ -1475,7 +1475,26 @@ static bool EmitPropIC(Encoder& e, WJBackend& be, MInstruction* ins,
     if (!GetLocal(e, be.propTaggedLocal) || !e.writeOp(Op::I32Const) ||
         !e.writeVarS32(1) || !e.writeOp(Op::I32ShrU) || !e.writeOp(Op::I32Add))
       return false;
-    return e.writeOp(Op::I64Load) && e.writeVarU32(3) && e.writeVarU32(0);
+    if (!e.writeOp(Op::I64Load) || !e.writeVarU32(3) || !e.writeVarU32(0))
+      return false;  // [value]
+    // DEBUG: catch reuse-staleness -- if the loaded value's bits == the SWEPT nursery
+    // poison pattern (0x2B*), this read came from a FREED (collected) cell whose
+    // memory wasn't yet reused. Abort with the site (GECKO_WJ_READVALIDATE).
+    static int readValidate = getenv("GECKO_WJ_READVALIDATE") ? 1 : 0;
+    if (readValidate) {
+      if (!e.writeOp(Op::LocalTee) || !e.writeVarU32(be.unboxScratch)) return false;
+      // if (value == 0x2B2B2B2B2B2B2B2B) report poison
+      if (!GetLocal(e, be.unboxScratch) || !e.writeOp(Op::I64Const) ||
+          !e.writeVarS64(int64_t(0x2B2B2B2B2B2B2B2BULL)) || !e.writeOp(Op::I64Eq))
+        return false;
+      if (!e.writeOp(Op::If) || !e.writeFixedU8(0x40)) return false;
+      if (!e.writeOp(Op::F64Const) || !e.writeFixedF64(double(WJH_CHECKCELL)) ||
+          !e.writeOp(Op::F64Const) || !e.writeFixedF64(double(int(site))) ||
+          !e.writeOp(Op::Call) || !e.writeVarU32(0) || !e.writeOp(Op::Drop))
+        return false;
+      if (!e.writeOp(Op::End)) return false;  // [value] still on stack from the tee
+    }
+    return true;
   };
 
   // Runtime-cache ways + helper miss path (the polymorphic fallback). Each way:
@@ -1777,6 +1796,17 @@ static bool EmitPropStoreIC(Encoder& e, WJBackend& be, MInstruction* ins,
                      vt == MIRType::String || vt == MIRType::Symbol ||
                      vt == MIRType::BigInt);
 
+  static int storeValidate = getenv("GECKO_WJ_STOREVALIDATE") ? 1 : 0;
+  auto emitCheckCell = [&](uint32_t loc) -> bool {  // loc = i32 local holding a ptr
+    uintptr_t objAddr = uintptr_t(static_cast<void*>(&gWJHelpObj));
+    if (!e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(objAddr)) ||
+        !GetLocal(e, loc) || !e.writeOp(Op::I32Store) || !e.writeVarU32(2) ||
+        !e.writeVarU32(0))
+      return false;
+    return e.writeOp(Op::F64Const) && e.writeFixedF64(double(WJH_CHECKCELL)) &&
+           e.writeOp(Op::F64Const) && e.writeFixedF64(0.0) && e.writeOp(Op::Call) &&
+           e.writeVarU32(0) && e.writeOp(Op::Drop);
+  };
   auto emitStore = [&](uint32_t w) -> bool {
     // propTagged = gWJPropOff[base+w]; slotAddr -> propTaggedLocal repurposed.
     if (!e.writeOp(Op::I32Const) ||
@@ -1784,6 +1814,8 @@ static bool EmitPropStoreIC(Encoder& e, WJBackend& be, MInstruction* ins,
         !e.writeOp(Op::I32Load) || !e.writeVarU32(2) || !e.writeVarU32(0) ||
         !e.writeOp(Op::LocalSet) || !e.writeVarU32(be.propTaggedLocal))
       return false;
+    // DEBUG: validate the receiver is a live (non-forwarded) cell before storing.
+    if (storeValidate && !emitCheckCell(be.propObjLocal)) return false;
     // slotBase = (tagged & 1) ? propObj : I32Load(propObj + offsetOfSlots)
     if (!GetLocal(e, be.propTaggedLocal) || !e.writeOp(Op::I32Const) ||
         !e.writeVarS32(1) || !e.writeOp(Op::I32And))
@@ -1807,6 +1839,13 @@ static bool EmitPropStoreIC(Encoder& e, WJBackend& be, MInstruction* ins,
                  e.writeVarU32(3) && e.writeVarU32(0);
         }))
       return false;
+    // DEBUG: validate the VALUE payload is a live (non-forwarded) cell, if GC-typed.
+    if (storeValidate && valMaybeGC) {
+      if (!GetLocal(e, be.unboxScratch) || !e.writeOp(Op::I32WrapI64) ||
+          !e.writeOp(Op::LocalSet) || !e.writeVarU32(be.propTaggedLocal))
+        return false;
+      if (!emitCheckCell(be.propTaggedLocal)) return false;
+    }
     // Store: *(slotAddr) = value.
     if (!GetLocal(e, be.propShapeLocal) || !GetLocal(e, be.unboxScratch) ||
         !e.writeOp(Op::I64Store) || !e.writeVarU32(3) || !e.writeVarU32(0))

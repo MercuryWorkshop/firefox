@@ -88,6 +88,7 @@ enum WJHelpKind : int {
   WJH_NEWOBJECT = 27,     // gWJNewObjScript/gWJNewObjPcOff -> NewObjectOperation (object literal)
   WJH_BINDNAME = 28,      // scratch[0]=envChain, scratch[1]=name(StringValue) -> LookupNameUnqualified (Object)
   WJH_GROWSLOTS = 29,     // scratch[0]=object, gWJNewAux=newCapacity -> NativeObject::growSlotsPure (AllocateAndStoreSlot)
+  WJH_CHECKCELL = 30,     // DEBUG: gWJHelpObj = ptr to validate; abort if forwarded/invalid (GECKO_WJ_STOREVALIDATE)
   WJH_TOINT32 = 30,       // scratch[0]=value -> JS::ToInt32 (Int32); no-deopt ToInt32 for `x|0`/`&` on a boxed value
 };
 

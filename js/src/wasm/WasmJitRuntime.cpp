@@ -1192,6 +1192,18 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
     return 0.0;
   }
 
+  if (kind == js::wasm::WJH_CHECKCELL) {
+    // DEBUG validator: caller detected a loaded value matching the SWEPT nursery
+    // poison pattern (0x2B*) -- i.e. an inline access read a FREED (collected) cell's
+    // memory: the reuse-staleness GC bug, caught at the exact read. gWJHelpObj holds
+    // the read's PC-ish site; the value bits are reported by the caller's site arg.
+    fprintf(stderr, "[wj-poison] STALE READ of freed cell -- site=%d objloc=%u (GC reuse-staleness)\n",
+            int(siteF), gWJHelpObj);
+    fflush(stderr);
+    MOZ_CRASH("WJ stale read of poisoned (freed) cell");
+    return 0.0;
+  }
+
   if (kind == js::wasm::WJH_POSTBARRIER) {
     JSObject* obj = reinterpret_cast<JSObject*>(uintptr_t(gWJHelpObj));
     // PostWriteBarrier (putWholeCellDontCheckLast) assumes a TENURED container;

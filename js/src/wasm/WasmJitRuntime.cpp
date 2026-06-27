@@ -32,6 +32,7 @@
 #include "vm/BytecodeUtil.h"  // js::CodeName
 #include "vm/NativeObject.h"
 #include "vm/PlainObject.h"  // js::PlainObject::createWithShape
+#include "vm/EnvironmentObject.h"  // js::CallObject::createWithShape
 #include "vm/Interpreter.h"  // SetObjectElement, InstanceofOperator, LessThan, ...
 #include "vm/EqualityOperations.h"  // LooselyEqual, StrictlyEqual
 #include "vm/Stack.h"  // ConstructArgs
@@ -108,6 +109,7 @@ uint64_t gWJCallCallee = 0;     // boxed callee Value (set by emitted code)
 uint32_t gWJCallArgc = 0;
 uint64_t gWJConstructNewTarget = 0;  // boxed newTarget for constructing calls
 uintptr_t gWJMarkBarrierAddr = 0;  // baked zone needs-marking-barrier flag address
+uintptr_t gWJWholeCellLastAddr = 0;  // baked &storeBuffer.bufferWholeCell.last_
 uint64_t gWJGlobalLexEnvVal = 0;   // boxed global lexical env (for FunctionEnvironment)
 uint32_t gWJCurrentEnv = 0;        // current fn's runtime environment (raw ptr)
 int gWJExecDepth = 0;              // >0 while emitted wasm-JIT code is on the stack
@@ -136,6 +138,26 @@ static uint32_t gWJNextCallSite = 0;
 uint32_t WJAllocCallSite() {
   if (gWJNextCallSite >= kWJCallSites) return 0;  // site 0 is a safe sentinel
   return gWJNextCallSite++;
+}
+
+// Per-construct-site monomorphic inline cache (GECKO_WJ_CTORINLINE). On a hit the
+// backend inline-allocates `this` (cached shape/size/nfixed) + call_indirects the
+// ctor directly, eliminating the 8.87M/run WJH_CONSTRUCT boundary crossings (earley
+// cons cells). Filled by WJH_CONSTRUCT on the slow path. site 0 = sentinel (never
+// cached). Callee/shape are GC ptrs -> traced in WJTraceRoots.
+uint32_t gWJCtorCallee[kWJCtorSites] = {0};  // cached ctor JSFunction ptr (0 = empty)
+uint32_t gWJCtorShape[kWJCtorSites] = {0};   // cached `this` SharedShape ptr
+uint32_t gWJCtorSize[kWJCtorSites] = {0};    // total nursery cell size (header+thing)
+uint32_t gWJCtorNfixed[kWJCtorSites] = {0};  // fixed slot count (init to undefined)
+int32_t gWJCtorTblIdx[kWJCtorSites] = {0};   // ctor's shared-table index (-1 = none)
+uint32_t gWJCtorEnv[kWJCtorSites] = {0};     // ctor's environment ptr
+static uint8_t gWJCtorNoFill[kWJCtorSites] = {0};  // 1 = site can never inline-fill
+                                                   // (forwarding wrapper) -> stop the
+                                                   // per-construct fill-attempt churn
+static uint32_t gWJNextCtorSite = 0;
+uint32_t WJAllocCtorSite() {
+  if (gWJNextCtorSite >= kWJCtorSites) return 0;
+  return ++gWJNextCtorSite;  // site 0 reserved as sentinel
 }
 
 // Inline property-load IC (see WasmJitBackend.h).
@@ -1192,6 +1214,18 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
     return 0.0;
   }
 
+  if (kind == js::wasm::WJH_DBGPTR) {
+    // DEBUG: log the value the valNursery post-barrier check is about to chunk-load.
+    // gWJHelpObj = payload (low32), gWJHelpVal = full boxed bits. If the next line is
+    // the last before a trap, that payload is the OOB culprit.
+    JS::Value v = JS::Value::fromRawBits(gWJHelpVal);
+    fprintf(stderr, "[wj-vgdbg] payload=%#x bits=%#llx isObj=%d isDouble=%d isGCThing=%d isNull=%d\n",
+            gWJHelpObj, (unsigned long long)gWJHelpVal, v.isObject(), v.isDouble(),
+            v.isGCThing(), v.isNull());
+    fflush(stderr);
+    return 0.0;
+  }
+
   if (kind == js::wasm::WJH_CHECKCELL) {
     // DEBUG validator: caller detected a loaded value matching the SWEPT nursery
     // poison pattern (0x2B*) -- i.e. an inline access read a FREED (collected) cell's
@@ -1693,6 +1727,80 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
     return 0.0;
   }
 
+  if (kind == js::wasm::WJH_INSTANCEOFPROTO) {
+    // MInstanceOf: scratch[0]=obj (value), scratch[1]=proto (the RHS's .prototype
+    // object, already resolved). Result = proto is on obj's prototype chain. A
+    // non-object obj is never an instance -> false. (earley/Boyer does millions of
+    // `x instanceof sc_Pair` -- this lets those functions JIT instead of bailing.)
+    RootedValue v(cx, JS::Value::fromRawBits(gWJScratch[0]));
+    RootedValue protov(cx, JS::Value::fromRawBits(gWJScratch[1]));
+    bool res = false;
+    if (v.isObject() && protov.isObject()) {
+      RootedObject proto(cx, &protov.toObject());
+      if (!js::IsPrototypeOf(cx, proto, &v.toObject(), &res)) return 1.0;
+    }
+    gWJScratch[js::wasm::kWJResultSlot] = JS::BooleanValue(res).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_LAMBDA) {
+    // MLambda: scratch[0]=envChain (object), scratch[1]=template function (object
+    // constant). Clone the closure over the env. Matches Ion's OOL fallback. earley/
+    // Boyer creates many closures (Scheme lambdas) -- lets those functions JIT.
+    RootedValue envv(cx, JS::Value::fromRawBits(gWJScratch[0]));
+    RootedValue funv(cx, JS::Value::fromRawBits(gWJScratch[1]));
+    if (!funv.isObject() || !funv.toObject().is<JSFunction>() || !envv.isObject())
+      return 1.0;
+    RootedFunction fun(cx, &funv.toObject().as<JSFunction>());
+    RootedObject env(cx, &envv.toObject());
+    JSObject* res =
+        js::LambdaOptimizedFallback(cx, fun, env, js::gc::Heap::Default);
+    if (!res) return 1.0;
+    gWJScratch[js::wasm::kWJResultSlot] = JS::ObjectValue(*res).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_TYPEOFIS) {
+    // MTypeOfIs: scratch[0]=operand value; site = (jstype<<1 | invert) where invert
+    // is set for Ne/StrictNe. result = (typeof operand == jstype) XOR invert.
+    RootedValue v(cx, JS::Value::fromRawBits(gWJScratch[0]));
+    JSType t = js::TypeOfValue(v);
+    uint32_t packed = uint32_t(siteF);
+    JSType want = JSType(packed >> 1);
+    bool invert = (packed & 1) != 0;
+    bool match = (t == want) ^ invert;
+    gWJScratch[js::wasm::kWJResultSlot] = JS::BooleanValue(match).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_CTORALLOC) {
+    // GC-correct ctor-`this` alloc for the inline construct: createWithShape via the
+    // GC machinery (handles nursery registration + mid-life promotion correctly,
+    // unlike the manual bump whose half-built `this` got swept). gWJNewShapeSlot
+    // holds the ADDRESS of a Shape* (the per-site cached shape).
+    js::Shape* sh = *reinterpret_cast<js::Shape**>(uintptr_t(gWJNewShapeSlot));
+    if (!sh || !sh->isShared()) return 1.0;
+    JS::Rooted<js::SharedShape*> shape(cx, &sh->asShared());
+    js::PlainObject* obj = js::PlainObject::createWithShape(cx, shape);
+    if (!obj) return 1.0;
+    gWJScratch[js::wasm::kWJThisSlot] = JS::ObjectValue(*obj).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_NEWCALLOBJ) {
+    // MNewCallObject: allocate a CallObject (closure scope) with the traced shared
+    // shape. Enclosing-env + callee slots are filled by subsequent StoreFixedSlot
+    // ops (matches Ion's visitNewCallObject, which just calls createWithShape).
+    js::Shape* sh = *reinterpret_cast<js::Shape**>(uintptr_t(gWJNewShapeSlot));
+    if (!sh) return 1.0;
+    JS::Rooted<js::SharedShape*> shape(cx, &sh->asShared());
+    js::CallObject* obj =
+        js::CallObject::createWithShape(cx, shape, js::gc::Heap(gWJNewHeap));
+    if (!obj) return 1.0;
+    gWJScratch[js::wasm::kWJResultSlot] = JS::ObjectValue(*obj).asRawBits();
+    return 0.0;
+  }
+
   if (kind == js::wasm::WJH_CREATETHIS) {
     static int dbgCtCount = getenv("GECKO_WJ_CTCOUNT") ? 1 : 0;
     if (dbgCtCount) {
@@ -1728,6 +1836,13 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
                       JS::Value::fromRawBits(gWJScratch[js::wasm::kWJThisSlot]));
     RootedValue newTarget(
         cx, JS::Value::fromRawBits(gWJScratch[js::wasm::kWJNewTargetSlot]));
+    if (getenv("GECKO_WJ_CTORINLINEDBG")) {
+      static uint64_t ent = 0;
+      if ((++ent % 200000) == 0)
+        fprintf(stderr, "[wj-ctorentry] %llu site=%u thisMagic=%d thisObj=%d nt==fval=%d\n",
+                (unsigned long long)ent, uint32_t(siteF), thisv.isMagic(),
+                thisv.isObject(), int(newTarget.asRawBits() == fval.asRawBits()));
+    }
     static int cdbg = getenv("GECKO_WJ_CONSTRUCTDBG") ? 1 : 0;
     if (cdbg && !(fval.isObject() && fval.toObject().is<JSFunction>())) {
       const char* cn = fval.isObject() ? fval.toObject().getClass()->name : "?";
@@ -1761,7 +1876,13 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
       }
       if (cshape) {
         Rooted<js::SharedShape*> shape(cx, cshape);
-        js::PlainObject* obj = js::PlainObject::createWithShape(cx, shape);
+        // GECKO_WJ_TENURECTOR: pretenure constructed `this` (allocate tenured)
+        // to skip nursery churn for long-lived objects (splay tree nodes) -- tests
+        // whether the minor-GC pause is splay's bottleneck. Ion pretenures hot
+        // long-lived alloc sites via PretenuringInfo; this is the forced version.
+        static int tenureCtor = getenv("GECKO_WJ_TENURECTOR") ? 1 : 0;
+        js::PlainObject* obj = js::PlainObject::createWithShape(
+            cx, shape, tenureCtor ? js::TenuredObject : js::GenericObject);
         if (!obj) return 1.0;
         thisv = JS::ObjectValue(*obj);
       } else {
@@ -1772,6 +1893,54 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
         thisv = created;
       }
       gWJScratch[js::wasm::kWJThisSlot] = thisv.get().asRawBits();
+      // CTORINLINE: cache per-site ctor info from the FRESHLY-CREATED (pre-ctor,
+      // EMPTY-shape) `this`. The backend inline path allocates `this` with THIS
+      // initial shape so the ctor's compiled property-ADD (shape-transition) ops run
+      // on the layout they expect. (Capturing the FINAL post-ctor shape corrupted
+      // ~13% of earley's ctors: their transition ICs mismatched the pre-shaped obj.)
+      static int ctorInlineFill = getenv("GECKO_WJ_NOCTORINLINE") ? 0 : 1;
+      uint32_t cs = uint32_t(siteF);
+      if (ctorInlineFill && cs && cs < js::wasm::kWJCtorSites &&
+          !gWJCtorNoFill[cs] && thisv.isObject() &&
+          thisv.toObject().is<js::PlainObject>() &&
+          newTarget.asRawBits() == fval.asRawBits() && gEntries) {
+        js::NativeObject& no = thisv.toObject().as<js::NativeObject>();
+        js::Shape* sh = no.shape();
+        JSFunction* cf = &fval.toObject().as<JSFunction>();
+        // Mark forwarding wrappers permanently no-fill so we stop re-running this
+        // whole block (WJIsForwardingWrapper hash-lookup + shape/fn checks) on EVERY
+        // construct -- that per-construct churn, not the inline path, was raytrace's
+        // ~29% CTORINLINE regression (its Class.create wrappers never fill).
+        if (cf->isInterpreted() && cf->hasBytecode() &&
+            WJIsForwardingWrapper(cx, cf->nonLazyScript())) {
+          gWJCtorNoFill[cs] = 1;
+        }
+        // Do NOT inline-cache FORWARDING WRAPPERS (Prototype.js Class.create:
+        // `function(){ this.initialize.apply(this, arguments) }`). call_indirect'ing
+        // the wrapper would run its `.apply(this, arguments)` (arguments-object alloc
+        // + fun_apply) -- exactly what the forwarding-construct fast path below skips
+        // by calling `initialize` directly. CTORINLINE (direct ctors, earley cons)
+        // and forwarding-construct (wrapper ctors, raytrace) are COMPLEMENTARY: let
+        // wrappers fall through to the forwarding path (the inline gate then misses).
+        if (sh->isShared() && no.numDynamicSlots() == 0 && cf->isInterpreted() &&
+            cf->hasBytecode() && !WJIsForwardingWrapper(cx, cf->nonLazyScript())) {
+          js::wasm::WasmJitObserveCall(cf->nonLazyScript());
+          auto ce = gEntries->find(cf->nonLazyScript());
+          if (ce != gEntries->end() &&
+              ce->second.state == WJEntry::State::Compiled &&
+              ce->second.tblSlot >= 0) {
+            js::gc::AllocKind ak = no.allocKind();
+            gWJCtorShape[cs] = uint32_t(uintptr_t(static_cast<void*>(sh)));
+            gWJCtorSize[cs] = uint32_t(js::gc::Arena::thingSize(ak)) +
+                              uint32_t(js::Nursery::nurseryCellHeaderSize());
+            gWJCtorNfixed[cs] = no.numFixedSlots();
+            gWJCtorTblIdx[cs] = ce->second.tblSlot;
+            gWJCtorEnv[cs] =
+                uint32_t(uintptr_t(static_cast<void*>(cf->environment())));
+            gWJCtorCallee[cs] = uint32_t(uintptr_t(static_cast<void*>(cf)));
+          }
+        }
+      }
     }
     // FORWARDING CONSTRUCT FAST PATH (default-on; GECKO_WJ_NOFWDCTOR disables).
     // For the Prototype.js `Class.create` wrapper `function(){ this.initialize.
@@ -1931,6 +2100,9 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
         }
       }
     }
+    // (CTORINLINE cache is now filled from the PRE-ctor empty `this` above, right
+    // after CreateThisFromIon -- the backend inline path needs the INITIAL shape the
+    // ctor's transition ICs expect, not the final post-ctor shape.)
     js::ConstructArgs cargs(cx);
     if (!cargs.init(cx, argc)) return 1.0;
     for (uint32_t i = 0; i < argc; i++) {
@@ -2070,6 +2242,21 @@ extern "C" EMSCRIPTEN_KEEPALIVE void WJTraceRoots(JSTracer* trc, void*) {
       if (gWJCallFn[i]) {
         js::TraceRoot(trc, reinterpret_cast<JSObject**>(&gWJCallFn[i]), "wjcallfn");
       }
+    }
+  }
+  // Per-site ctor inline cache: callee fn, `this` shape, and ctor env are GC ptrs.
+  // If any moves and a slot isn't updated, the backend's `callee==gWJCtorCallee`
+  // gate would mis-hit / the cached shape would be stale -> trace them all.
+  {
+    uint32_t n = js::wasm::gWJNextCtorSite + 1;
+    if (n > js::wasm::kWJCtorSites) n = js::wasm::kWJCtorSites;
+    for (uint32_t i = 0; i < n; i++) {
+      if (gWJCtorCallee[i])
+        js::TraceRoot(trc, reinterpret_cast<JSObject**>(&gWJCtorCallee[i]), "wjctorcallee");
+      if (gWJCtorShape[i])
+        js::TraceRoot(trc, reinterpret_cast<js::Shape**>(&gWJCtorShape[i]), "wjctorshape");
+      if (gWJCtorEnv[i])
+        js::TraceRoot(trc, reinterpret_cast<JSObject**>(&gWJCtorEnv[i]), "wjctorenv");
     }
   }
   uint32_t sp = gWJRootSP;

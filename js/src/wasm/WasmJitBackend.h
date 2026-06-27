@@ -90,6 +90,12 @@ enum WJHelpKind : int {
   WJH_GROWSLOTS = 29,     // scratch[0]=object, gWJNewAux=newCapacity -> NativeObject::growSlotsPure (AllocateAndStoreSlot)
   WJH_CHECKCELL = 30,     // DEBUG: gWJHelpObj = ptr to validate; abort if forwarded/invalid (GECKO_WJ_STOREVALIDATE)
   WJH_TOINT32 = 30,       // scratch[0]=value -> JS::ToInt32 (Int32); no-deopt ToInt32 for `x|0`/`&` on a boxed value
+  WJH_INSTANCEOFPROTO = 31,  // scratch[0]=obj(value), scratch[1]=proto(object) -> IsPrototypeOf (Boolean); MInstanceOf
+  WJH_LAMBDA = 32,           // scratch[0]=envChain(object), scratch[1]=templateFun(object) -> LambdaOptimizedFallback (Object); MLambda
+  WJH_TYPEOFIS = 33,         // scratch[0]=operand(value), site=(jstype<<1|invert) -> TypeOfValue==jstype (Boolean); MTypeOfIs
+  WJH_NEWCALLOBJ = 34,       // gWJNewShapeSlot=traced CallObject shared shape, gWJNewHeap -> CallObject::createWithShape (Object); MNewCallObject
+  WJH_CTORALLOC = 35,        // gWJNewShapeSlot=&shapeptr -> PlainObject::createWithShape -> gWJScratch[kWJThisSlot]; GC-correct ctor `this` alloc (CTORINLINE isolation/fix)
+  WJH_DBGPTR = 36,           // DEBUG (GECKO_WJ_VGDBG): gWJHelpObj=payload, gWJHelpVal=val bits -> log the value the valNursery check is about to chunk-load
 };
 
 // Allocation-helper staging (non-GC ints; the shape is in the traced shape pool).
@@ -104,6 +110,11 @@ extern uint32_t gWJNewObjPcOff;   // bytecode offset of the JSOp::NewObject
 // loads + tests this; it's 0 except during an incremental GC slice. Set by
 // WJWarpCompile. Single-zone shell, so one address suffices.
 extern uintptr_t gWJMarkBarrierAddr;
+// Baked &storeBuffer.bufferWholeCell.last_ (single-zone shell). The inline whole-
+// cell post-write barrier reads it to dedup consecutive same-cell stores (the
+// `last_` check in StoreBuffer::WholeCellBuffer::put) WITHOUT a wjhelp boundary
+// crossing -- splay does 1.43M such barriers, most redundant within a tree op.
+extern uintptr_t gWJWholeCellLastAddr;
 
 // Inline nursery bump-allocation params (baked in WJWarpCompile; read by the
 // backend at emit time, emitted as immediates). gWJNurseryPosAddr = address of
@@ -214,6 +225,18 @@ extern uint32_t gWJCallFn[];      // cached callee obj ptr (0 = empty)
 extern int32_t gWJCallTblIdx[];   // callee's shared-table index
 // Next unused call-site id (process-global; assigned at compile).
 uint32_t WJAllocCallSite();
+
+// Per-construct-site monomorphic inline cache (GECKO_WJ_CTORINLINE). See
+// WasmJitRuntime.cpp. Lets the backend inline `new X()` (alloc + ctor call) and
+// skip the WJH_CONSTRUCT boundary for monomorphic construct sites.
+static constexpr uint32_t kWJCtorSites = 16384;
+extern uint32_t gWJCtorCallee[];  // cached ctor fn ptr (0 = empty)
+extern uint32_t gWJCtorShape[];   // cached `this` SharedShape ptr
+extern uint32_t gWJCtorSize[];    // total nursery cell size
+extern uint32_t gWJCtorNfixed[];  // fixed slot count
+extern int32_t gWJCtorTblIdx[];   // ctor table index (-1 = none)
+extern uint32_t gWJCtorEnv[];     // ctor environment ptr
+uint32_t WJAllocCtorSite();
 
 // Inline property-load IC (for MegamorphicLoadSlot / named GetPropertyCache of
 // own data properties). Mirrors the call IC: per-site cached (receiver shape,

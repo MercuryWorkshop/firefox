@@ -270,6 +270,8 @@ int WJWarpCompile(JSContext* cx, JSScript* script, uint32_t* nargsOut,
   // barrier fast path (single-zone shell -> one stable address).
   js::wasm::gWJMarkBarrierAddr =
       uintptr_t(script->zone()->addressOfNeedsMarkingBarrier());
+  js::wasm::gWJWholeCellLastAddr =
+      uintptr_t(cx->runtime()->gc.storeBuffer().addressOfLastBufferedWholeCell());
   js::wasm::gWJGlobalLexEnvVal =
       JS::ObjectValue(cx->global()->lexicalEnvironment()).asRawBits();
   // Inline nursery bump-allocation params (for the GECKO_WJ_INLINEALLOC path):

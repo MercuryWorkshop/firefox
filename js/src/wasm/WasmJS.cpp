@@ -1981,6 +1981,14 @@ int wasmhost_guest_mem_objid();
 int wasmhost_guest_mem_shared();
 int wasmhost_jit_table();
 int wasmhost_jit_table_set(int handle, int idx);
+int wasmhost_export_register_obj(int handle, int index);
+int wasmhost_table_length(int objId);
+int wasmhost_table_grow(int objId, int delta);
+double wasmhost_table_call(int objId, int idx, const double* args, int argc);
+int wasmhost_table_set_null(int objId, int idx);
+int wasmhost_table_set_hostfn(int objId, int idx, int srcHandle, int srcIdx);
+double wasmhost_global_get(int objId);
+int wasmhost_global_set(int objId, double val);
 }
 
 // ===========================================================================
@@ -2003,6 +2011,8 @@ static JSObject* HostBuildInstanceObject(JSContext* cx, int handle);
 static int HostObjId(JSContext* cx, HandleObject obj);
 static JSObject* HostMakeMemoryWrapper(JSContext* cx, int objId, bool shared);
 static JSObject* HostMakeObjIdWrapper(JSContext* cx, int objId);
+static JSObject* HostMakeTableWrapper(JSContext* cx, int objId);
+static JSObject* HostMakeGlobalWrapper(JSContext* cx, int objId);
 #endif
 
 /* static */
@@ -5584,8 +5594,9 @@ static bool HostBindAndInstantiate(JSContext* cx, int handle,
   return true;
 }
 
-// Build an `{ exports }` instance object for an instantiated `handle`. Export
-// functions are bridged; other export kinds (memory/table/global) are null.
+// Build an `{ exports }` instance object for an instantiated `handle`. Function,
+// memory, table, and global exports are all bridged to guest-side wrappers; only
+// unrecognized kinds (e.g. tags) remain null.
 static JSObject* HostBuildInstanceObject(JSContext* cx, int handle) {
   RootedObject exportsObj(cx, JS_NewPlainObject(cx));
   if (!exportsObj) {
@@ -5621,6 +5632,28 @@ static JSObject* HostBuildInstanceObject(JSContext* cx, int handle) {
           return nullptr;
         }
         exportVal.setObject(*memWrap);
+      } else {
+        exportVal.setNull();
+      }
+    } else if (ekind == 1) {  // table: register + build a get/set/grow wrapper
+      int objId = wasmhost_export_register_obj(handle, i);
+      if (objId >= 0) {
+        RootedObject tableWrap(cx, HostMakeTableWrapper(cx, objId));
+        if (!tableWrap) {
+          return nullptr;
+        }
+        exportVal.setObject(*tableWrap);
+      } else {
+        exportVal.setNull();
+      }
+    } else if (ekind == 3) {  // global: register + build a value accessor wrapper
+      int objId = wasmhost_export_register_obj(handle, i);
+      if (objId >= 0) {
+        RootedObject globalWrap(cx, HostMakeGlobalWrapper(cx, objId));
+        if (!globalWrap) {
+          return nullptr;
+        }
+        exportVal.setObject(*globalWrap);
       } else {
         exportVal.setNull();
       }
@@ -5735,8 +5768,9 @@ static JSObject* HostMakeMemoryWrapper(JSContext* cx, int objId, bool shared) {
   return wrapper;
 }
 
-// Minimal guest wrapper carrying just the host obj id (table/global): enough to
-// bind them as imports; JS-side element/value access is not bridged yet.
+// Minimal guest wrapper carrying just the host obj id: enough to bind a host
+// table/global as an *import* (it just needs its obj id). For *exports* the guest
+// gets a functional wrapper instead (HostMakeTableWrapper / HostMakeGlobalWrapper).
 static JSObject* HostMakeObjIdWrapper(JSContext* cx, int objId) {
   RootedObject wrapper(cx, JS_NewPlainObject(cx));
   if (!wrapper) {
@@ -5744,6 +5778,244 @@ static JSObject* HostMakeObjIdWrapper(JSContext* cx, int objId) {
   }
   RootedValue idv(cx, Int32Value(objId));
   if (!JS_DefineProperty(cx, wrapper, kHostObjIdProp, idv, 0)) {
+    return nullptr;
+  }
+  return wrapper;
+}
+
+// Per-index cache of get() trampolines on a table wrapper, so repeated
+// `table.get(i)` returns the same function object (emscripten's getWasmTableEntry
+// asserts reference equality) and so `table.set(i, fn)` can make get() return the
+// guest fn that was set.
+static const char* const kHostTableCacheProp = "__wasmHostTblCache";
+
+// Native backing for a table slot returned by table.get(idx): extended slot 0 is
+// the host table's obj id, slot 1 the index. Calls route to wasmhost_table_call,
+// which invokes the host table entry. Numeric args/results round-trip through
+// double (i64/ref not handled), as with bridged export functions.
+static bool WasmHostTableCall(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  JSFunction& callee = args.callee().as<JSFunction>();
+  int objId = callee.getExtendedSlot(0).toInt32();
+  int idx = callee.getExtendedSlot(1).toInt32();
+  double buf[64];
+  unsigned n = args.length() > 64 ? 64 : args.length();
+  for (unsigned i = 0; i < n; i++) {
+    double d;
+    if (!ToNumber(cx, args[i], &d)) {
+      return false;
+    }
+    buf[i] = d;
+  }
+  double r = wasmhost_table_call(objId, idx, buf, int(n));
+  args.rval().setNumber(r);
+  return true;
+}
+
+static JSObject* HostTableCacheObject(JSContext* cx, HandleObject self) {
+  RootedValue cacheV(cx);
+  if (!JS_GetProperty(cx, self, kHostTableCacheProp, &cacheV)) {
+    return nullptr;
+  }
+  if (cacheV.isObject()) {
+    return &cacheV.toObject();
+  }
+  RootedObject cache(cx, JS_NewPlainObject(cx));
+  if (!cache) {
+    return nullptr;
+  }
+  RootedValue cv(cx, ObjectValue(*cache));
+  if (!JS_DefineProperty(cx, self, kHostTableCacheProp, cv, 0)) {
+    return nullptr;
+  }
+  return cache;
+}
+
+static bool WasmHostTableGet(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  if (!args.thisv().isObject()) {
+    args.rval().setNull();
+    return true;
+  }
+  RootedObject self(cx, &args.thisv().toObject());
+  int objId = HostObjId(cx, self);
+  double dv;
+  if (!ToNumber(cx, args.get(0), &dv)) {
+    return false;
+  }
+  int32_t idx = int32_t(dv);
+  RootedObject cache(cx, HostTableCacheObject(cx, self));
+  if (!cache) {
+    return false;
+  }
+  RootedValue cached(cx);
+  if (!JS_GetElement(cx, cache, uint32_t(idx), &cached)) {
+    return false;
+  }
+  if (cached.isObject()) {
+    args.rval().set(cached);
+    return true;
+  }
+  Rooted<JSAtom*> noName(cx, nullptr);
+  Rooted<JSFunction*> fn(
+      cx, NewNativeFunction(cx, WasmHostTableCall, 0, noName,
+                            gc::AllocKind::FUNCTION_EXTENDED));
+  if (!fn) {
+    return false;
+  }
+  fn->setExtendedSlot(0, Int32Value(objId));
+  fn->setExtendedSlot(1, Int32Value(idx));
+  RootedValue fnv(cx, ObjectValue(*fn));
+  if (!JS_SetElement(cx, cache, uint32_t(idx), fnv)) {
+    return false;
+  }
+  args.rval().set(fnv);
+  return true;
+}
+
+static bool WasmHostTableSet(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  if (!args.thisv().isObject()) {
+    args.rval().setUndefined();
+    return true;
+  }
+  RootedObject self(cx, &args.thisv().toObject());
+  int objId = HostObjId(cx, self);
+  double dv;
+  if (!ToNumber(cx, args.get(0), &dv)) {
+    return false;
+  }
+  int32_t idx = int32_t(dv);
+  RootedValue fnVal(cx, args.get(1));
+  // A bridged host export (our WasmHostExportCall native) IS a real host wasm
+  // function with a concrete type -- put it straight into the host table so
+  // call_indirect type-checks. (emscripten addFunction / wasm-bindgen closures set
+  // exactly these typed wrappers; an untyped JS shim would trap call_indirect with
+  // "function signature mismatch".)
+  if (fnVal.isObject() && fnVal.toObject().is<JSFunction>() &&
+      fnVal.toObject().as<JSFunction>().maybeNative() == WasmHostExportCall) {
+    JSFunction& srcFn = fnVal.toObject().as<JSFunction>();
+    int srcHandle = srcFn.getExtendedSlot(0).toInt32();
+    int srcIdx = srcFn.getExtendedSlot(1).toInt32();
+    if (wasmhost_table_set_hostfn(objId, idx, srcHandle, srcIdx) == 0) {
+      RootedObject cache(cx, HostTableCacheObject(cx, self));
+      if (!cache || !JS_SetElement(cx, cache, uint32_t(idx), fnVal)) {
+        return false;
+      }
+      args.rval().setUndefined();
+      return true;
+    }
+  }
+  if (fnVal.isNull()) {
+    wasmhost_table_set_null(objId, idx);
+    args.rval().setUndefined();
+    return true;
+  }
+  // A funcref table can only hold a wasm function or null. A plain JS function is
+  // rejected (TypeError) exactly as the real WebAssembly.Table.set does -- it has no
+  // concrete wasm type, so an untyped wrapper would trap call_indirect ("function
+  // signature mismatch"). Throwing here is what makes emscripten's addFunction catch
+  // the TypeError and fall back to convertJsFunctionToWasm (a typed wrapper module,
+  // instantiated through this passthrough -> a bridged export handled above).
+  JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr, JSMSG_NOT_FUNCTION,
+                            "WebAssembly.Table.set value");
+  return false;
+}
+
+static bool WasmHostTableGrow(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  if (!args.thisv().isObject()) {
+    args.rval().setInt32(-1);
+    return true;
+  }
+  RootedObject self(cx, &args.thisv().toObject());
+  int objId = HostObjId(cx, self);
+  double dv;
+  if (!ToNumber(cx, args.get(0), &dv)) {
+    return false;
+  }
+  args.rval().setInt32(wasmhost_table_grow(objId, int(dv)));
+  return true;
+}
+
+static bool WasmHostTableLengthGetter(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  if (!args.thisv().isObject()) {
+    args.rval().setInt32(0);
+    return true;
+  }
+  RootedObject self(cx, &args.thisv().toObject());
+  args.rval().setInt32(wasmhost_table_length(HostObjId(cx, self)));
+  return true;
+}
+
+static bool WasmHostGlobalValueGetter(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  if (!args.thisv().isObject()) {
+    args.rval().setUndefined();
+    return true;
+  }
+  RootedObject self(cx, &args.thisv().toObject());
+  args.rval().setNumber(wasmhost_global_get(HostObjId(cx, self)));
+  return true;
+}
+
+static bool WasmHostGlobalValueSetter(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  if (!args.thisv().isObject()) {
+    args.rval().setUndefined();
+    return true;
+  }
+  RootedObject self(cx, &args.thisv().toObject());
+  double d;
+  if (!ToNumber(cx, args.get(0), &d)) {
+    return false;
+  }
+  wasmhost_global_set(HostObjId(cx, self), d);
+  args.rval().setUndefined();
+  return true;
+}
+
+// Guest WebAssembly.Table-like wrapper for an existing host table `objId`:
+// get/set/grow methods + a length getter route to the host table via the bridge.
+// Backs emscripten's getWasmTableEntry / addFunction on a passthrough module.
+static JSObject* HostMakeTableWrapper(JSContext* cx, int objId) {
+  RootedObject wrapper(cx, JS_NewPlainObject(cx));
+  if (!wrapper) {
+    return nullptr;
+  }
+  RootedValue idv(cx, Int32Value(objId));
+  if (!JS_DefineProperty(cx, wrapper, kHostObjIdProp, idv, 0)) {
+    return nullptr;
+  }
+  if (!JS_DefineFunction(cx, wrapper, "get", WasmHostTableGet, 1,
+                         JSPROP_ENUMERATE) ||
+      !JS_DefineFunction(cx, wrapper, "set", WasmHostTableSet, 2,
+                         JSPROP_ENUMERATE) ||
+      !JS_DefineFunction(cx, wrapper, "grow", WasmHostTableGrow, 1,
+                         JSPROP_ENUMERATE)) {
+    return nullptr;
+  }
+  if (!JS_DefineProperty(cx, wrapper, "length", WasmHostTableLengthGetter,
+                         nullptr, JSPROP_ENUMERATE)) {
+    return nullptr;
+  }
+  return wrapper;
+}
+
+// Guest WebAssembly.Global-like wrapper for an existing host global `objId`: a
+// `value` accessor routes to the host global (i64 is lossy; see the js-library).
+static JSObject* HostMakeGlobalWrapper(JSContext* cx, int objId) {
+  RootedObject wrapper(cx, JS_NewPlainObject(cx));
+  if (!wrapper) {
+    return nullptr;
+  }
+  RootedValue idv(cx, Int32Value(objId));
+  if (!JS_DefineProperty(cx, wrapper, kHostObjIdProp, idv, 0)) {
+    return nullptr;
+  }
+  if (!JS_DefineProperty(cx, wrapper, "value", WasmHostGlobalValueGetter,
+                         WasmHostGlobalValueSetter, JSPROP_ENUMERATE)) {
     return nullptr;
   }
   return wrapper;

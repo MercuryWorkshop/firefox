@@ -97,7 +97,16 @@ enum WJHelpKind : int {
   WJH_NEWCALLOBJ = 34,       // gWJNewShapeSlot=traced CallObject shared shape, gWJNewHeap -> CallObject::createWithShape (Object); MNewCallObject
   WJH_CTORALLOC = 35,        // gWJNewShapeSlot=&shapeptr -> PlainObject::createWithShape -> gWJScratch[kWJThisSlot]; GC-correct ctor `this` alloc (CTORINLINE isolation/fix)
   WJH_DBGPTR = 36,           // DEBUG (GECKO_WJ_VGDBG): gWJHelpObj=payload, gWJHelpVal=val bits -> log the value the valNursery check is about to chunk-load
+  WJH_LINEARIZE = 37,        // scratch[0]=string(value) -> str->ensureLinear (flatten rope) (String); MLinearizeString / MLinearizeForCharAccess
+  WJH_STROP = 38,            // generic string method, site=sub-op: 0 includes,1 indexOf,2 lastIndexOf,3 startsWith,4 endsWith (str,search -> Bool/Int32); 5 substr (str,begin,len -> String); 6 toLowerCase,7 toUpperCase (str -> String)
+  WJH_TYPEOF = 39,           // scratch[0]=value -> js::TypeOfValue (Int32 JSType); MTypeOf
+  WJH_ISARRAY = 40,          // scratch[0]=value -> Array.isArray (Boolean); MIsArray
+  WJH_REGEXPCLONE = 41,      // scratch[0]=source RegExpObject(boxed) -> CloneRegExpObject (Object); MRegExp
+  WJH_TYPEOFNAME = 42,       // scratch[0]=int32 JSType -> TypeName atom (String); MTypeOfName
+  WJH_NEWLEXENV = 43,        // gWJLexScope=LexicalScope* (raw) -> BlockLexicalEnvironmentObject::createWithoutEnclosing (Object); MNewLexicalEnvironmentObject
 };
+// MNewLexicalEnvironmentObject: the LexicalScope* baked from the template object.
+extern uint32_t gWJLexScope;
 
 // Allocation-helper staging (non-GC ints; the shape is in the traced shape pool).
 extern uint32_t gWJNewShapeSlot;  // gWJShapePool index of the template shape

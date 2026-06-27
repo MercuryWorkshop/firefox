@@ -33,6 +33,7 @@
 #include "vm/NativeObject.h"
 #include "vm/PlainObject.h"  // js::PlainObject::createWithShape
 #include "vm/EnvironmentObject.h"  // js::CallObject::createWithShape
+#include "vm/Scope.h"  // js::LexicalScope (WJH_NEWLEXENV)
 #include "vm/Interpreter.h"  // SetObjectElement, InstanceofOperator, LessThan, ...
 #include "vm/EqualityOperations.h"  // LooselyEqual, StrictlyEqual
 #include "vm/Stack.h"  // ConstructArgs
@@ -41,7 +42,8 @@
 #include "gc/Tracer.h"   // js::TraceRoot
 #include "vm/Shape.h"    // js::Shape
 #include "vm/ArrayObject.h"   // js::ArrayObject
-#include "builtin/Array.h"    // js::SetLengthProperty
+#include "builtin/Array.h"    // js::SetLengthProperty, IsArrayFromJit
+#include "vm/RegExpObject.h"  // js::CloneRegExpObject (MRegExp)
 #include "builtin/String.h"   // js::StringFromCharCode
 #include "vm/StringType.h"    // js::ToString
 
@@ -127,6 +129,7 @@ uint32_t gWJNewAux = 0;            // alloc helper: allocKind or array length
 uint32_t gWJNewHeap = 0;           // alloc helper: gc::Heap
 uint32_t gWJNewObjScript = 0;      // WJH_NEWOBJECT: JSScript* (raw)
 uint32_t gWJNewObjPcOff = 0;       // WJH_NEWOBJECT: bytecode offset
+uint32_t gWJLexScope = 0;          // WJH_NEWLEXENV: LexicalScope* (raw)
 uintptr_t gWJNurseryPosAddr = 0;   // address of zone nursery position_ (inline alloc)
 uintptr_t gWJObjHeaderWord = 0;    // NurseryCellHeader value for Object cells
 uintptr_t gWJStringHeaderWord = 0; // NurseryCellHeader value for String cells (rope-concat inline)
@@ -332,7 +335,16 @@ bool js::wasm::WasmJitObserveCall(JSScript* script) {
   static int sEnabled = -1;
   if (sEnabled < 0) sEnabled = getenv("GECKO_NOWASMJIT") ? 0 : 1;
   if (!sEnabled) return false;
-  if (!script->function() || script->isModule() || script->length() > 4096) {
+  // Max compilable bytecode length. Big functions (uBlock's parseNetPattern/validateNet/
+  // analyze_re ~4.4-6KB) were never attempted at the old hard 4096. Configurable so we can
+  // compile them. GECKO_WJ_MAXLEN overrides.
+  static uint32_t sMaxLen = 0;
+  if (!sMaxLen) {
+    const char* s = getenv("GECKO_WJ_MAXLEN");
+    sMaxLen = s ? uint32_t(atoi(s)) : 4096;
+    if (!sMaxLen) sMaxLen = 4096;
+  }
+  if (!script->function() || script->isModule() || script->length() > sMaxLen) {
     static int pblWho = getenv("GECKO_WJ_PBLWHO") ? 1 : 0;
     if (pblWho && script->function() && !script->isModule() &&
         script->length() > 4096) {
@@ -1096,13 +1108,18 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
       // PBL falls back to the canonical func->environment().
       RootedObject enclosingEnv(
           cx, reinterpret_cast<JSObject*>(uintptr_t(gWJResumeEnclosingEnv[f])));
-      // NOTE: keepFrameEnv (reuse the captured gWJResumeEnvPtr as the frame env,
-      // skipping InitFunctionEnvironmentObjects) was tried to fix navier's mid-
-      // function-deopt checksum bug, but gWJResumeEnvPtr is unreliable (wrong for
-      // earley -> regressed it, no help for navier). Disabled; use the enclosing-
-      // env + Init path (earley correct). navier's resume bug needs gWJResumeEnvPtr
-      // to be made reliable first (EmitObjPtr of the RP env operand). See memory.
-      bool keepFrameEnv = false;
+      // keepFrameEnv: reuse the spilled gWJResumeEnvPtr (the RP environmentChain
+      // operand) as the resumed frame's env, skipping the Init path that rebuilds
+      // ONLY the function-level env. The spilled env is the TRUE current env chain at
+      // the deopt pc -- including any PUSHED LEXICAL/BLOCK envs (NewLexicalEnvironment
+      // Object) AND the function's own CallObject. The Init path discards pushed
+      // lexical envs, so a deopt INSIDE a `let`/`const` block then resumes with the
+      // wrong scope -> aliased-var reads return garbage ("undefined is not a function"
+      // in ubo's CSS generator: a closure read its sibling `let` from the function env
+      // instead of the block env). Now that the spill is EmitObjPtr(RP env operand)
+      // (reliable), keep it whenever present. GECKO_WJ_NOKEEPENV reverts to Init.
+      static int noKeepEnv = getenv("GECKO_WJ_NOKEEPENV") ? 1 : 0;
+      bool keepFrameEnv = !noKeepEnv && (gWJResumeEnvPtr[f] != 0);
       uint32_t nargs = gWJResumeNArgs[f];
       uint32_t nlocals = gWJResumeNLocals[f];
       uint32_t depth = gWJResumeStackDepth[f];
@@ -1309,10 +1326,14 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
     }
     RootedValue rval(cx);
     gWJSlowCalls++;
-    if (getenv("GECKO_WJ_CALLPROF") && (gWJSlowCalls % 500000) == 0)
+    // getenv is a hot-path tax here (~1.2M slow calls in ubo); cache all debug gates
+    // in statics ([[wjhelp-getenv-tax]]).
+    static int callProf = getenv("GECKO_WJ_CALLPROF") ? 1 : 0;
+    static int callTrace = getenv("GECKO_WJ_CALLTRACE") ? atoi(getenv("GECKO_WJ_CALLTRACE")) : -1;
+    static int calleeDbg = getenv("GECKO_WJ_CALLEEDBG") ? 1 : 0;
+    if (callProf && (gWJSlowCalls % 500000) == 0)
       fprintf(stderr, "[wb-slowcall] %llu\n", (unsigned long long)gWJSlowCalls);
-    if (getenv("GECKO_WJ_CALLTRACE") &&
-        uint32_t(siteF) == uint32_t(atoi(getenv("GECKO_WJ_CALLTRACE")))) {
+    if (callTrace >= 0 && uint32_t(siteF) == uint32_t(callTrace)) {
       static int n = 0;
       if (n++ < 60) {
         const char* cls = callee.isObject() ? callee.toObject().getClass()->name
@@ -1324,7 +1345,7 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
                 (unsigned long long)gWJScratch[js::wasm::kWJThisSlot]);
       }
     }
-    if (getenv("GECKO_WJ_CALLEEDBG")) {
+    if (calleeDbg) {
       bool ok = callee.isObject() && callee.toObject().is<JSFunction>();
       if (!ok) {
         const char* cls = callee.isObject() ? callee.toObject().getClass()->name : "?";
@@ -1633,9 +1654,70 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
   if (kind == js::wasm::WJH_CHARCODEAT) {
     RootedString str(cx, JS::Value::fromRawBits(gWJScratch[0]).toString());
     int32_t index = JS::Value::fromRawBits(gWJScratch[1]).toInt32();
+    // siteF==1: MCharCodeAtOrNegative -> -1 for an out-of-bounds index (no throw).
+    if (int(siteF) == 1 && (index < 0 || uint32_t(index) >= str->length())) {
+      gWJScratch[js::wasm::kWJResultSlot] = JS::Int32Value(-1).asRawBits();
+      return 0.0;
+    }
     uint32_t code = 0;
     if (!js::jit::CharCodeAt(cx, str, index, &code)) return 1.0;
     gWJScratch[js::wasm::kWJResultSlot] = JS::Int32Value(int32_t(code)).asRawBits();
+    return 0.0;
+  }
+  if (kind == js::wasm::WJH_TYPEOF) {
+    // MTypeOf -> the JSType enum as an Int32 (a separate MTypeOfName maps it to a
+    // string). TypeOfValue is pure (no GC/throw).
+    JSType t = js::TypeOfValue(JS::Value::fromRawBits(gWJScratch[0]));
+    gWJScratch[js::wasm::kWJResultSlot] = JS::Int32Value(int32_t(t)).asRawBits();
+    return 0.0;
+  }
+  if (kind == js::wasm::WJH_ISARRAY) {
+    // MIsArray (Array.isArray): non-object -> false; else IsArrayFromJit (handles
+    // proxies-to-array correctly).
+    RootedValue v(cx, JS::Value::fromRawBits(gWJScratch[0]));
+    bool isArr = false;
+    if (v.isObject()) {
+      RootedObject obj(cx, &v.toObject());
+      if (!js::IsArrayFromJit(cx, obj, &isArr)) return 1.0;
+    }
+    gWJScratch[js::wasm::kWJResultSlot] = JS::BooleanValue(isArr).asRawBits();
+    return 0.0;
+  }
+  if (kind == js::wasm::WJH_TYPEOFNAME) {
+    // MTypeOfName: map the JSType enum int -> its permanent typeof-name atom.
+    JSType t = JSType(JS::Value::fromRawBits(gWJScratch[0]).toInt32());
+    JSString* s = js::TypeName(t, cx->names());
+    gWJScratch[js::wasm::kWJResultSlot] = JS::StringValue(s).asRawBits();
+    return 0.0;
+  }
+  if (kind == js::wasm::WJH_REGEXPCLONE) {
+    // MRegExp: clone the (baked) source RegExpObject for a regex literal.
+    Rooted<js::RegExpObject*> src(
+        cx, &JS::Value::fromRawBits(gWJScratch[0]).toObject().as<js::RegExpObject>());
+    JSObject* clone = js::CloneRegExpObject(cx, src);
+    if (!clone) return 1.0;
+    gWJScratch[js::wasm::kWJResultSlot] = JS::ObjectValue(*clone).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_NEWLEXENV) {
+    // MNewLexicalEnvironmentObject: allocate a block lexical env from the baked scope.
+    Rooted<js::LexicalScope*> scope(
+        cx, reinterpret_cast<js::LexicalScope*>(uintptr_t(gWJLexScope)));
+    static int lexDbg = getenv("GECKO_WJ_LEXDBG") ? 1 : 0;  // cached: hot-path getenv tax
+    JSObject* env = js::BlockLexicalEnvironmentObject::createWithoutEnclosing(cx, scope);
+    if (!env) return 1.0;
+    if (lexDbg) {
+      js::NativeObject* nenv = &env->as<js::NativeObject>();
+      fprintf(stderr,
+              "[wj-lexenv] env=%p nfixed=%u slotSpan=%u numDynamic=%u "
+              "scopeEnvShapeSlotSpan=%u scopeNfixed=%u\n",
+              (void*)env, nenv->numFixedSlots(), nenv->slotSpan(),
+              nenv->numDynamicSlots(),
+              scope->environmentShape()->slotSpan(),
+              scope->environmentShape()->numFixedSlots());
+    }
+    gWJScratch[js::wasm::kWJResultSlot] = JS::ObjectValue(*env).asRawBits();
     return 0.0;
   }
 
@@ -1666,6 +1748,50 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
     JSString* s = js::ToString<js::CanGC>(cx, in);
     if (!s) return 1.0;
     gWJScratch[js::wasm::kWJResultSlot] = JS::StringValue(s).asRawBits();
+    return 0.0;
+  }
+  if (kind == js::wasm::WJH_LINEARIZE) {
+    // MLinearizeString / MLinearizeForCharAccess: flatten a rope to a linear string
+    // (valid for any char index). scratch[0] = the string value.
+    RootedString s(cx, JS::Value::fromRawBits(gWJScratch[0]).toString());
+    JSLinearString* lin = s->ensureLinear(cx);
+    if (!lin) return 1.0;
+    gWJScratch[js::wasm::kWJResultSlot] = JS::StringValue(lin).asRawBits();
+    return 0.0;
+  }
+  if (kind == js::wasm::WJH_STROP) {
+    // Generic string method, dispatched on siteF (the sub-op). scratch[0]=string,
+    // scratch[1]=search/begin, scratch[2]=length.
+    int sub = int(siteF);
+    RootedString s(cx, JS::Value::fromRawBits(gWJScratch[0]).toString());
+    if (sub <= 4) {
+      RootedString search(cx, JS::Value::fromRawBits(gWJScratch[1]).toString());
+      if (sub == 1 || sub == 2) {
+        int32_t r = 0;
+        bool ok = (sub == 1) ? js::StringIndexOf(cx, s, search, &r)
+                             : js::StringLastIndexOf(cx, s, search, &r);
+        if (!ok) return 1.0;
+        gWJScratch[js::wasm::kWJResultSlot] = JS::Int32Value(r).asRawBits();
+      } else {
+        bool r = false;
+        bool ok = (sub == 0)   ? js::StringIncludes(cx, s, search, &r)
+                  : (sub == 3) ? js::StringStartsWith(cx, s, search, &r)
+                               : js::StringEndsWith(cx, s, search, &r);
+        if (!ok) return 1.0;
+        gWJScratch[js::wasm::kWJResultSlot] = JS::BooleanValue(r).asRawBits();
+      }
+    } else if (sub == 5) {
+      int32_t begin = JS::Value::fromRawBits(gWJScratch[1]).toInt32();
+      int32_t len = JS::Value::fromRawBits(gWJScratch[2]).toInt32();
+      JSString* r = js::SubstringKernel(cx, s, begin, len);
+      if (!r) return 1.0;
+      gWJScratch[js::wasm::kWJResultSlot] = JS::StringValue(r).asRawBits();
+    } else {
+      JSLinearString* r =
+          (sub == 6) ? js::StringToLowerCase(cx, s) : js::StringToUpperCase(cx, s);
+      if (!r) return 1.0;
+      gWJScratch[js::wasm::kWJResultSlot] = JS::StringValue(r).asRawBits();
+    }
     return 0.0;
   }
 

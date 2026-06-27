@@ -51,6 +51,8 @@
 #include "vm/JSObject-inl.h"     // GuessArrayGCKind (array inline alloc)
 #include "vm/StringType.h"       // JSString/JSRope/JSFatInlineString (inline rope concat)
 #include "vm/StringFlags.h"      // StringFlags::ropeFlags / CharEncoding (inline rope concat)
+#include "vm/EnvironmentObject.h"  // BlockLexicalEnvironmentObject (NewLexicalEnvironmentObject)
+#include "vm/Scope.h"            // LexicalScope (NewLexicalEnvironmentObject)
 #include "wasm/WasmBinary.h"
 
 using namespace js;
@@ -3157,6 +3159,15 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
         }
         if (conv) return GetOp(e, be, g->object());
       }
+      // Shape-hybrid (read-only, default-on): a GuardShapeList whose uses are all
+      // convertible slot READS becomes a passthrough -- the reads self-guard via a
+      // by-name EmitPropIC that handles ANY shape, so NO deopt on a receiver outside
+      // the captured 4-shape set. Kills polymorphic-receiver GuardShapeList storms
+      // (ubo's astFromTemplate: 175k deopts on >4 AST-template subtypes). Mirrors the
+      // GuardShape hybrid above. (Store-feeding lists still deopt -> store-hybrid.)
+      if (WJShapeHybrid() && WJMegaConvertibleGuard(ins, /*allowStores=*/false)) {
+        return GetOp(e, be, g->object());
+      }
       int32_t objLocal = be.local(g->object());
       if (objLocal < 0) return false;
       uint32_t shapeOff = uint32_t(offsetof(JS::shadow::Object, shape));
@@ -3328,6 +3339,63 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
       if (!EmitDeopt(e, be)) return false;
       if (!e.writeOp(Op::End)) return false;
       return GetLocal(e, uint32_t(l));  // passthrough the (null/undefined) value
+    }
+    case MDefinition::Opcode::GuardArrayIsPacked: {
+      if (getenv("GECKO_WJ_NOGUARDPACKED")) return false;
+      // Deopt unless the array's dense elements are PACKED (no holes); passthrough the
+      // array object. Ion: load elements header flags, check NON_PACKED bit clear.
+      int32_t l = be.local(ins->toGuardArrayIsPacked()->array());
+      if (l < 0) return false;
+      // elements = array->elements_ ; flags = elements->flags
+      if (!GetLocal(e, uint32_t(l)) || !e.writeOp(Op::I32Load) || !e.writeVarU32(2) ||
+          !e.writeVarU32(uint32_t(js::NativeObject::offsetOfElements())))
+        return false;
+      if (!e.writeOp(Op::I32Load) || !e.writeVarU32(2) ||
+          !e.writeVarU32(uint32_t(js::ObjectElements::offsetOfFlags())))
+        return false;
+      if (!e.writeOp(Op::I32Const) ||
+          !e.writeVarS32(int32_t(js::ObjectElements::NON_PACKED)) ||
+          !e.writeOp(Op::I32And))
+        return false;
+      if (!e.writeOp(Op::If) || !e.writeFixedU8(0x40)) return false;  // non-packed
+      if (!EmitDeopt(e, be)) return false;
+      if (!e.writeOp(Op::End)) return false;
+      return GetLocal(e, uint32_t(l));  // passthrough the array
+    }
+    case MDefinition::Opcode::GuardIsNotObject: {
+      if (getenv("GECKO_WJ_NOGUARDNOTOBJ")) return false;
+      // Passthrough the Value; deopt if its tag is OBJECT.
+      int32_t l = be.local(ins->getOperand(0));
+      if (l < 0) return false;
+      if (!GetLocal(e, uint32_t(l)) || !e.writeOp(Op::I64Const) ||
+          !e.writeVarS64(32) || !e.writeOp(Op::I64ShrU) ||
+          !e.writeOp(Op::I32WrapI64) || !e.writeOp(Op::I32Const) ||
+          !e.writeVarS32(int32_t(TagWord(JSVAL_TYPE_OBJECT))) || !e.writeOp(Op::I32Eq))
+        return false;
+      if (!e.writeOp(Op::If) || !e.writeFixedU8(0x40)) return false;
+      if (!EmitDeopt(e, be)) return false;
+      if (!e.writeOp(Op::End)) return false;
+      return GetLocal(e, uint32_t(l));  // passthrough Value
+    }
+    case MDefinition::Opcode::HomeObjectSuperBase: {
+      if (getenv("GECKO_WJ_HOSB_BOXHO")) {
+        // DIAGNOSTIC: box the home object DIRECTLY (skip the proto walk). super.x
+        // still resolves x via the proto chain at lookup, so this works iff
+        // HomeObject (the operand) is itself sound. Isolates ho-null vs proto-walk.
+        MDefinition* ho = ins->toHomeObjectSuperBase()->homeObject();
+        return GetOp(e, be, ho) && EmitBoxFromStack(e, MIRType::Object);
+      }
+      return false;
+    }
+    case MDefinition::Opcode::HomeObject: {
+      if (getenv("GECKO_WJ_HOMEOBJ_TRY")) {
+        MDefinition* fn = ins->toHomeObject()->function();
+        if (!GetOp(e, be, fn) || !e.writeOp(Op::I64Load) || !e.writeVarU32(3) ||
+            !e.writeVarU32(uint32_t(js::FunctionExtended::offsetOfMethodHomeObjectSlot())))
+          return false;
+        return e.writeOp(Op::I32WrapI64);
+      }
+      return false;
     }
     case MDefinition::Opcode::GuardFunctionScript: {
       // Deopt unless the function's BaseScript matches the expected one. This is
@@ -3724,6 +3792,9 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
         return WJBAIL("mega read couldn't convert (guard removed)\n");
       }
       uint32_t off = uint32_t(js::NativeObject::getFixedSlotOffset(l->slot()));
+      if (getenv("GECKO_WJ_SLOTDBG2"))
+        fprintf(stderr, "[wb-slot] LoadFixedSlot slot=%zu off=%u objOp=%s type=%d\n",
+                l->slot(), off, WJOpName(l->object()->op()), int(l->type()));
       // Read the object via GetOp (rematerializes Unbox/GuardShape from the rooted
       // source) -- a cached object local goes stale across a GC-ing call.
       if (!GetOp(e, be, l->object())) return false;
@@ -3761,6 +3832,9 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
         return WJBAIL("mega read couldn't convert (guard removed)\n");
       }
       uint32_t off = uint32_t(js::NativeObject::getFixedSlotOffset(l->slot()));
+      if (getenv("GECKO_WJ_SLOTDBG2"))
+        fprintf(stderr, "[wb-slot] LoadFixedSlotAndUnbox slot=%zu off=%u objOp=%s type=%d\n",
+                l->slot(), off, WJOpName(l->object()->op()), int(l->type()));
       if (!GetOp(e, be, l->object())) return false;  // rematerialized object
       if (!e.writeOp(Op::I64Load) || !e.writeVarU32(3) || !e.writeVarU32(off))
         return false;
@@ -3832,6 +3906,9 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
         }
       }
       uint32_t off = uint32_t(l->slot() * sizeof(JS::Value));
+      if (getenv("GECKO_WJ_SLOTDBG2"))
+        fprintf(stderr, "[wb-slot] LoadDynamicSlot slot=%u off=%u slotsOp=%s\n",
+                uint32_t(l->slot()), off, WJOpName(l->slots()->op()));
       if (!GetOp(e, be, l->slots())) return false;
       if (!e.writeOp(Op::I64Load) || !e.writeVarU32(3) || !e.writeVarU32(off))
         return false;
@@ -4222,6 +4299,134 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
       return e.writeOp(Op::I32Load) && e.writeVarU32(2) &&
              e.writeVarU32(uint32_t(JSString::offsetOfLength()));
     }
+    case MDefinition::Opcode::IsObject: {
+      // result = (typeof v is object). For a boxed Value: tag == OBJECT.
+      MDefinition* v = ins->getOperand(0);
+      MIRType t = v->type();
+      if (t == MIRType::Object) return e.writeOp(Op::I32Const) && e.writeVarS32(1);
+      if (t != MIRType::Value)
+        return e.writeOp(Op::I32Const) && e.writeVarS32(0);  // any other typed prim
+      if (!GetOp(e, be, v) || !e.writeOp(Op::I64Const) || !e.writeVarS64(32) ||
+          !e.writeOp(Op::I64ShrU) || !e.writeOp(Op::I32WrapI64) ||
+          !e.writeOp(Op::I32Const) ||
+          !e.writeVarS32(int32_t(TagWord(JSVAL_TYPE_OBJECT))) ||
+          !e.writeOp(Op::I32Eq))
+        return false;
+      return true;
+    }
+    case MDefinition::Opcode::IsNullOrUndefined: {
+      MDefinition* v = ins->getOperand(0);
+      MIRType t = v->type();
+      if (t == MIRType::Null || t == MIRType::Undefined)
+        return e.writeOp(Op::I32Const) && e.writeVarS32(1);
+      if (t != MIRType::Value)
+        return e.writeOp(Op::I32Const) && e.writeVarS32(0);
+      // (tag == NULL) | (tag == UNDEFINED)
+      auto tag = [&]() -> bool {
+        return GetOp(e, be, v) && e.writeOp(Op::I64Const) && e.writeVarS64(32) &&
+               e.writeOp(Op::I64ShrU) && e.writeOp(Op::I32WrapI64);
+      };
+      if (!tag() || !e.writeOp(Op::I32Const) ||
+          !e.writeVarS32(int32_t(TagWord(JSVAL_TYPE_NULL))) || !e.writeOp(Op::I32Eq))
+        return false;
+      if (!tag() || !e.writeOp(Op::I32Const) ||
+          !e.writeVarS32(int32_t(TagWord(JSVAL_TYPE_UNDEFINED))) ||
+          !e.writeOp(Op::I32Eq) || !e.writeOp(Op::I32Or))
+        return false;
+      return true;
+    }
+    case MDefinition::Opcode::CheckObjCoercible: {
+      // Passthrough the value; THROW (deopt to PBL, which re-runs + throws the proper
+      // TypeError) if it is null/undefined. Result type is Value (boxed i64).
+      MDefinition* v = ins->getOperand(0);
+      if (v->type() != MIRType::Value) return false;  // typed-operand cases rare; bail
+      int32_t l = be.local(v);
+      if (l < 0) return false;
+      auto tag = [&]() -> bool {
+        return GetLocal(e, uint32_t(l)) && e.writeOp(Op::I64Const) &&
+               e.writeVarS64(32) && e.writeOp(Op::I64ShrU) && e.writeOp(Op::I32WrapI64);
+      };
+      if (!tag() || !e.writeOp(Op::I32Const) ||
+          !e.writeVarS32(int32_t(TagWord(JSVAL_TYPE_NULL))) || !e.writeOp(Op::I32Eq))
+        return false;
+      if (!tag() || !e.writeOp(Op::I32Const) ||
+          !e.writeVarS32(int32_t(TagWord(JSVAL_TYPE_UNDEFINED))) ||
+          !e.writeOp(Op::I32Eq) || !e.writeOp(Op::I32Or))
+        return false;
+      if (!e.writeOp(Op::If) || !e.writeFixedU8(0x40)) return false;
+      if (!EmitDeopt(e, be)) return false;
+      if (!e.writeOp(Op::End)) return false;
+      return GetLocal(e, uint32_t(l));  // passthrough (i64)
+    }
+    case MDefinition::Opcode::LexicalCheck: {
+      // Passthrough; THROW (deopt -> PBL throws ReferenceError) on the TDZ sentinel
+      // MagicValue(JS_UNINITIALIZED_LEXICAL). Result type Value.
+      MDefinition* v = ins->getOperand(0);
+      if (v->type() != MIRType::Value) return false;
+      int32_t l = be.local(v);
+      if (l < 0) return false;
+      int64_t magic = int64_t(JS::MagicValue(JS_UNINITIALIZED_LEXICAL).asRawBits());
+      if (!GetLocal(e, uint32_t(l)) || !e.writeOp(Op::I64Const) ||
+          !e.writeVarS64(magic) || !e.writeOp(Op::I64Eq))
+        return false;
+      if (!e.writeOp(Op::If) || !e.writeFixedU8(0x40)) return false;
+      if (!EmitDeopt(e, be)) return false;
+      if (!e.writeOp(Op::End)) return false;
+      return GetLocal(e, uint32_t(l));  // passthrough (i64)
+    }
+    case MDefinition::Opcode::HasClass: {
+      // result = (obj->clasp == class_). obj is MIRType::Object (i32 ptr).
+      MDefinition* obj = ins->getOperand(0);
+      if (obj->type() != MIRType::Object) return false;
+      const JSClass* clasp = ins->toHasClass()->getClass();
+      uint32_t shapeOff = uint32_t(offsetof(JS::shadow::Object, shape));
+      if (!GetOp(e, be, obj) || !e.writeOp(Op::I32Load) || !e.writeVarU32(2) ||
+          !e.writeVarU32(shapeOff) || !e.writeOp(Op::I32Load) || !e.writeVarU32(2) ||
+          !e.writeVarU32(uint32_t(js::Shape::offsetOfBaseShape())) ||
+          !e.writeOp(Op::I32Load) || !e.writeVarU32(2) ||
+          !e.writeVarU32(uint32_t(js::BaseShape::offsetOfClasp())))
+        return false;
+      return e.writeOp(Op::I32Const) &&
+             e.writeVarS32(int32_t(uintptr_t(clasp))) && e.writeOp(Op::I32Eq);
+    }
+    case MDefinition::Opcode::GuardToClass: {
+      // Passthrough obj; deopt if obj->clasp != class_. Result type Object (i32 ptr).
+      MDefinition* obj = ins->getOperand(0);
+      if (obj->type() != MIRType::Object) return false;
+      const JSClass* clasp = ins->toGuardToClass()->getClass();
+      uint32_t shapeOff = uint32_t(offsetof(JS::shadow::Object, shape));
+      if (!GetOp(e, be, obj) || !e.writeOp(Op::I32Load) || !e.writeVarU32(2) ||
+          !e.writeVarU32(shapeOff) || !e.writeOp(Op::I32Load) || !e.writeVarU32(2) ||
+          !e.writeVarU32(uint32_t(js::Shape::offsetOfBaseShape())) ||
+          !e.writeOp(Op::I32Load) || !e.writeVarU32(2) ||
+          !e.writeVarU32(uint32_t(js::BaseShape::offsetOfClasp())))
+        return false;
+      if (!e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(uintptr_t(clasp))) ||
+          !e.writeOp(Op::I32Ne))
+        return false;
+      if (!e.writeOp(Op::If) || !e.writeFixedU8(0x40)) return false;
+      if (!EmitDeopt(e, be)) return false;
+      if (!e.writeOp(Op::End)) return false;
+      return GetOp(e, be, obj);  // passthrough (i32 ptr)
+    }
+    case MDefinition::Opcode::CallGetIntrinsicValue: {
+      // Self-hosted intrinsic, realm-stable (created once, cached on the global).
+      // Resolve at COMPILE time + bake the boxed result into the traced const pool
+      // (no helper, no per-call cost -- mirrors Ion folding it to a constant).
+      JSContext* cx = js::TlsContext.get();
+      if (!cx) return false;
+      JS::Rooted<js::GlobalObject*> global(cx, cx->global());
+      JS::Rooted<js::PropertyName*> name(cx, ins->toCallGetIntrinsicValue()->name());
+      JS::RootedValue val(cx);
+      if (!js::GlobalObject::getIntrinsicValue(cx, global, name, &val)) {
+        cx->clearPendingException();
+        return false;  // unresolved -> bail (rare)
+      }
+      uintptr_t slot = WJInternConstant(val.get().asRawBits());
+      if (!slot) return false;
+      return e.writeOp(Op::I32Const) && e.writeVarS32(int32_t(slot)) &&
+             e.writeOp(Op::I64Load) && e.writeVarU32(3) && e.writeVarU32(0);
+    }
     case MDefinition::Opcode::GetFrameArgument: {
       // Register ABI: actual arg i is wasm param 2+i (boxed Value). Only static,
       // in-range indices map; anything else bails.
@@ -4424,6 +4629,100 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
       if (!EmitStageScratch(e, be, ins->getOperand(0), 0)) return false;
       if (!EmitHelperCallResult(e, be, ins, WJH_TOSTRING, 0)) return false;
       return EmitHelperResultAsType(e, be, ins->type());  // String
+    }
+    case MDefinition::Opcode::LinearizeString:
+    case MDefinition::Opcode::LinearizeForCharAccess: {
+      // Flatten a (possibly rope) string to a linear one for char access. The index
+      // operand of LinearizeForCharAccess is a hint; a full ensureLinear is valid for
+      // any index, so both map to WJH_LINEARIZE(string). Unblocks uBlock's
+      // parseNetPattern/validateNet tokenizers (which scan chars).
+      if (!EmitStageScratch(e, be, ins->getOperand(0), 0)) return false;  // string
+      if (!EmitHelperCallResult(e, be, ins, WJH_LINEARIZE, 0)) return false;
+      return EmitHelperResultAsType(e, be, ins->type());  // String
+    }
+    case MDefinition::Opcode::StringIncludes:
+    case MDefinition::Opcode::StringIndexOf:
+    case MDefinition::Opcode::StringLastIndexOf:
+    case MDefinition::Opcode::StringStartsWith:
+    case MDefinition::Opcode::StringEndsWith: {
+      // (string, searchString) -> Bool/Int32 via WJH_STROP. uBlock parser tokenizers.
+      uint32_t sub = ins->op() == MDefinition::Opcode::StringIncludes      ? 0
+                     : ins->op() == MDefinition::Opcode::StringIndexOf     ? 1
+                     : ins->op() == MDefinition::Opcode::StringLastIndexOf ? 2
+                     : ins->op() == MDefinition::Opcode::StringStartsWith  ? 3
+                                                                           : 4;
+      if (!EmitStageScratch(e, be, ins->getOperand(0), 0)) return false;
+      if (!EmitStageScratch(e, be, ins->getOperand(1), 1)) return false;
+      if (!EmitHelperCallResult(e, be, ins, WJH_STROP, sub)) return false;
+      return EmitHelperResultAsType(e, be, ins->type());  // Boolean / Int32
+    }
+    case MDefinition::Opcode::Substr: {
+      // (string, begin, length) -> String via WJH_STROP sub=5.
+      if (!EmitStageScratch(e, be, ins->getOperand(0), 0)) return false;
+      if (!EmitStageScratch(e, be, ins->getOperand(1), 1)) return false;
+      if (!EmitStageScratch(e, be, ins->getOperand(2), 2)) return false;
+      if (!EmitHelperCallResult(e, be, ins, WJH_STROP, 5)) return false;
+      return EmitHelperResultAsType(e, be, ins->type());  // String
+    }
+    case MDefinition::Opcode::StringConvertCase: {
+      // toLowerCase/toUpperCase -> String via WJH_STROP sub=6/7.
+      uint32_t sub =
+          ins->toStringConvertCase()->stringCase() == jit::StringCase::Lower ? 6 : 7;
+      if (!EmitStageScratch(e, be, ins->getOperand(0), 0)) return false;
+      if (!EmitHelperCallResult(e, be, ins, WJH_STROP, sub)) return false;
+      return EmitHelperResultAsType(e, be, ins->type());  // String
+    }
+    case MDefinition::Opcode::CharCodeAtOrNegative: {
+      // Like CharCodeAt but -1 for out-of-bounds (no throw). WJH_CHARCODEAT site=1.
+      if (!EmitStageScratch(e, be, ins->getOperand(0), 0)) return false;  // string
+      if (!EmitStageScratch(e, be, ins->getOperand(1), 1)) return false;  // index
+      if (!EmitHelperCallResult(e, be, ins, WJH_CHARCODEAT, 1)) return false;
+      return EmitHelperResultAsType(e, be, ins->type());  // Int32
+    }
+    case MDefinition::Opcode::TypeOf: {
+      // -> JSType enum (Int32). MTypeOfName maps it to a string separately.
+      if (!EmitStageScratch(e, be, ins->getOperand(0), 0)) return false;
+      if (!EmitHelperCallResult(e, be, ins, WJH_TYPEOF, 0)) return false;
+      return EmitHelperResultAsType(e, be, ins->type());  // Int32
+    }
+    case MDefinition::Opcode::IsArray: {
+      // Array.isArray (handles proxies via the helper). -> Boolean.
+      if (!EmitStageScratch(e, be, ins->getOperand(0), 0)) return false;
+      if (!EmitHelperCallResult(e, be, ins, WJH_ISARRAY, 0)) return false;
+      return EmitHelperResultAsType(e, be, ins->type());  // Boolean
+    }
+    case MDefinition::Opcode::RegExp: {
+      // Regex literal: clone the baked source RegExpObject. The source is a compile-
+      // time argument -> bake it (boxed) into scratch[0] via the const pool, clone.
+      JSObject* src = ins->toRegExp()->source();
+      if (!src) return false;
+      if (!EmitStageConstBoxed(e, be, JS::ObjectValue(*src).asRawBits(), 0))
+        return false;
+      if (!EmitHelperCallResult(e, be, ins, WJH_REGEXPCLONE, 0)) return false;
+      return EmitHelperResultAsType(e, be, ins->type());  // Object
+    }
+    case MDefinition::Opcode::TypeOfName: {
+      // JSType int -> typeof-name string (permanent atom). MTypeOf companion.
+      if (!EmitStageScratch(e, be, ins->getOperand(0), 0)) return false;
+      if (!EmitHelperCallResult(e, be, ins, WJH_TYPEOFNAME, 0)) return false;
+      return EmitHelperResultAsType(e, be, ins->type());  // String
+    }
+    case MDefinition::Opcode::NegativeToNaN: {
+      // input<0 ? NaN : Double(input), boxed as a double Value. (CharCodeAtOrNegative
+      // companion: -1 -> NaN for String.prototype.charCodeAt out-of-bounds.)
+      MDefinition* in = ins->getOperand(0);
+      if (!GetOp(e, be, in) || !e.writeOp(Op::I32Const) || !e.writeVarS32(0) ||
+          !e.writeOp(Op::I32LtS))
+        return false;
+      if (!e.writeOp(Op::If) || !e.writeFixedU8(0x7C)) return false;  // -> f64
+      if (!e.writeOp(Op::I64Const) ||
+          !e.writeVarS64(int64_t(0x7FF8000000000000ULL)) ||
+          !e.writeOp(Op::F64ReinterpretI64))
+        return false;  // canonical NaN
+      if (!e.writeOp(Op::Else)) return false;
+      if (!GetOp(e, be, in) || !e.writeOp(Op::F64ConvertI32S)) return false;
+      if (!e.writeOp(Op::End)) return false;
+      return EmitBoxFromStack(e, MIRType::Double);  // -> boxed Value (i64)
     }
     case MDefinition::Opcode::BinaryCache: {
       // The JSOp comes from the node's RESUME POINT pc (matching Ion's
@@ -5103,6 +5402,26 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
                    JS::MagicValue(JS_IS_CONSTRUCTING).asRawBits()));
       }
       return EmitHelperCallResult(e, be, ins, WJH_CREATETHIS, 0);
+    }
+    case MDefinition::Opcode::NewLexicalEnvironmentObject: {
+      if (getenv("GECKO_WJ_NONEWLEXENV")) return false;
+      // Block-scope env alloc. The template object is a compile-time constant
+      // BlockLexicalEnvironmentObject; bake its LexicalScope* and call the helper
+      // (BlockLexicalEnvironmentObject::createWithoutEnclosing). uBlock's parser has
+      // many block-scoped (let/const) functions -- this was the dominant ubo bail.
+      MDefinition* tmpl = ins->toNewLexicalEnvironmentObject()->templateObj();
+      if (!tmpl->isConstant() || tmpl->toConstant()->type() != MIRType::Object)
+        return false;
+      JSObject* tobj = &tmpl->toConstant()->toObject();
+      js::Scope* scope = &tobj->as<js::BlockLexicalEnvironmentObject>().scope();
+      if (!e.writeOp(Op::I32Const) ||
+          !e.writeVarS32(int32_t(uintptr_t(&js::wasm::gWJLexScope))) ||
+          !e.writeOp(Op::I32Const) ||
+          !e.writeVarS32(int32_t(uintptr_t(static_cast<void*>(scope)))) ||
+          !e.writeOp(Op::I32Store) || !e.writeVarU32(2) || !e.writeVarU32(0))
+        return false;
+      if (!EmitHelperCallResult(e, be, ins, WJH_NEWLEXENV, 0)) return false;
+      return EmitHelperResultAsType(e, be, ins->type());  // Object
     }
     case MDefinition::Opcode::NewObject:
     case MDefinition::Opcode::NewPlainObject:
@@ -6615,6 +6934,9 @@ static EffectKind EmitEffect(Encoder& e, WJBackend& be, MInstruction* ins) {
         static int noInline = getenv("GECKO_WJ_NOINLINESETSLOT") ? 1 : 0;
         if (!noInline) {
           uint32_t off = uint32_t(js::NativeObject::getFixedSlotOffset(s->slot()));
+          if (getenv("GECKO_WJ_SLOTDBG2"))
+            fprintf(stderr, "[wb-slot] StoreFixedSlot(barrier) slot=%zu off=%u objOp=%s\n",
+                    s->slot(), off, WJOpName(s->object()->op()));
           if (!EmitGuardedValuePreBarrier(e, be, [&]() {
                 return GetOp(e, be, s->object()) && e.writeOp(Op::I64Load) &&
                        e.writeVarU32(3) && e.writeVarU32(off);
@@ -6883,10 +7205,14 @@ static EffectKind EmitEffect(Encoder& e, WJBackend& be, MInstruction* ins) {
       // or over a hole. In-bounds dense store stays in JIT (gbemu's pre-sized
       // this.memory[addr]=v writes + the memoryRead/WriteJumpCompile cache tables);
       // the grow/append/hole case (index >= initializedLength) deopts to PBL which
-      // grows the array correctly. An object VALUE would need a (currently unreliable)
-      // post-write barrier, so bail those to PBL -- gbemu's element values are numbers.
+      // grows the array correctly. A GC-pointer VALUE gets the proven-sound inline
+      // post-write barrier after the store (objTenured-only gate, same path as
+      // StoreFixedSlot's default HYBSTORE) -- uBlock's parser stores AST-node objects
+      // into dense arrays, so bailing them all to PBL was the dominant StoreElementHole
+      // cost. gbemu's element values are numbers (barrier skipped via WJTypeMaybeGC).
       MStoreElementHole* s = ins->toStoreElementHole();
-      if (WJTypeMaybeGC(s->value()->type())) return EffectKind::Fail;
+      if (getenv("GECKO_WJ_NOSEHGC") && WJTypeMaybeGC(s->value()->type()))
+        return EffectKind::Fail;
       int32_t idx = be.local(s->index());
       if (idx < 0) return EffectKind::Fail;
       // bounds guard: deopt unless (uint32)index < (uint32)initializedLength
@@ -6907,6 +7233,12 @@ static EffectKind EmitEffect(Encoder& e, WJBackend& be, MInstruction* ins) {
         return EffectKind::Fail;
       if (!EmitSpillValue(e, be, s->value())) return EffectKind::Fail;
       if (!e.writeOp(Op::I64Store) || !e.writeVarU32(3) || !e.writeVarU32(0))
+        return EffectKind::Fail;
+      // GC-pointer value: post-write barrier on the array object (tenured-array <-
+      // nursery-node edge). objTenured-only gate, proven sound. Skip if Warp already
+      // emitted a PostWriteBarrier node for this object (dedup).
+      if (WJTypeMaybeGC(s->value()->type()) && !WJHasPostBarrierNode(s->object()) &&
+          !EmitForcePostBarrier(e, be, s->object()))
         return EffectKind::Fail;
       return EffectKind::Emitted;
     }
@@ -7286,13 +7618,16 @@ static bool EmitBlockBody(Encoder& e, WJBackend& be, MBasicBlock* b) {
       // No value local: either a no-op typed node or an effectful one.
       EffectKind k = EmitEffect(e, be, ins);
       if (k == EffectKind::Fail) {
-        fprintf(stderr, "[wb-be] unsupported effect op#%u\n", unsigned(ins->op()));
+        fprintf(stderr, "[wb-be] unsupported effect op#%u %s\n",
+                unsigned(ins->op()), WJOpName(ins->op()));
         return false;
       }
     } else {
       if (!EmitValue(e, be, ins)) {
-        fprintf(stderr, "[wb-be] unsupported value op#%u type%u\n",
-                unsigned(ins->op()), unsigned(ins->type()));
+        JSScript* bs = be.info ? be.info->script() : nullptr;
+        fprintf(stderr, "[wb-be] unsupported value op#%u %s type%u fn@%u\n",
+                unsigned(ins->op()), WJOpName(ins->op()), unsigned(ins->type()),
+                bs ? unsigned(bs->lineno()) : 0u);
         return false;
       }
       if (!e.writeOp(Op::LocalSet) || !e.writeVarU32(uint32_t(l))) {

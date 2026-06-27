@@ -931,6 +931,7 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
   if (kind == js::wasm::WJH_RESUME) {
     gWJDidResume = true;  // this JIT entry deopted (safety-valve accounting)
     if(getenv("GECKO_DEBUG_JIT")){static uint64_t c=0; if((++c%5000)==0) fprintf(stderr,"[wb-resume-count] %llu\n",(unsigned long long)c);}
+    if(getenv("GECKO_WJ_SITEHIST")){static uint64_t c=0; if((++c%200000)==0) js::wasm::WJDumpDeoptSiteHist();}
     if (getenv("GECKO_WJ_DEOPTHIST")) {
       static uint64_t dc = 0;
       uint64_t dmod = getenv("GECKO_WJ_DEOPTHISTN") ? 10 : 200;
@@ -1162,7 +1163,12 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
         auto it = gEntries->find(cs);
         if (it != gEntries->end() &&
             it->second.state == WJEntry::State::Compiled &&
-            argc >= it->second.nargs) {
+            argc >= it->second.nargs &&
+            it->second.handle >= 0) {  // invalid handle (post-valve reset / failed
+                                       // recompile) -> fall to slow JS::Call, never
+                                       // call_indirect a -1 handle (wasm "null function
+                                       // or signature mismatch" trap). Matches the ctor
+                                       // fast paths (handle>=0 guarded).
           WJEntry& ce = it->second;
           // Fill the caller's call-site IC so the next call goes direct
           // (call_indirect) with no helper hop. site is wjhelp's 2nd arg.
@@ -1207,6 +1213,8 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
     }
     RootedValue rval(cx);
     gWJSlowCalls++;
+    if (getenv("GECKO_WJ_CALLPROF") && (gWJSlowCalls % 500000) == 0)
+      fprintf(stderr, "[wb-slowcall] %llu\n", (unsigned long long)gWJSlowCalls);
     if (!JS::Call(cx, thisv, callee, JS::HandleValueArray(argv), &rval)) {
       return 1.0;  // callee threw -> propagate
     }

@@ -59,6 +59,53 @@ static inline bool WJDbg() {
 }
 #define WJBAIL(...) (WJDbg() ? (fprintf(stderr, "[wb-bail] " __VA_ARGS__), false) : false)
 
+// GECKO_WJ_SITEHIST: definitive per-deopt-site attribution. Each EmitDeopt gets a
+// unique global id whose metadata (MIR curOp, emit __LINE__, JS script:line) is
+// recorded at compile time; the emitted deopt path bumps gWJSiteHits[id] at
+// runtime. atexit dumps the hottest sites with full attribution -- unlike the
+// gWJDeoptByOp histogram this is never confused by inlined/rematerialized guards.
+static constexpr uint32_t kWJMaxDSites = 8192;
+uint32_t gWJSiteHits[kWJMaxDSites] = {0};
+static uint16_t gWJSiteOp[kWJMaxDSites] = {0};
+static uint32_t gWJSiteLine[kWJMaxDSites] = {0};
+static const char* gWJSiteFile[kWJMaxDSites] = {nullptr};
+static uint32_t gWJSiteJsLine[kWJMaxDSites] = {0};
+static uint32_t gWJSiteCounter = 0;
+static int gWJSiteHistEnabled = -1;
+// GECKO_WJ_BCRT: idx/len/hits at a taken bounds-check deopt (store-only, no
+// helper call -- safe to emit). Dumped by WJDumpSiteHist.
+int32_t gWJBCDbgIdx = -1;
+int32_t gWJBCDbgLen = -1;
+uint32_t gWJBCDbgHits = 0;
+// GECKO_WJ_GSRT: actual obj->shape_ vs expected (pool) at a taken GuardShape deopt.
+uint32_t gWJGSActual = 0;
+uint32_t gWJGSExpect = 0;
+uint32_t gWJGSHits = 0;
+// Current function's script start-line, set per-instruction; used by GECKO_WJ_HYBSTORELINE
+// to scope the WIP store-hybrid to ONE function while bisecting the correctness bug.
+uint32_t gWJCurScriptLine = 0;
+void WJDumpSiteHist() {
+  // Top sites by runtime hit count.
+  uint32_t n = gWJSiteCounter < kWJMaxDSites ? gWJSiteCounter : kWJMaxDSites;
+  for (uint32_t rank = 0; rank < 30; rank++) {
+    uint32_t best = 0, bestIdx = n;
+    for (uint32_t i = 0; i < n; i++) {
+      if (gWJSiteHits[i] > best) { best = gWJSiteHits[i]; bestIdx = i; }
+    }
+    if (bestIdx == n || best == 0) break;
+    fprintf(stderr,
+            "[wj-sitehist] hits=%u op#%u line=%u %s:%u\n", best,
+            gWJSiteOp[bestIdx], gWJSiteLine[bestIdx],
+            gWJSiteFile[bestIdx] ? gWJSiteFile[bestIdx] : "?",
+            gWJSiteJsLine[bestIdx]);
+    gWJSiteHits[bestIdx] = 0;  // consume so next rank finds the next-highest
+  }
+  fprintf(stderr, "[wj-bcdbg] hits=%u lastIdx=%d lastLen=%d\n", gWJBCDbgHits,
+          gWJBCDbgIdx, gWJBCDbgLen);
+  fprintf(stderr, "[wj-gsdbg] hits=%u actualShape=%#x expectShape=%#x\n",
+          gWJGSHits, gWJGSActual, gWJGSExpect);
+}
+
 // Bail-reason tally: under GECKO_WJ_BAILDBG, count how often each MIR opcode
 // forces a function to stay in PBL, and dump the histogram at process exit.
 static const char* WJOpName(jit::MDefinition::Opcode op) {
@@ -499,16 +546,78 @@ static bool EmitDoubleGuardLocal(Encoder& e, WJBackend& be, uint32_t localIdx) {
   return e.writeOp(Op::End);
 }
 
+// Relaxed fallible Int32 unbox (GECKO_WJ_NORELAXINT32 disables). Leaves the i32
+// on the stack. Fast path: tag==INT32 -> payload. Else an integer-valued double
+// in int32 range converts inline -- Ion parity for int32/double-unstable fields
+// (e.g. gbemu flag/counter values stored as 1.0): without this, every such read
+// tag-guard-deopts to PBL (the gbemu deopt storm). Non-number, non-integer, NaN,
+// or out-of-range values still deopt (correct: a genuine Int32 type violation).
+// localIdx is NOT mutated (it may be a live operand local, not scratch).
+static bool EmitRelaxedInt32Unbox(Encoder& e, WJBackend& be, uint32_t localIdx) {
+  const uint8_t kI32bt = 0x7F;
+  auto tagOf = [&]() -> bool {
+    return GetLocal(e, localIdx) && e.writeOp(Op::I64Const) && e.writeVarS64(32) &&
+           e.writeOp(Op::I64ShrU) && e.writeOp(Op::I32WrapI64);
+  };
+  // tag == INT32 ?
+  if (!tagOf() || !e.writeOp(Op::I32Const) ||
+      !e.writeVarS32(int32_t(TagWord(JSVAL_TYPE_INT32))) || !e.writeOp(Op::I32Eq))
+    return false;
+  if (!e.writeOp(Op::If) || !e.writeFixedU8(kI32bt)) return false;
+  if (!GetLocal(e, localIdx) || !e.writeOp(Op::I32WrapI64)) return false;  // payload
+  if (!e.writeOp(Op::Else)) return false;
+  // not int32: deopt if not a double (tag > CLEAR => some other non-number type)
+  if (!tagOf() || !e.writeOp(Op::I32Const) ||
+      !e.writeVarS32(int32_t(uint32_t(JSVAL_TAG_CLEAR))) || !e.writeOp(Op::I32GtU))
+    return false;
+  if (!e.writeOp(Op::If) || !e.writeFixedU8(0x40)) return false;
+  {
+    uint32_t saved = be.deoptExtraNest;
+    be.deoptExtraNest = saved + 1;  // deopt sits 2 scopes deep (else-arm + this if)
+    bool ok = EmitDeopt(e, be);
+    be.deoptExtraNest = saved;
+    if (!ok) return false;
+  }
+  if (!e.writeOp(Op::End)) return false;
+  // it's a double: deopt unless convert(truncsat(d)) == d (exact int in int32 range)
+  if (!GetLocal(e, localIdx) || !e.writeOp(Op::F64ReinterpretI64) ||
+      !e.writeOp(MiscOp::I32TruncSatF64S) || !e.writeOp(Op::F64ConvertI32S))
+    return false;
+  if (!GetLocal(e, localIdx) || !e.writeOp(Op::F64ReinterpretI64)) return false;
+  if (!e.writeOp(Op::F64Ne)) return false;
+  if (!e.writeOp(Op::If) || !e.writeFixedU8(0x40)) return false;
+  {
+    uint32_t saved = be.deoptExtraNest;
+    be.deoptExtraNest = saved + 1;
+    bool ok = EmitDeopt(e, be);
+    be.deoptExtraNest = saved;
+    if (!ok) return false;
+  }
+  if (!e.writeOp(Op::End)) return false;
+  // exact integer double: result = truncsat(d)
+  if (!GetLocal(e, localIdx) || !e.writeOp(Op::F64ReinterpretI64) ||
+      !e.writeOp(MiscOp::I32TruncSatF64S))
+    return false;
+  return e.writeOp(Op::End);  // end if/else -> leaves i32
+}
+
 // Unbox the i64 JS::Value held in `localIdx` to `out`, leaving the unboxed value
 // on the stack. Fallible mode emits a tag guard (deopt on mismatch).
 static bool EmitUnboxLocal(Encoder& e, WJBackend& be, uint32_t localIdx,
                            MIRType out, bool fallible) {
   switch (out) {
-    case MIRType::Int32:
+    case MIRType::Int32: {
+      // Opt-in (GECKO_WJ_RELAXINT32): sound Ion-parity (integer-double -> int32
+      // inline vs deopt) but measured neutral/slightly-negative so far (gbemu's
+      // storm is NOT int32 tag guards -- see [[gbemu-deopt-storm]]). Kept for the
+      // workload with genuine int32/double instability on a hot int32 unbox.
+      static int relaxInt32 = getenv("GECKO_WJ_RELAXINT32") ? 1 : 0;
+      if (fallible && relaxInt32) return EmitRelaxedInt32Unbox(e, be, localIdx);
       if (fallible &&
           !EmitTagGuardLocal(e, be, localIdx, TagWord(JSVAL_TYPE_INT32)))
         return false;
       return GetLocal(e, localIdx) && e.writeOp(Op::I32WrapI64);
+    }
     case MIRType::Boolean:
       if (fallible &&
           !EmitTagGuardLocal(e, be, localIdx, TagWord(JSVAL_TYPE_BOOLEAN)))
@@ -1095,6 +1204,28 @@ static bool EmitDeoptResume(Encoder& e, WJBackend& be) {
            e.writeOp(Op::Return);
   }
   if (!be.curRp || !be.info) return WJBAIL("resume: no rp/info\n");
+  // Per-deopt-site hit counter (GECKO_WJ_SITEHIST). Emitted HERE -- at the guard,
+  // before the OOL/inline split -- so deoptCallLine (set by the EmitDeopt macro
+  // just now) is correct for ALL deopts, not just inline ones. The reliable
+  // attribution is (line=guard, JS script:line); curOp may be stale.
+  if (gWJSiteHistEnabled < 0) {
+    gWJSiteHistEnabled = getenv("GECKO_WJ_SITEHIST") ? 1 : 0;
+  }
+  if (gWJSiteHistEnabled && gWJSiteCounter < kWJMaxDSites) {
+    uint32_t gid = gWJSiteCounter++;
+    gWJSiteOp[gid] = uint16_t(be.curOp);
+    gWJSiteLine[gid] = be.deoptCallLine;
+    JSScript* ss = be.info ? be.info->script() : nullptr;
+    gWJSiteFile[gid] = ss && ss->filename() ? ss->filename() : "?";
+    gWJSiteJsLine[gid] = ss ? uint32_t(ss->lineno()) : 0;
+    uintptr_t h = uintptr_t(static_cast<void*>(&gWJSiteHits[gid]));
+    if (!e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(h)) ||
+        !e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(h)) ||
+        !e.writeOp(Op::I32Load) || !e.writeVarU32(2) || !e.writeVarU32(0) ||
+        !e.writeOp(Op::I32Const) || !e.writeVarS32(1) || !e.writeOp(Op::I32Add) ||
+        !e.writeOp(Op::I32Store) || !e.writeVarU32(2) || !e.writeVarU32(0))
+      return false;
+  }
   if (be.oolDeopt && be.inDispatchBody) {
     uint32_t site = uint32_t(be.deoptSites.size());
     // Shadow-eligible iff single-frame (the hot-path shadow only mirrors frame 0).
@@ -2006,7 +2137,55 @@ static bool WJIsShapeGuard(jit::MDefinition* g) {
 // deopts on a shape outside its captured set, which was deltablue 414's storm)
 // and reads become self-guarding multi-shape EmitPropIC. Shape-AGNOSTIC uses
 // (calls/compares/returns) are fine unguarded.
-static bool WJMegaConvertibleGuard(jit::MDefinition* gg) {
+// Shape-guard PropIC hybrid (GECKO_WJ_SHAPEHYBRID): convert a convertible
+// GuardShape + fixed/dynamic-slot read into a self-guarding baked PropIC (bare
+// shape-compare fast path + ways/helper fallback, NO deopt) -- independent of the
+// global forceMega (which also reroutes stores/GSLTO and regresses richards). The
+// EmitPropIC baked fast path is ~the cost of a plain guarded read, so always-match
+// receivers don't slow down, while a stale/dictionary/poly shape that today
+// deopts-forever-to-PBL (gbemu's GuardShape storm) stays in JIT. See
+// [[gbemu-deopt-storm]].
+static bool WJShapeHybrid() {
+  static int v = getenv("GECKO_WJ_NOSHAPEHYBRID") ? 0 : 1;  // default-ON (validated)
+  return v;
+}
+static bool WJValueMightBeGCThing(jit::MIRType t);  // fwd (defined near EmitForcePostBarrier)
+// A slot store is HYBRID-convertible (passthrough guard + store-IC, no deopt) iff
+// its stored value can never be a GC pointer: a non-GC value (Int32/Double/Boolean
+// /etc.) needs NO post-write barrier, so the store-IC's plain I64Store is correct
+// and provably sidesteps the store-IC's historical GC barrier/staleness crash
+// (which only bites GC-pointer stores). forceMega (allowStores) takes any store.
+static bool WJStoreHybridOK(jit::MDefinition* storeVal, bool allowStores) {
+  if (allowStores) return true;  // forceMega
+  // Hybrid store-IC is WIP: converting store-feeding guards currently breaks gbemu
+  // correctness (ERR=Gameboy) -- NOT the store mechanics (generic-helper stores also
+  // ERR) but something the extra guard-passthrough exposes (read PropIC key, or a
+  // mis-classified shape-agnostic use). Gated default-OFF (GECKO_WJ_HYBSTORE) so the
+  // default build stays the correct read-only hybrid while this is debugged.
+  static int hybStore = getenv("GECKO_WJ_HYBSTORE") ? 1 : 0;
+  if (!hybStore || WJValueMightBeGCThing(storeVal->type())) return false;
+  // Bisection: GECKO_WJ_HYBSTORELINE=<n> scopes conversion to the function whose
+  // script starts at line n (0/unset = all functions).
+  static int onlyLine = getenv("GECKO_WJ_HYBSTORELINE")
+                            ? atoi(getenv("GECKO_WJ_HYBSTORELINE")) : 0;
+  if (onlyLine && gWJCurScriptLine != uint32_t(onlyLine)) return false;
+  static int minLine = getenv("GECKO_WJ_HYBSTOREMIN")
+                           ? atoi(getenv("GECKO_WJ_HYBSTOREMIN")) : 0;
+  static int maxLine = getenv("GECKO_WJ_HYBSTOREMAX")
+                           ? atoi(getenv("GECKO_WJ_HYBSTOREMAX")) : 0;
+  if (minLine && int(gWJCurScriptLine) < minLine) return false;
+  if (maxLine && int(gWJCurScriptLine) > maxLine) return false;
+  if (getenv("GECKO_WJ_HYBSTORELOG"))
+    fprintf(stderr, "[wj-hybstore] convert store in fn@line=%u valType=%s\n",
+            gWJCurScriptLine, StringFromMIRType(storeVal->type()));
+  return true;
+}
+// allowStores=false (the shape-hybrid default) makes this READ-ONLY: a guard that
+// feeds ANY slot/element store is NOT convertible, because passthrough'ing the
+// guard while the store still writes at the baked (stale-shape) offset would
+// corrupt the heap (the store mega/IC path is forceMega-gated, not hybrid). Only
+// forceMega (which DOES convert stores) passes allowStores=true.
+static bool WJMegaConvertibleGuard(jit::MDefinition* gg, bool allowStores = true) {
   using Op = jit::MDefinition::Opcode;
   js::Shape* shape = WJGuardRepShape(gg);
   if (!shape || !shape->isShared()) return false;
@@ -2028,6 +2207,7 @@ static bool WJMegaConvertibleGuard(jit::MDefinition* gg) {
       // object operand is THIS guard (operand 0), not the stored value.
       auto* s = d->toStoreFixedSlot();
       if (s->object() != gg) return false;  // gg is the stored VALUE -> bail
+      if (!WJStoreHybridOK(s->value(), allowStores)) return false;  // hybrid: non-GC only
       if (!WJDerivePropKey(shape, uint32_t(s->slot()), &k)) return false;
     } else if (op == Op::Slots) {
       // dynamic slots: every use of the Slots must be a derivable dynamic READ.
@@ -2040,18 +2220,23 @@ static bool WJMegaConvertibleGuard(jit::MDefinition* gg) {
           dynSlot = uint32_t(sd->toLoadDynamicSlot()->slot());
         else if (so == Op::LoadDynamicSlotAndUnbox)
           dynSlot = uint32_t(sd->toLoadDynamicSlotAndUnbox()->slot());
-        else if (so == Op::StoreDynamicSlot && getenv("GECKO_WJ_MEGADYNSTORE")) {
+        else if (so == Op::StoreDynamicSlot) {
           // dynamic-slot store: converts to a self-guarding store IC (re-checks
           // shape, looks up the per-shape slot offset, helper-falls-back on miss --
           // EmitPropStoreIC handles dynamic slots via the tagged-offset low bit).
           // This is gbemu's dominant deopt source: GuardShape -> Slots ->
-          // StoreDynamicSlot (obj.field = v on out-of-line slots). d (the Slots
+          // StoreDynamicSlot (obj.field = v on out-of-line slots, e.g.
+          // computeAudioChannels' channel counters). forceMega: MEGADYNSTORE-gated
+          // (any value); hybrid: non-GC value only (no barrier needed). d (the Slots
           // node) must be the store's `slots` operand, not the stored value.
           auto* st = sd->toStoreDynamicSlot();
+          bool ok = allowStores ? (getenv("GECKO_WJ_MEGADYNSTORE") != nullptr)
+                                : WJStoreHybridOK(st->value(), /*allowStores=*/false);
+          if (!ok) return false;
           if (st->slots() != d) return false;
           dynSlot = uint32_t(st->slot());
         } else
-          return false;  // dynamic store (gate off) / other -> keep guard
+          return false;  // other use -> keep guard
         if (!WJDerivePropKey(shape, nfixed + dynSlot, &k)) return false;
       }
     } else if (op == Op::Elements && getenv("GECKO_WJ_MEGAELEM")) {
@@ -2071,7 +2256,7 @@ static bool WJMegaConvertibleGuard(jit::MDefinition* gg) {
         bool readOk = eo == Op::LoadElement || eo == Op::LoadElementAndUnbox ||
                       eo == Op::ArrayLength || eo == Op::InitializedLength ||
                       eo == Op::BoundsCheck;
-        bool storeOk = getenv("GECKO_WJ_MEGAESTORE") &&
+        bool storeOk = allowStores && getenv("GECKO_WJ_MEGAESTORE") &&
                        (eo == Op::StoreElement || eo == Op::StoreElementHole ||
                         eo == Op::StoreElementHole || eo == Op::SetInitializedLength);
         if (!readOk && !storeOk)
@@ -2108,10 +2293,12 @@ static jit::MDefinition* WJGuardObject(jit::MDefinition* g) {
 }
 // If `slots` is MSlots(obj) where obj is a mega-convertible shape guard, return
 // that guard (dynamic reads through it convert to EmitPropIC); else null.
-static jit::MDefinition* WJMegaSlotsGuard(jit::MDefinition* slots) {
+static jit::MDefinition* WJMegaSlotsGuard(jit::MDefinition* slots,
+                                          bool allowStores = true) {
   if (!slots || !slots->isSlots()) return nullptr;
   jit::MDefinition* obj = slots->getOperand(0);
-  if (!WJIsShapeGuard(obj) || !WJMegaConvertibleGuard(obj)) return nullptr;
+  if (!WJIsShapeGuard(obj) || !WJMegaConvertibleGuard(obj, allowStores))
+    return nullptr;
   return obj;
 }
 // GuardShapeListToOffset (polymorphic read where the property sits at DIFFERENT
@@ -2427,6 +2614,45 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
           fprintf(stderr, "\n");
         }
       }
+      // Shape-guard PropIC hybrid: a convertible guard becomes a no-op passthrough;
+      // its dependent fixed/dynamic-slot reads emit a self-guarding baked PropIC
+      // (handled in LoadFixedSlot etc.). No deopt on a stale/poly/dictionary shape.
+      if (WJShapeHybrid() && WJMegaConvertibleGuard(g, /*allowStores=*/false)) {
+        if (getenv("GECKO_WJ_HYBCONVLOG")) {
+          JSScript* ms = be.info ? be.info->script() : nullptr;
+          int nshapes = g->isGuardShapeList()
+              ? int([&]{ int n=0; const auto& sl=g->toGuardShapeList()->shapeList()->shapes();
+                         for(size_t i=0;i<4;i++) if(sl[i]) n++; return n; }())
+              : (g->isGuardShape() ? 1 : -1);
+          fprintf(stderr, "[wj-hybconv] passthrough guard fn@%u kind=%s nshapes=%d uses:",
+                  ms ? unsigned(ms->lineno()) : 0, WJOpName(g->op()), nshapes);
+          for (jit::MUseIterator u = g->usesBegin(); u != g->usesEnd(); u++) {
+            if (!u->consumer()->isDefinition()) { fprintf(stderr, " <rp>"); continue; }
+            jit::MDefinition* cd = u->consumer()->toDefinition();
+            fprintf(stderr, " %s", WJOpName(cd->op()));
+            if (cd->isSlots()) {
+              for (jit::MUseIterator su = cd->usesBegin(); su != cd->usesEnd(); su++)
+                if (su->consumer()->isDefinition())
+                  fprintf(stderr, "/%s",
+                          WJOpName(su->consumer()->toDefinition()->op()));
+            }
+          }
+          fprintf(stderr, "\n");
+        }
+        return GetOp(e, be, g->object());
+      }
+      if (getenv("GECKO_WJ_HYBFAIL")) {  // why a guard ISN'T convertible (still deopts)
+        js::Shape* sh = WJGuardRepShape(g);
+        JSScript* ms = be.info ? be.info->script() : nullptr;
+        fprintf(stderr, "[wj-hybfail] %s:%u shared=%d uses:",
+                ms && ms->filename() ? ms->filename() : "?",
+                ms ? unsigned(ms->lineno()) : 0, sh ? int(sh->isShared()) : -1);
+        for (jit::MUseIterator u = g->usesBegin(); u != g->usesEnd(); u++) {
+          if (!u->consumer()->isDefinition()) { fprintf(stderr, " <rp>"); continue; }
+          fprintf(stderr, " %s", WJOpName(u->consumer()->toDefinition()->op()));
+        }
+        fprintf(stderr, "\n");
+      }
       static int forceDeoptLine =
           getenv("GECKO_WJ_FORCEDEOPTLINE") ? atoi(getenv("GECKO_WJ_FORCEDEOPTLINE")) : 0;
       if (forceDeoptLine && be.info && be.info->script() &&
@@ -2472,6 +2698,27 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
         return false;  // current (relocated) expected shape from the pool
       if (!e.writeOp(Op::I32Ne)) return false;
       if (!e.writeOp(Op::If) || !e.writeFixedU8(0x40)) return false;
+      if (getenv("GECKO_WJ_GSRT")) {  // store-only: actual/expected shape at deopt
+        uintptr_t aa = uintptr_t(static_cast<void*>(&gWJGSActual));
+        uintptr_t ea = uintptr_t(static_cast<void*>(&gWJGSExpect));
+        uintptr_t ha = uintptr_t(static_cast<void*>(&gWJGSHits));
+        if (!e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(aa)) ||
+            !GetOp(e, be, g->object()) || !e.writeOp(Op::I32Load) ||
+            !e.writeVarU32(2) || !e.writeVarU32(shapeOff) ||
+            !e.writeOp(Op::I32Store) || !e.writeVarU32(2) || !e.writeVarU32(0))
+          return false;
+        if (!e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(ea)) ||
+            !e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(slot)) ||
+            !e.writeOp(Op::I32Load) || !e.writeVarU32(2) || !e.writeVarU32(0) ||
+            !e.writeOp(Op::I32Store) || !e.writeVarU32(2) || !e.writeVarU32(0))
+          return false;
+        if (!e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(ha)) ||
+            !e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(ha)) ||
+            !e.writeOp(Op::I32Load) || !e.writeVarU32(2) || !e.writeVarU32(0) ||
+            !e.writeOp(Op::I32Const) || !e.writeVarS32(1) || !e.writeOp(Op::I32Add) ||
+            !e.writeOp(Op::I32Store) || !e.writeVarU32(2) || !e.writeVarU32(0))
+          return false;
+      }
       if (!EmitDeopt(e, be)) return false;
       if (!e.writeOp(Op::End)) return false;
       return GetOp(e, be, g->object());  // result = the (current) object
@@ -2842,6 +3089,25 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
             !e.writeOp(Op::I32GeU))
           return false;
         if (!e.writeOp(Op::If) || !e.writeFixedU8(0x40)) return false;
+        if (getenv("GECKO_WJ_BCRT")) {  // store-only idx/len/hits at taken deopt
+          uintptr_t ia = uintptr_t(static_cast<void*>(&gWJBCDbgIdx));
+          uintptr_t la = uintptr_t(static_cast<void*>(&gWJBCDbgLen));
+          uintptr_t ha = uintptr_t(static_cast<void*>(&gWJBCDbgHits));
+          if (!e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(ia)) ||
+              !GetLocal(e, uint32_t(il)) || !e.writeOp(Op::I32Store) ||
+              !e.writeVarU32(2) || !e.writeVarU32(0))
+            return false;
+          if (!e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(la)) ||
+              !GetLocal(e, uint32_t(ll)) || !e.writeOp(Op::I32Store) ||
+              !e.writeVarU32(2) || !e.writeVarU32(0))
+            return false;
+          if (!e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(ha)) ||
+              !e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(ha)) ||
+              !e.writeOp(Op::I32Load) || !e.writeVarU32(2) || !e.writeVarU32(0) ||
+              !e.writeOp(Op::I32Const) || !e.writeVarS32(1) || !e.writeOp(Op::I32Add) ||
+              !e.writeOp(Op::I32Store) || !e.writeVarU32(2) || !e.writeVarU32(0))
+            return false;
+        }
         if (!EmitDeopt(e, be)) return false;
         if (!e.writeOp(Op::End)) return false;
         return GetLocal(e, uint32_t(il));
@@ -3040,13 +3306,13 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
     }
     case MDefinition::Opcode::LoadFixedSlot: {
       MLoadFixedSlot* l = ins->toLoadFixedSlot();
-      // Megamorphic recompile: this read is guarded by a mega-convertible
-      // GuardShape (now a passthrough). Re-derive the property key and emit a
-      // multi-shape EmitPropIC (shape-cache + helper fallback, NO deopt) on the
-      // real receiver -- so a polymorphic receiver (deltablue Equality vs Scale)
+      // Megamorphic recompile / shape-hybrid: this read is guarded by a mega-
+      // convertible GuardShape (now a passthrough). Re-derive the property key and
+      // emit a baked multi-shape EmitPropIC (bare shape-compare fast path + helper
+      // fallback, NO deopt) on the real receiver -- a stale/poly/dictionary shape
       // never deopts. The PropIC self-guards, so losing the GuardShape is sound.
-      if (be.forceMega && WJIsShapeGuard(l->object()) &&
-          WJMegaConvertibleGuard(l->object())) {
+      if ((be.forceMega || WJShapeHybrid()) && WJIsShapeGuard(l->object()) &&
+          WJMegaConvertibleGuard(l->object(), /*allowStores=*/be.forceMega)) {
         // Guard removed -> read MUST convert by-name or BAIL (a fixed-slot read
         // under a removed guard is a correctness bug for a polymorphic receiver).
         jit::MDefinition* gs = l->object();
@@ -3081,9 +3347,9 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
     }
     case MDefinition::Opcode::LoadFixedSlotAndUnbox: {
       MLoadFixedSlotAndUnbox* l = ins->toLoadFixedSlotAndUnbox();
-      // Megamorphic recompile (see LoadFixedSlot): self-guarding multi-shape load.
-      if (be.forceMega && WJIsShapeGuard(l->object()) &&
-          WJMegaConvertibleGuard(l->object())) {
+      // Megamorphic recompile / shape-hybrid (see LoadFixedSlot): self-guarding load.
+      if ((be.forceMega || WJShapeHybrid()) && WJIsShapeGuard(l->object()) &&
+          WJMegaConvertibleGuard(l->object(), /*allowStores=*/be.forceMega)) {
         // Guard removed -> read MUST convert by-name or BAIL (a fixed-slot read
         // under a removed guard is a correctness bug for a polymorphic receiver).
         jit::MDefinition* gs = l->object();
@@ -3112,8 +3378,8 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
     }
     case MDefinition::Opcode::LoadDynamicSlotAndUnbox: {
       MLoadDynamicSlotAndUnbox* l = ins->toLoadDynamicSlotAndUnbox();
-      if (be.forceMega) {
-        if (jit::MDefinition* gs = WJMegaSlotsGuard(l->slots())) {
+      if (be.forceMega || WJShapeHybrid()) {
+        if (jit::MDefinition* gs = WJMegaSlotsGuard(l->slots(), /*allowStores=*/be.forceMega)) {
           // The shape guard WILL be passthrough'd (removed -- WJMegaConvertibleGuard
           // matched). So this read MUST become a self-guarding by-name EmitPropIC;
           // a bare fixed-slot load would read the WRONG slot for a polymorphic
@@ -3150,8 +3416,8 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
     }
     case MDefinition::Opcode::LoadDynamicSlot: {
       MLoadDynamicSlot* l = ins->toLoadDynamicSlot();
-      if (be.forceMega) {
-        if (jit::MDefinition* gs = WJMegaSlotsGuard(l->slots())) {
+      if (be.forceMega || WJShapeHybrid()) {
+        if (jit::MDefinition* gs = WJMegaSlotsGuard(l->slots(), /*allowStores=*/be.forceMega)) {
           // Guard removed -> read MUST convert by-name or BAIL (see
           // LoadDynamicSlotAndUnbox: a fixed-slot read under a removed guard is a
           // correctness bug on a polymorphic receiver).
@@ -3710,7 +3976,11 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
       // walk (GetEnvironmentName). Result is a Value.
       if (getenv("GECKO_WJ_NOGETNAME")) return false;
       MResumePoint* rp = ins->resumePoint();
-      JSScript* s = be.info ? be.info->script() : nullptr;
+      // Use the resume point's OWN script (rp->pc() indexes that script's atoms).
+      // Under COLDCALL inlining rp may belong to an inlined callee, NOT
+      // be.info->script() -- using the caller's script indexes the wrong atom array
+      // OOB -> MOZ_CRASH at compile (earley COLDCALL crash).
+      JSScript* s = rp ? rp->block()->info().script() : nullptr;
       if (!rp || !rp->pc() || !s) return false;
       js::PropertyName* name = s->getName(rp->pc());
       if (!name) return false;
@@ -3731,7 +4001,8 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
       // node's resume-point pc (like GetNameCache).
       if (getenv("GECKO_WJ_NOBINDNAME")) return false;
       MResumePoint* rp = ins->resumePoint();
-      JSScript* s = be.info ? be.info->script() : nullptr;
+      // Resume point's own script (inlined-callee-safe; see GetNameCache above).
+      JSScript* s = rp ? rp->block()->info().script() : nullptr;
       if (!rp || !rp->pc() || !s) return false;
       js::PropertyName* name = s->getName(rp->pc());
       if (!name) return false;
@@ -5130,12 +5401,12 @@ static bool EmitForcePostBarrier(Encoder& e, WJBackend& be, jit::MDefinition* ob
   // absolute ceiling of eliminating barrier cost (is POSTBAR the bottleneck or not?).
   static int noBarrier = getenv("GECKO_WJ_NOBARRIER") ? 1 : 0;
   if (noBarrier) return true;
-  // A provably non-GC stored value (Int32/Double/Boolean/...) creates no tenured->
-  // nursery edge, so NO post-write barrier is ever needed -- skip it (sound, matches
-  // Ion). DEFAULT-ON (opt out GECKO_WJ_NOVALGUARD). The crypto OOB seen with this on
-  // is PRE-EXISTING (same ~1/10 rate with it OFF + NOCTORINLINE), not caused here.
-  static int novalGuard = getenv("GECKO_WJ_NOVALGUARD") ? 1 : 0;
-  if (!novalGuard && valDef && !WJValueMightBeGCThing(valDef->type())) return true;
+  // DEFAULT-ON (opt out GECKO_WJ_NOVALGUARD). The valNursery skip's pointer-type
+  // chunk-load is now ADDRESS-BOUNDS-GUARDED (below): it only loads chunk(value)->sb
+  // when the load address is in wasm memory, else conservatively emits the barrier.
+  // That fixed the earley trap (1/10 "out of bounds" -> 0/16). +7% earley.
+  static int vgEnv0 = getenv("GECKO_WJ_NOVALGUARD") ? 0 : 1;
+  if (vgEnv0 && valDef && !WJValueMightBeGCThing(valDef->type())) return true;
   static int noInlineBar = getenv("GECKO_WJ_NOINLINEBARRIER") ? 1 : 0;
   uintptr_t objAddr = uintptr_t(static_cast<void*>(&gWJHelpObj));
   const uint32_t chunkMaskInv = uint32_t(~js::gc::ChunkMask);
@@ -5172,12 +5443,15 @@ static bool EmitForcePostBarrier(Encoder& e, WJBackend& be, jit::MDefinition* ob
   // (its gain is from the Object-typed skips; VG_OBJONLY measured ~635 == full).
   // GECKO_WJ_VG_VALUE re-enables the (unsafe) Value tag-inspection branch for A/B.
   static int vgValue = getenv("GECKO_WJ_VG_VALUE") ? 1 : 0;
-  // DEFAULT-ON (opt out GECKO_WJ_NOVALGUARD): valNursery skip restricted to
-  // reliably-pointer MIR types (never Value -- a non-canonical NaN double's tag can
-  // collide with the GC-tag range -> chunk(garbage) trap). The crypto OOB is
-  // PRE-EXISTING (fires at the same rate with valguard OFF), not caused by this.
+  // OPT-IN: valNursery skip restricted to reliably-pointer MIR types (never Value).
+  // Still trap-prone (earley 1/10 OOB) -- see note above; opt-in pending the value-
+  // pointer staleness fix.
+  // The Object-branch chunk-load below is now bounds-guarded (trap-safe for any
+  // value-pointer incl. stale Lambda closures / mistyped speculative Unboxes), so no
+  // per-op exclusion is needed. Value-typed still excluded (its tag-inspection path
+  // is separately bounds-guarded only if vgValue).
   bool valGuard =
-      !novalGuard && valDef != nullptr && WJCanGetOp(be, valDef) &&
+      vgEnv0 && valDef != nullptr && WJCanGetOp(be, valDef) &&
       (vgValue || valDef->type() != jit::MIRType::Value);
   // VGDBG: log the payload the value-check is about to chunk-load (Object-branch),
   // so the last line before a trap identifies the OOB culprit.
@@ -5234,12 +5508,38 @@ static bool EmitForcePostBarrier(Encoder& e, WJBackend& be, jit::MDefinition* ob
         if (!e.writeOp(Op::I32Const) || !e.writeVarS32(0)) return false;  // not GC -> 0
         if (!e.writeOp(Op::End)) return false;
       } else {
-        // Object/String/Symbol/BigInt: always GC; payload = the pointer directly.
-        if (!GetOp(e, be, valDef) || !e.writeOp(Op::I32Const) ||
-            !e.writeVarS32(int32_t(chunkMaskInv)) || !e.writeOp(Op::I32And) ||
-            !e.writeOp(Op::I32Load) || !e.writeVarU32(2) || !e.writeVarU32(sbOff) ||
-            !e.writeOp(Op::I32Const) || !e.writeVarS32(0) || !e.writeOp(Op::I32Ne))
-          return false;  // chunk(payload)->sb != 0
+        // Object/String/Symbol/BigInt: payload = the pointer. TRAP-SAFE bounds guard:
+        // a stale/mistyped value pointer (Lambda closure, speculative Unbox/
+        // LoadElementAndUnbox) can be a non-current or non-object bit pattern whose
+        // chunk(payload) lands OUTSIDE wasm memory -> the chunk-load TRAPS (earley
+        // 1/10 "out of bounds"). So only load when payload is in-range; otherwise
+        // assume nursery and emit the barrier (SOUND -- over-barrier never corrupts;
+        // an in-range stale nursery ptr still reads its old nursery chunk -> correct).
+        // Guard the ACTUAL load address (chunk(payload)+sbOff), not just payload:
+        // a garbage payload in the top ~1 chunk would pass `payload<mem` yet make
+        // chunkBase+sbOff exceed memory -> trap. addr = (payload & ~ChunkMask)+sbOff.
+        // valNursery = (addr+4 <= memBytes) ? (load[addr] != 0) : 1
+        auto emitAddr = [&]() -> bool {
+          return GetOp(e, be, valDef) && e.writeOp(Op::I32Const) &&
+                 e.writeVarS32(int32_t(chunkMaskInv)) && e.writeOp(Op::I32And) &&
+                 e.writeOp(Op::I32Const) && e.writeVarS32(int32_t(sbOff)) &&
+                 e.writeOp(Op::I32Add);
+        };
+        // (addr + 4) <= (memory.size << 16)
+        if (!emitAddr() || !e.writeOp(Op::I32Const) || !e.writeVarS32(4) ||
+            !e.writeOp(Op::I32Add) || !e.writeOp(Op::MemorySize) ||
+            !e.writeVarU32(0) || !e.writeOp(Op::I32Const) || !e.writeVarS32(16) ||
+            !e.writeOp(Op::I32Shl) || !e.writeOp(Op::I32LeU))
+          return false;
+        if (!e.writeOp(Op::If) || !e.writeFixedU8(uint8_t(TypeCode::I32)))
+          return false;
+        if (!emitAddr() || !e.writeOp(Op::I32Load) || !e.writeVarU32(2) ||
+            !e.writeVarU32(0) || !e.writeOp(Op::I32Const) || !e.writeVarS32(0) ||
+            !e.writeOp(Op::I32Ne))
+          return false;  // load[addr] != 0  (chunk storeBuffer)
+        if (!e.writeOp(Op::Else) || !e.writeOp(Op::I32Const) ||
+            !e.writeVarS32(1) || !e.writeOp(Op::End))
+          return false;  // out-of-range -> assume nursery (emit barrier)
       }
       if (!e.writeOp(Op::I32And)) return false;  // objTenured && valNursery
     }
@@ -5388,8 +5688,11 @@ static EffectKind EmitEffect(Encoder& e, WJBackend& be, MInstruction* ins) {
       // GuardShape, so the receiver may be polymorphic -> a raw fixed-slot store
       // would corrupt. Route through the generic SETPROP helper (baked key, no
       // deopt, handles any shape). EFFECT -> leaves nothing on the stack.
-      if (be.forceMega && WJIsShapeGuard(s->object()) &&
-          WJMegaConvertibleGuard(s->object())) {
+      bool sMega = be.forceMega && WJIsShapeGuard(s->object()) &&
+                   WJMegaConvertibleGuard(s->object(), /*allowStores=*/true);
+      bool sHybrid = !sMega && WJShapeHybrid() && WJIsShapeGuard(s->object()) &&
+                     WJMegaConvertibleGuard(s->object(), /*allowStores=*/false);
+      if (sMega || sHybrid) {
         jit::MDefinition* gs = s->object();
         uint64_t keyBits = 0;
         if (WJDerivePropKey(WJGuardRepShape(gs), uint32_t(s->slot()), &keyBits) &&
@@ -5406,8 +5709,13 @@ static EffectKind EmitEffect(Encoder& e, WJBackend& be, MInstruction* ins) {
           // 100% correct; default/minor-GC crashes "null function") -- a post-write-
           // barrier/store-staleness bug for the GC sweep. DEFAULT-OFF until fixed;
           // GECKO_WJ_MEGASTOREIC enables.
+          // Hybrid always uses the store IC (value is provably non-GC -> no barrier,
+          // safe). forceMega keeps the MEGASTOREIC gate (it allows GC-value stores,
+          // which carry the historical barrier-staleness risk).
           static int megaStoreIC = getenv("GECKO_WJ_MEGASTOREIC") ? 1 : 0;
-          uint32_t site = megaStoreIC ? WJPropSite(be) : 0;
+          static int hybStoreHelper = getenv("GECKO_WJ_HYBSTOREHELPER") ? 1 : 0;
+          bool useIC = (sHybrid && !hybStoreHelper) || megaStoreIC;
+          uint32_t site = useIC ? WJPropSite(be) : 0;
           if (site != 0) {
             return EmitPropStoreIC(e, be, ins, WJGuardObject(gs), nullptr,
                                    s->value(), /*strict=*/false, site, keyVal)
@@ -5535,9 +5843,10 @@ static EffectKind EmitEffect(Encoder& e, WJBackend& be, MInstruction* ins) {
       // polymorphic receiver -> route to the self-guarding store IC (gbemu's
       // dominant deopt source: 686K shape-guard deopts on out-of-line field
       // stores). Mirrors the StoreFixedSlot mega path. GECKO_WJ_MEGADYNSTORE.
-      if (be.forceMega && s->slots()->isSlots()) {
+      if ((be.forceMega || WJShapeHybrid()) && s->slots()->isSlots()) {
         jit::MDefinition* gs = s->slots()->toSlots()->object();
-        if (WJIsShapeGuard(gs) && WJMegaConvertibleGuard(gs)) {
+        if (WJIsShapeGuard(gs) &&
+            WJMegaConvertibleGuard(gs, /*allowStores=*/be.forceMega)) {
           js::Shape* gshape = WJGuardRepShape(gs);
           uint32_t nfixed = gshape ? gshape->asShared().numFixedSlots() : 0;
           uint64_t keyBits = 0;
@@ -5546,7 +5855,8 @@ static EffectKind EmitEffect(Encoder& e, WJBackend& be, MInstruction* ins) {
               WJGuardObject(gs)->type() == MIRType::Object) {
             uint64_t keyVal = js::IdToValue(
                 JS::PropertyKey::fromRawBits(uintptr_t(keyBits))).asRawBits();
-            uint32_t site = WJPropSite(be);
+            static int hybStoreHelper = getenv("GECKO_WJ_HYBSTOREHELPER") ? 1 : 0;
+            uint32_t site = (hybStoreHelper && !be.forceMega) ? 0 : WJPropSite(be);
             if (site != 0) {
               return EmitPropStoreIC(e, be, ins, WJGuardObject(gs), nullptr,
                                      s->value(), /*strict=*/false, site, keyVal)
@@ -6091,6 +6401,8 @@ static bool EmitBlockBody(Encoder& e, WJBackend& be, MBasicBlock* b) {
     if (insRp && !spillAfter) lastRp = insRp;
     be.curRp = lastRp;
     be.curOp = uint32_t(ins->op());
+    if (be.info && be.info->script())
+      gWJCurScriptLine = uint32_t(be.info->script()->lineno());
     bool doShadow = be.shadowDeopt && be.inDispatchBody;
     if (doShadow && !spillAfter && lastRp != spilledRp) {
       if (!EmitFrameSpillDelta(e, be, lastRp, spilledRp)) {
@@ -6884,6 +7196,8 @@ static void WJElideUnboxForPropCache(MIRGenerator& mir, MIRGraph& graph) {
 }
 
 }  // namespace
+
+void js::wasm::WJDumpDeoptSiteHist() { WJDumpSiteHist(); }
 
 bool js::wasm::WJEmitTrampoline(Encoder& e) {
   // locals: i32 sbI32 (1), f64 flag (2), i64 result (3). Param 0 = scratch-base.

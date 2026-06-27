@@ -36,6 +36,7 @@ bool WJEmitBody(jit::MIRGenerator& mir, jit::MIRGraph& graph, uint32_t nargs,
 // with the register-argument ABI. Used for the host-entry path. Returns false on
 // encoder failure.
 bool WJEmitTrampoline(Encoder& e);
+void WJDumpDeoptSiteHist();
 
 // GC-constant pool (WASMJIT_REARCH_PLAN.md §4.2). Interns a boxed JS::Value (a
 // GC pointer baked into emitted wasm cannot be relocated by a moving GC) and

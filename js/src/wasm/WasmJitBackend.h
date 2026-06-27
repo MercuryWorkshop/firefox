@@ -125,6 +125,7 @@ extern uintptr_t gWJWholeCellLastAddr;
 // emptyObjectSlots/Elements) are compile-time constants the backend computes.
 extern uintptr_t gWJNurseryPosAddr;
 extern uintptr_t gWJObjHeaderWord;
+extern uintptr_t gWJStringHeaderWord;
 
 // Boxed ObjectValue bits of the realm's global lexical environment, refreshed
 // each WJWarpCompile. MFunctionEnvironment bakes this for top-level-scoped
@@ -201,6 +202,7 @@ extern uint32_t gWJResumeNLocals[];     // per frame
 extern uint32_t gWJResumeValsOff[];     // start index into gWJResumeVals, per frame
 // Call boundary: callee + argc for wjhelp(WJH_CALL).
 extern uint64_t gWJCallCallee;
+extern uint32_t gWJCallSiteLine[];  // DEBUG: caller script line per call site
 extern uint32_t gWJCallArgc;
 // Constructing call: newTarget (boxed) for wjhelp(WJH_CREATETHIS isn't this --
 // this is for the construct CALL itself). `this` is staged at gWJScratch[kWJThisSlot].
@@ -209,6 +211,7 @@ extern uint64_t gWJConstructNewTarget;
 extern uint32_t gWJHelpObj;
 extern uint32_t gWJHelpSlot;
 extern uint64_t gWJHelpVal;
+extern uint64_t gWJElemHits;  // DEBUG: inline typed-array element-store IC hits
 
 // Monomorphic call-site IC for direct wasm->wasm calls. Per call site: the cached
 // callee object pointer and its shared-table index. A JIT'd caller compares the
@@ -252,6 +255,9 @@ static constexpr uint32_t kWJPropSites = 16384;
 static constexpr uint32_t kWJPropWays = 4;
 extern uint32_t gWJPropShape[];   // cached receiver Shape* (0 = empty)
 extern uint32_t gWJPropOff[];     // cached TaggedSlotOffset bits ((off<<1)|isFixed)
+extern uint32_t gWJAddOldShape[];  // ADD-IC: pool addr of pre-add shape (0 = unset)
+extern uint32_t gWJAddNewShape[];  // ADD-IC: pool addr of post-add shape
+extern uint32_t gWJAddOff[];       // ADD-IC: added prop's fixed-slot byte offset
 extern uint32_t gWJPropHolder[];  // proto-read cache: holder object* (0 = OWN-property way;
                                   // nonzero = load the slot from this proto holder instead
                                   // of the receiver). Validated by receiver shape match alone

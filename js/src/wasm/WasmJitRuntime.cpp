@@ -129,11 +129,14 @@ uint32_t gWJNewObjScript = 0;      // WJH_NEWOBJECT: JSScript* (raw)
 uint32_t gWJNewObjPcOff = 0;       // WJH_NEWOBJECT: bytecode offset
 uintptr_t gWJNurseryPosAddr = 0;   // address of zone nursery position_ (inline alloc)
 uintptr_t gWJObjHeaderWord = 0;    // NurseryCellHeader value for Object cells
+uintptr_t gWJStringHeaderWord = 0; // NurseryCellHeader value for String cells (rope-concat inline)
 uint32_t gWJHelpObj = 0;        // object ptr for WJH_SETSLOT
 uint32_t gWJHelpSlot = 0;
 uint64_t gWJHelpVal = 0;        // boxed value for WJH_SETSLOT
+uint64_t gWJElemHits = 0;       // DEBUG: inline typed-array element-store IC hits
 uint32_t gWJCallFn[kWJCallSites * kWJCallWays];     // polymorphic call IC: callee ptrs
 int32_t gWJCallTblIdx[kWJCallSites * kWJCallWays];  // polymorphic call IC: table slots
+uint32_t gWJCallSiteLine[kWJCallSites] = {0};       // DEBUG: caller script line per site
 static uint32_t gWJNextCallSite = 0;
 uint32_t WJAllocCallSite() {
   if (gWJNextCallSite >= kWJCallSites) return 0;  // site 0 is a safe sentinel
@@ -163,6 +166,12 @@ uint32_t WJAllocCtorSite() {
 // Inline property-load IC (see WasmJitBackend.h).
 uint32_t gWJPropShape[kWJPropSites * kWJPropWays];
 uint32_t gWJPropOff[kWJPropSites * kWJPropWays];
+// ADD-IC: per-site cached fixed-slot property-ADD transition (oldShape -> newShape
+// at a fixed slot). gWJAddOld/NewShape hold POOL ADDRESSES into gWJShapePool (traced
+// + GC-current), so the cached newShape is safe to write into an object. 0 = unset.
+uint32_t gWJAddOldShape[kWJPropSites] = {0};
+uint32_t gWJAddNewShape[kWJPropSites] = {0};
+uint32_t gWJAddOff[kWJPropSites] = {0};  // added prop's fixed-slot byte offset (from obj)
 uint32_t gWJPropHolder[kWJPropSites * kWJPropWays];  // proto-read holder (0 = own)
 uint64_t gWJPropKey[kWJPropSites];
 uint8_t gWJPropStrict[kWJPropSites];
@@ -324,6 +333,18 @@ bool js::wasm::WasmJitObserveCall(JSScript* script) {
   if (sEnabled < 0) sEnabled = getenv("GECKO_NOWASMJIT") ? 0 : 1;
   if (!sEnabled) return false;
   if (!script->function() || script->isModule() || script->length() > 4096) {
+    static int pblWho = getenv("GECKO_WJ_PBLWHO") ? 1 : 0;
+    if (pblWho && script->function() && !script->isModule() &&
+        script->length() > 4096) {
+      static std::unordered_map<JSScript*, uint64_t> big;
+      uint64_t& c = big[script];
+      if (c == 0)
+        fprintf(stderr, "[wb-pblwho] TOO-BIG(len=%u>4096, never compiled) %s:%u\n",
+                unsigned(script->length()),
+                script->filename() ? script->filename() : "?",
+                unsigned(script->lineno()));
+      c++;
+    }
     return false;
   }
 
@@ -405,6 +426,10 @@ bool js::wasm::WasmJitObserveCall(JSScript* script) {
     }
     return false;
   }
+  if (getenv("GECKO_WJ_PBLWHO"))
+    fprintf(stderr, "[wb-compiled] %s:%u len=%u directIdx=%d\n",
+            script->filename() ? script->filename() : "?",
+            unsigned(script->lineno()), unsigned(script->length()), e.directIdx);
   e.state = WJEntry::State::Compiled;
   e.handle = handle;
   e.tblSlot = tblSlot;
@@ -423,6 +448,10 @@ bool js::wasm::WasmJitObserveCall(JSScript* script) {
   if (!getenv("GECKO_WJ_NODIRECT")) {
     e.directIdx = int(wasmhost_call(handle, -1, nullptr, 0));
   }
+  if (getenv("GECKO_WJ_PBLWHO"))
+    fprintf(stderr, "[wb-directidx] %s:%u directIdx=%d\n",
+            script->filename() ? script->filename() : "?",
+            unsigned(script->lineno()), e.directIdx);
   return true;
 }
 
@@ -447,14 +476,72 @@ int js::wasm::WasmJitRunCall(JSScript* script, uint64_t thisBits,
     ep = sLastEntry;
   } else {
     auto it = gEntries->find(script);
-    if (it == gEntries->end()) return 0;
+    if (it == gEntries->end()) {
+      static int pblWho0 = getenv("GECKO_WJ_PBLWHO") ? 1 : 0;
+      if (pblWho0) {
+        static std::unordered_map<JSScript*, int> seen;
+        if (seen.emplace(script, 1).second)
+          fprintf(stderr, "[wb-pblwho] NOT-IN-MAP(never-compiled) %s:%u\n",
+                  script->filename() ? script->filename() : "?",
+                  unsigned(script->lineno()));
+      }
+      return 0;
+    }
     ep = &it->second;
     sLastScript = script;
     sLastEntry = ep;
   }
   WJEntry& e = *ep;
-  if (e.state != WJEntry::State::Compiled) return 0;
-  if (argc < e.nargs) return 0;  // underflow: let the interpreter pad
+  static int pblWho = getenv("GECKO_WJ_PBLWHO") ? 1 : 0;
+  if (pblWho && e.state == WJEntry::State::Compiled) {
+    // Count JIT'd functions entered FROM PBL (the 2.25M PBL->JIT transitions). The
+    // top callees reveal what the hot PBL caller is invoking -> identifies the
+    // uncompiled hot caller to target.
+    static std::unordered_map<JSScript*, uint64_t> cc;
+    static uint64_t t = 0;
+    cc[script]++;
+    if ((++t % 1000000) == 0) {
+      fprintf(stderr, "[wb-pblcallee] top PBL->JIT callees @%llu:\n",
+              (unsigned long long)t);
+      std::vector<std::pair<JSScript*, uint64_t>> v(cc.begin(), cc.end());
+      std::sort(v.begin(), v.end(),
+                [](auto& a, auto& b) { return a.second > b.second; });
+      for (size_t i = 0; i < v.size() && i < 6; i++)
+        fprintf(stderr, "    %s:%u x%llu\n",
+                v[i].first->filename() ? v[i].first->filename() : "?",
+                unsigned(v[i].first->lineno()), (unsigned long long)v[i].second);
+    }
+  }
+  if (e.state != WJEntry::State::Compiled) {
+    if (pblWho) {
+      static std::unordered_map<JSScript*, uint64_t> cnt;
+      static uint64_t tot = 0;
+      cnt[script]++;
+      if ((++tot % 500000) == 0) {
+        fprintf(stderr, "[wb-pblwho] state!=Compiled top scripts:\n");
+        std::vector<std::pair<JSScript*, uint64_t>> v(cnt.begin(), cnt.end());
+        std::sort(v.begin(), v.end(),
+                  [](auto& a, auto& b) { return a.second > b.second; });
+        for (size_t i = 0; i < v.size() && i < 8; i++)
+          fprintf(stderr, "    %s:%u state=%d  count=%llu\n",
+                  v[i].first->filename() ? v[i].first->filename() : "?",
+                  unsigned(v[i].first->lineno()), int(gEntries->count(v[i].first)
+                      ? (*gEntries)[v[i].first].state : WJEntry::State()),
+                  (unsigned long long)v[i].second);
+      }
+    }
+    return 0;
+  }
+  if (argc < e.nargs) {
+    if (pblWho) {
+      static uint64_t uf = 0;
+      if ((++uf % 200000) == 0)
+        fprintf(stderr, "[wb-pblwho] argc<nargs underflow %s:%u (argc=%u nargs=%u) x%llu\n",
+                script->filename() ? script->filename() : "?",
+                unsigned(script->lineno()), argc, e.nargs, (unsigned long long)uf);
+    }
+    return 0;  // underflow: let the interpreter pad
+  }
 
   for (uint32_t i = 0; i < e.nargs; i++) {
     gWJScratch[i] = argv[i].asRawBits();
@@ -521,7 +608,10 @@ int js::wasm::WasmJitRunCall(JSScript* script, uint64_t thisBits,
   // The function's runtime environment (for MFunctionEnvironment): stash it so the
   // JIT'd code reads the correct closure env at entry (no GC before it reads it).
   gWJCurrentEnv = uint32_t(uintptr_t(static_cast<void*>(envChain)));
-  if (getenv("GECKO_WJ_ENVDBG")) {
+  // CACHED: this is the per-call JIT entry (millions of calls on gbemu); a bare
+  // getenv here cost ~3% (getenv+strncmp) in the profile. See [[wjhelp-getenv-tax]].
+  static int envDbg = getenv("GECKO_WJ_ENVDBG") ? 1 : 0;
+  if (envDbg) {
     fprintf(stderr, "[wb-envdbg] ENTRY env=%u %s:%u\n", gWJCurrentEnv,
             script ? script->filename() : "?", script ? script->lineno() : 0);
   }
@@ -912,17 +1002,23 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
 
   static int helpHist = getenv("GECKO_WJ_HELPHIST") ? 1 : 0;
   if (helpHist) {
-    static uint64_t hc[32] = {0};
+    static uint64_t hc[40] = {0};
     static uint64_t tot = 0;
-    if (kind >= 0 && kind < 32) hc[kind]++;
+    if (kind >= 0 && kind < 40) hc[kind]++;
     if ((++tot % 200000) == 0) {
-      static const char* nm[16] = {"?",        "RESUME",  "CALL",
+      static const char* nm[37] = {"?",        "RESUME",  "CALL",
                                    "SETSLOT",  "GETPROP", "SETPROP",
                                    "GETELEM",  "INSTOF",  "ARRPUSH",
                                    "ARRPOP",   "CRTHIS",  "CONSTRUCT",
-                                   "POSTBAR",  "PREBAR",  "?14",  "?15"};
+                                   "POSTBAR",  "PREBAR",  "PROPIC",  "SETPROPIC",
+                                   "NEWPLAIN", "NEWARROBJ","NEWARR", "BINARITH",
+                                   "UNARITH",  "GETNAME", "TOPROPKEY","CHARCODEAT",
+                                   "FROMCC",   "TOSTRING","COMPARE", "NEWOBJECT",
+                                   "BINDNAME", "GROWSLOTS","TOINT32","INSTOFPROTO",
+                                   "LAMBDA",   "TYPEOFIS","NEWCALLOBJ","CTORALLOC",
+                                   "DBGPTR"};
       fprintf(stderr, "[wb-helphist] %llu calls:", (unsigned long long)tot);
-      for (int k = 0; k < 16; k++)
+      for (int k = 0; k < 37; k++)
         if (hc[k]) fprintf(stderr, " %s=%llu", nm[k], (unsigned long long)hc[k]);
       fprintf(stderr, "\n");
     }
@@ -1215,6 +1311,39 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
     gWJSlowCalls++;
     if (getenv("GECKO_WJ_CALLPROF") && (gWJSlowCalls % 500000) == 0)
       fprintf(stderr, "[wb-slowcall] %llu\n", (unsigned long long)gWJSlowCalls);
+    if (getenv("GECKO_WJ_CALLTRACE") &&
+        uint32_t(siteF) == uint32_t(atoi(getenv("GECKO_WJ_CALLTRACE")))) {
+      static int n = 0;
+      if (n++ < 60) {
+        const char* cls = callee.isObject() ? callee.toObject().getClass()->name
+                                            : (callee.isUndefined() ? "undef" : "prim");
+        const char* tcls = thisv.isObject() ? thisv.toObject().getClass()->name : "prim";
+        bool isFn = callee.isObject() && callee.toObject().is<JSFunction>();
+        fprintf(stderr, "[calltrace] site=%u #%d calleeBits=%#llx cls=%s isFn=%d thisCls=%s thisBits=%#llx\n",
+                uint32_t(siteF), n, (unsigned long long)gWJCallCallee, cls, isFn, tcls,
+                (unsigned long long)gWJScratch[js::wasm::kWJThisSlot]);
+      }
+    }
+    if (getenv("GECKO_WJ_CALLEEDBG")) {
+      bool ok = callee.isObject() && callee.toObject().is<JSFunction>();
+      if (!ok) {
+        const char* cls = callee.isObject() ? callee.toObject().getClass()->name : "?";
+        const char* tcls = thisv.isObject() ? thisv.toObject().getClass()->name : "prim";
+        fprintf(stderr, "[calleedbg] BAD callee bits=%#llx calleeClass=%s argc=%u "
+                "callerLine=%u thisClass=%s site=%u\n",
+                (unsigned long long)gWJCallCallee, cls, argc,
+                gWJCallSiteLine[uint32_t(siteF) % js::wasm::kWJCallSites], tcls,
+                uint32_t(siteF));
+      } else {
+        JSFunction* f = &callee.toObject().as<JSFunction>();
+        // sane fn? interpreted-with-script or native. flag a function whose
+        // script/native looks corrupt.
+        bool sane = (f->isNativeFun()) || (f->isInterpreted() && f->hasBaseScript());
+        if (!sane)
+          fprintf(stderr, "[calleedbg] INSANE fn=%p flags=%#x argc=%u\n",
+                  (void*)f, f->flags().toRaw(), argc);
+      }
+    }
     if (!JS::Call(cx, thisv, callee, JS::HandleValueArray(argv), &rval)) {
       return 1.0;  // callee threw -> propagate
     }
@@ -1634,9 +1763,92 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
     RootedValue val(cx, JS::Value::fromRawBits(gWJScratch[2]));
     JS::RootedId id(cx);
     if (!js::ToPropertyKey(cx, idv, &id)) return 1.0;
+    static int spicDbg = -1;
+    if (spicDbg < 0) spicDbg = getenv("GECKO_WJ_SPICDBG") ? 1 : 0;
     if (objv.isObject() && objv.toObject().is<js::NativeObject>()) {
       js::NativeObject* nobj = &objv.toObject().as<js::NativeObject>();
       mozilla::Maybe<js::PropertyInfo> prop = nobj->lookupPure(id);
+      if (spicDbg) {
+        static uint64_t cacheable = 0, uncacheable = 0, repeatShape = 0;
+        static uint32_t lastSite = 0xffffffff, lastShape = 0;
+        if (prop.isSome() && prop->isDataProperty() && prop->writable()) {
+          cacheable++;
+          uint32_t sb = uint32_t(uintptr_t(static_cast<void*>(nobj->shape())));
+          if (site == lastSite && sb == lastShape) repeatShape++;
+          lastSite = site; lastShape = sb;
+        } else {
+          uncacheable++;
+        }
+        static uint64_t intId = 0, strAdd = 0, strAccessor = 0, strProto = 0, other = 0;
+        static uint64_t intArrayInbounds = 0, intArrayOOB = 0, intNonArray = 0;
+        if (!(prop.isSome() && prop->isDataProperty() && prop->writable())) {
+          if (id.isInt()) {
+            intId++;
+            if (nobj->is<js::ArrayObject>()) {
+              uint32_t idx = uint32_t(id.toInt());
+              if (idx < nobj->getDenseInitializedLength()) intArrayInbounds++;
+              else intArrayOOB++;
+            } else {
+              intNonArray++;
+              if (nobj->is<js::TypedArrayObject>()) {
+                static uint64_t taValInt = 0, taValOther = 0, taClaspMatch = 0,
+                                taClaspMiss = 0, taInbounds = 0;
+                int tt = int(nobj->as<js::TypedArrayObject>().type());
+                if (val.isInt32()) taValInt++; else taValOther++;
+                const JSClass* expect = &js::TypedArrayObject::fixedLengthClasses[tt];
+                if (nobj->getClass() == expect) taClaspMatch++; else taClaspMiss++;
+                if (uint32_t(id.toInt()) <
+                    nobj->as<js::TypedArrayObject>().length().valueOr(0))
+                  taInbounds++;
+                // Verify the inline clasp chain (obj->shape->base->clasp via raw
+                // offsets) against getClass() -- the suspected inline-IC bug.
+                {
+                  char* o = reinterpret_cast<char*>(nobj);
+                  uintptr_t shape = *reinterpret_cast<uintptr_t*>(
+                      o + offsetof(JS::shadow::Object, shape));
+                  uintptr_t bptr = *reinterpret_cast<uintptr_t*>(
+                      shape + js::Shape::offsetOfBaseShape());
+                  uintptr_t clasp = *reinterpret_cast<uintptr_t*>(
+                      bptr + js::BaseShape::offsetOfClasp());
+                  static int chk = 0;
+                  if (chk < 3) {
+                    chk++;
+                    fprintf(stderr,
+                            "[wj-spic-chain] chainClasp=%p getClass=%p expectFLC=%p shapeOff=%zu baseOff=%zu claspOff=%zu\n",
+                            (void*)clasp, (void*)nobj->getClass(), (void*)expect,
+                            (size_t)offsetof(JS::shadow::Object, shape),
+                            (size_t)js::Shape::offsetOfBaseShape(),
+                            (size_t)js::BaseShape::offsetOfClasp());
+                  }
+                }
+                static uint64_t taN = 0;
+                if ((++taN % 400000) == 0)
+                  fprintf(stderr,
+                          "[wj-spic-ta] elemHits=%llu | valInt=%llu valOther=%llu claspMatch=%llu claspMiss=%llu inbounds=%llu (type=%d)\n",
+                          (unsigned long long)gWJElemHits,
+                          (unsigned long long)taValInt, (unsigned long long)taValOther,
+                          (unsigned long long)taClaspMatch, (unsigned long long)taClaspMiss,
+                          (unsigned long long)taInbounds, tt);
+              }
+            }
+          }
+          else if (prop.isNothing()) strAdd++;        // named: property not present -> add/proto
+          else if (!prop->isDataProperty()) strAccessor++;  // accessor
+          else other++;
+        }
+        if (spicDbg && ((cacheable + uncacheable) % 400000) == 0)
+          fprintf(stderr,
+                  "[wj-spic-elem] intArrayInbounds=%llu intArrayOOB=%llu intNonArray=%llu\n",
+                  (unsigned long long)intArrayInbounds,
+                  (unsigned long long)intArrayOOB, (unsigned long long)intNonArray);
+        if (((cacheable + uncacheable) % 200000) == 0)
+          fprintf(stderr,
+                  "[wj-spic] cacheable=%llu uncacheable=%llu (intIdx=%llu namedAdd/proto=%llu accessor=%llu other=%llu) repeatShape=%llu\n",
+                  (unsigned long long)cacheable, (unsigned long long)uncacheable,
+                  (unsigned long long)intId, (unsigned long long)strAdd,
+                  (unsigned long long)strAccessor, (unsigned long long)other,
+                  (unsigned long long)repeatShape);
+      }
       if (prop.isSome() && prop->isDataProperty() && prop->writable()) {
         uint32_t base = site * js::wasm::kWJPropWays;
         uint32_t shapeBits =
@@ -1663,10 +1875,43 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
     }
     // Fallback: setter / non-writable / proto / add / non-native -> generic set.
     if (!objv.isObject()) return 1.0;
+    // ADD-IC: if this is a NAMED property ADD to a native object, cache the
+    // (oldShape -> newShape, fixedSlotOffset) transition so the next same-shape add
+    // at this site stores inline (no helper). Intern the PRE-add shape NOW (into the
+    // traced gWJShapePool, GC-current) before SetObjectElement runs the transition.
+    static int addIC = -1;
+    if (addIC < 0) addIC = getenv("GECKO_WJ_NOADDIC") ? 0 : 1;  // DEFAULT-ON
+    uint32_t preShapeSlot = 0;
+    bool tryAdd = addIC && site < js::wasm::kWJPropSites && !id.isInt() &&
+                  objv.toObject().is<js::NativeObject>();
+    if (tryAdd) {
+      js::NativeObject* nobj = &objv.toObject().as<js::NativeObject>();
+      if (nobj->lookupPure(id).isNothing()) {
+        preShapeSlot =
+            uint32_t(js::wasm::WJInternShape(uintptr_t(nobj->shape())));
+      } else {
+        tryAdd = false;  // not an add (accessor/proto/non-writable own)
+      }
+    }
     RootedObject obj(cx, &objv.toObject());
     RootedValue keyv(cx, js::IdToValue(id));
     bool strict = gWJPropStrict[site] != 0;
     if (!js::SetObjectElement(cx, obj, keyv, val, strict)) return 1.0;
+    if (tryAdd && preShapeSlot && obj->is<js::NativeObject>()) {
+      js::NativeObject* nobj = &obj->as<js::NativeObject>();
+      mozilla::Maybe<js::PropertyInfo> np = nobj->lookupPure(id);
+      if (np.isSome() && np->isDataProperty() && np->writable()) {
+        js::TaggedSlotOffset t = nobj->getTaggedSlotOffset(np->slot());
+        if (t.isFixedSlot() &&
+            uintptr_t(nobj->shape()) !=
+                *reinterpret_cast<uintptr_t*>(uintptr_t(preShapeSlot))) {
+          gWJAddOldShape[site] = preShapeSlot;
+          gWJAddNewShape[site] =
+              uint32_t(js::wasm::WJInternShape(uintptr_t(nobj->shape())));
+          gWJAddOff[site] = t.offset();
+        }
+      }
+    }
     return 0.0;
   }
 
@@ -2185,6 +2430,12 @@ uint32_t gWJRootSP = 0;
 }  // namespace js
 
 extern "C" EMSCRIPTEN_KEEPALIVE void WJTraceRoots(JSTracer* trc, void*) {
+  if (getenv("GECKO_WJ_TRACEDBG")) {
+    static uint64_t n = 0;
+    // trc->kind(): Marking (major) vs Tenuring/MinorSweeping (minor). Log kind+count.
+    fprintf(stderr, "[wjtrace] #%llu kind=%d\n", (unsigned long long)(++n),
+            int(trc->kind()));
+  }
   for (uint32_t i = 0; i <= js::wasm::kWJThisSlot; i++) {
     JS::TraceRoot(trc, reinterpret_cast<JS::Value*>(&gWJScratch[i]), "wjscratch");
   }

@@ -284,6 +284,17 @@ int WJWarpCompile(JSContext* cx, JSScript* script, uint32_t* nargsOut,
         JS::TraceKind::Object, js::gc::CatchAllAllocSite::Optimized);
     js::wasm::gWJObjHeaderWord =
         js::gc::NurseryCellHeader::MakeValue(site, JS::TraceKind::Object);
+    // String nursery cell header (for inline rope-concat bump-alloc). Gated on the
+    // nursery actually allocating strings -- if it tenures strings, leave 0 so the
+    // inline rope path falls back to the ConcatStrings helper (correct either way).
+    if (cx->nursery().canAllocateStrings()) {
+      js::gc::AllocSite* ssite = cz->catchAllAllocSite(
+          JS::TraceKind::String, js::gc::CatchAllAllocSite::Optimized);
+      js::wasm::gWJStringHeaderWord =
+          js::gc::NurseryCellHeader::MakeValue(ssite, JS::TraceKind::String);
+    } else {
+      js::wasm::gWJStringHeaderWord = 0;
+    }
   }
   // Bisection: GECKO_WJ_SKIPLINE=N[,M,...] bails the functions at those lines.
   if (const char* sl = getenv("GECKO_WJ_SKIPLINE")) {

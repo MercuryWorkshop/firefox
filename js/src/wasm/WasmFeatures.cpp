@@ -240,6 +240,15 @@ bool wasm::SimdAvailable(JSContext* cx) {
 }
 
 bool wasm::ThreadsAvailable(JSContext* cx) {
+#if defined(__EMSCRIPTEN__)
+  // The in-process interpreter implements atomics + shared memory itself, so it
+  // does not need a JIT compiler to be available (AnyCompilerAvailable is false
+  // in this --disable-jit build). Report threads as available so validation
+  // accepts shared memory and the 0xFE atomic opcodes instead of rejecting them.
+  if (UseInterp()) {
+    return true;
+  }
+#endif
   return WasmThreadsFlag(cx) && AnyCompilerAvailable(cx);
 }
 
@@ -275,14 +284,20 @@ bool wasm::HasPlatformSupport() {
 }
 
 #if defined(__EMSCRIPTEN__)
-bool wasm::UseHostPassthrough() { return true; }
+bool wasm::UseInterp() {
+  static int sEnabled = -1;
+  if (sEnabled < 0) sEnabled = getenv("GECKO_WASM_INTERP") ? 1 : 0;
+  return sEnabled != 0;
+}
+bool wasm::UseHostPassthrough() { return !UseInterp(); }
 #endif
 
 bool wasm::HasSupport(JSContext* cx) {
 #if defined(__EMSCRIPTEN__)
-  // No in-process wasm compiler on wasm32-emscripten; WebAssembly is routed to
-  // the host engine, so it is available regardless of platform/compiler support.
-  if (UseHostPassthrough()) {
+  // No in-process wasm compiler on wasm32-emscripten; WebAssembly is either run
+  // by the in-process interpreter (GECKO_WASM_INTERP) or routed to the host
+  // engine, so it is available regardless of platform/compiler support.
+  if (UseInterp() || UseHostPassthrough()) {
     return true;
   }
 #endif

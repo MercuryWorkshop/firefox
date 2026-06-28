@@ -114,6 +114,14 @@
 #include "vm/NativeObject-inl.h"
 #include "wasm/WasmInstance-inl.h"
 
+#if defined(__EMSCRIPTEN__)
+#  include "builtin/AtomicsObject.h"  // atomics_wait_impl/notify_impl (interp futex -> JS Atomics waiter list)
+#  include "js/SharedArrayBuffer.h"  // JS::GetSharedArrayBufferData (interp shared memory)
+#  include "js/StructuredClone.h"    // JS_WriteBytes/JS_ReadBytes (interp cross-thread clone)
+#  include "js/WasmInterpClone.h"    // InterpCloneWrite/Read decls (must match defs below)
+#  include "wasm/WasmInterp.h"  // in-process interpreter (GECKO_WASM_INTERP)
+#endif
+
 /*
  * [SMDOC] WebAssembly code rules (evolving)
  *
@@ -2013,6 +2021,24 @@ static JSObject* HostMakeMemoryWrapper(JSContext* cx, int objId, bool shared);
 static JSObject* HostMakeObjIdWrapper(JSContext* cx, int objId);
 static JSObject* HostMakeTableWrapper(JSContext* cx, int objId);
 static JSObject* HostMakeGlobalWrapper(JSContext* cx, int objId);
+
+// Extract a BufferSource arg and hand its bytes to the in-process interpreter's
+// compiler. Returns an interp module object or nullptr (+ reports).
+static JSObject* InterpCompileArg(JSContext* cx, HandleObject bytesObj) {
+  JSObject* unwrapped = CheckedUnwrapStatic(bytesObj);
+  SharedMem<uint8_t*> dataPointer;
+  size_t byteLength;
+  bool isShared;
+  if (!unwrapped ||
+      !IsBufferSource(cx, unwrapped, /*allowShared*/ true,
+                      /*allowResizable*/ true, &dataPointer, &byteLength,
+                      &isShared)) {
+    JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr,
+                             JSMSG_WASM_BAD_BUF_MOD_ARG);
+    return nullptr;
+  }
+  return wasm::interp::CompileBytes(cx, dataPointer.unwrap(), byteLength);
+}
 #endif
 
 /* static */
@@ -2026,6 +2052,23 @@ bool WasmModuleObject::construct(JSContext* cx, unsigned argc, Value* vp) {
   }
 
 #if defined(__EMSCRIPTEN__)
+  if (wasm::UseInterp()) {
+    if (!callArgs.requireAtLeast(cx, "WebAssembly.Module", 1)) {
+      return false;
+    }
+    if (!callArgs.get(0).isObject()) {
+      JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr,
+                               JSMSG_WASM_BAD_BUF_MOD_ARG);
+      return false;
+    }
+    RootedObject bytesObj(cx, &callArgs.get(0).toObject());
+    JSObject* moduleObj = InterpCompileArg(cx, bytesObj);
+    if (!moduleObj) {
+      return false;
+    }
+    callArgs.rval().setObject(*moduleObj);
+    return true;
+  }
   if (wasm::UseHostPassthrough()) {
     if (!callArgs.requireAtLeast(cx, "WebAssembly.Module", 1)) {
       return false;
@@ -2566,6 +2609,29 @@ bool WasmInstanceObject::construct(JSContext* cx, unsigned argc, Value* vp) {
   }
 
 #if defined(__EMSCRIPTEN__)
+  if (wasm::UseInterp()) {
+    if (!args.requireAtLeast(cx, "WebAssembly.Instance", 1)) {
+      return false;
+    }
+    if (!args.get(0).isObject() ||
+        !wasm::interp::IsModuleObject(&args.get(0).toObject())) {
+      JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr,
+                               JSMSG_WASM_BAD_MOD_ARG);
+      return false;
+    }
+    RootedObject modObj(cx, &args.get(0).toObject());
+    RootedObject importObj(cx);
+    if (!GetImportArg(cx, args.get(1), &importObj)) {
+      return false;
+    }
+    JSObject* instanceObj =
+        wasm::interp::InstantiateModuleObject(cx, modObj, importObj);
+    if (!instanceObj) {
+      return false;
+    }
+    args.rval().setObject(*instanceObj);
+    return true;
+  }
   if (wasm::UseHostPassthrough()) {
     if (!args.requireAtLeast(cx, "WebAssembly.Instance", 1)) {
       return false;
@@ -2810,6 +2876,39 @@ bool WasmMemoryObject::construct(JSContext* cx, unsigned argc, Value* vp) {
   }
 
 #if defined(__EMSCRIPTEN__)
+  if (wasm::UseInterp()) {
+    if (!args.requireAtLeast(cx, "WebAssembly.Memory", 1) ||
+        !args.get(0).isObject()) {
+      JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr,
+                               JSMSG_WASM_BAD_DESC_ARG, "memory");
+      return false;
+    }
+    RootedObject desc(cx, &args[0].toObject());
+    RootedValue v(cx);
+    int32_t initial = 0;
+    int32_t maximum = -1;
+    if (!JS_GetProperty(cx, desc, "initial", &v) || !ToInt32(cx, v, &initial)) {
+      return false;
+    }
+    if (!JS_GetProperty(cx, desc, "maximum", &v)) {
+      return false;
+    }
+    if (!v.isUndefined() && !ToInt32(cx, v, &maximum)) {
+      return false;
+    }
+    if (!JS_GetProperty(cx, desc, "shared", &v)) {
+      return false;
+    }
+    bool shared = ToBoolean(v);
+    JSObject* memObj = wasm::interp::NewMemoryObjectJS(
+        cx, uint32_t(initial), maximum < 0 ? UINT32_MAX : uint32_t(maximum),
+        shared);
+    if (!memObj) {
+      return false;
+    }
+    args.rval().setObject(*memObj);
+    return true;
+  }
   if (wasm::UseHostPassthrough()) {
     if (!args.requireAtLeast(cx, "WebAssembly.Memory", 1) ||
         !args.get(0).isObject()) {
@@ -3541,6 +3640,42 @@ bool WasmTableObject::construct(JSContext* cx, unsigned argc, Value* vp) {
   }
 
 #if defined(__EMSCRIPTEN__)
+  if (wasm::UseInterp()) {
+    if (!args.requireAtLeast(cx, "WebAssembly.Table", 1) ||
+        !args.get(0).isObject()) {
+      JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr,
+                               JSMSG_WASM_BAD_DESC_ARG, "table");
+      return false;
+    }
+    RootedObject desc(cx, &args[0].toObject());
+    RootedValue v(cx);
+    int32_t initial = 0;
+    int32_t maximum = -1;
+    if (!JS_GetProperty(cx, desc, "initial", &v) || !ToInt32(cx, v, &initial)) {
+      return false;
+    }
+    if (!JS_GetProperty(cx, desc, "maximum", &v)) {
+      return false;
+    }
+    if (!v.isUndefined() && !ToInt32(cx, v, &maximum)) {
+      return false;
+    }
+    bool externref = false;
+    if (JS_GetProperty(cx, desc, "element", &v) && v.isString()) {
+      bool m = false;
+      if (JS_StringEqualsLiteral(cx, v.toString(), "externref", &m)) {
+        externref = m;
+      }
+    }
+    JSObject* tableObj = wasm::interp::NewTableObjectJS(
+        cx, externref ? wasm::interp::VT::ExternRef : wasm::interp::VT::FuncRef,
+        uint32_t(initial), maximum < 0 ? UINT32_MAX : uint32_t(maximum));
+    if (!tableObj) {
+      return false;
+    }
+    args.rval().setObject(*tableObj);
+    return true;
+  }
   if (wasm::UseHostPassthrough()) {
     if (!args.requireAtLeast(cx, "WebAssembly.Table", 1) ||
         !args.get(0).isObject()) {
@@ -4003,6 +4138,77 @@ bool WasmGlobalObject::construct(JSContext* cx, unsigned argc, Value* vp) {
   }
 
 #if defined(__EMSCRIPTEN__)
+  if (wasm::UseInterp()) {
+    if (!args.requireAtLeast(cx, "WebAssembly.Global", 1) ||
+        !args.get(0).isObject()) {
+      JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr,
+                               JSMSG_WASM_BAD_DESC_ARG, "global");
+      return false;
+    }
+    RootedObject desc(cx, &args[0].toObject());
+    RootedValue v(cx);
+    wasm::interp::VT vt = wasm::interp::VT::F64;
+    if (JS_GetProperty(cx, desc, "value", &v) && v.isString()) {
+      RootedString s(cx, v.toString());
+      bool m = false;
+      if (JS_StringEqualsLiteral(cx, s, "i32", &m) && m) {
+        vt = wasm::interp::VT::I32;
+      } else if (JS_StringEqualsLiteral(cx, s, "i64", &m) && m) {
+        vt = wasm::interp::VT::I64;
+      } else if (JS_StringEqualsLiteral(cx, s, "f32", &m) && m) {
+        vt = wasm::interp::VT::F32;
+      } else if (JS_StringEqualsLiteral(cx, s, "externref", &m) && m) {
+        vt = wasm::interp::VT::ExternRef;
+      } else if (JS_StringEqualsLiteral(cx, s, "funcref", &m) && m) {
+        vt = wasm::interp::VT::FuncRef;
+      }
+    }
+    if (!JS_GetProperty(cx, desc, "mutable", &v)) {
+      return false;
+    }
+    bool mut = ToBoolean(v);
+    wasm::interp::Cell cell;
+    cell.u64 = 0;
+    RootedValue initRef(cx, args.get(1));
+    RootedValue initArg(cx, args.get(1));
+    switch (vt) {
+      case wasm::interp::VT::I32: {
+        int32_t i = 0;
+        if (args.length() >= 2 && !ToInt32(cx, initArg, &i)) return false;
+        cell.i32 = i;
+        break;
+      }
+      case wasm::interp::VT::I64: {
+        if (args.length() >= 2) {
+          JS::BigInt* bi = js::ToBigInt(cx, initArg);
+          if (!bi) return false;
+          cell.i64 = JS::BigInt::toInt64(bi);
+        }
+        break;
+      }
+      case wasm::interp::VT::F32: {
+        double d = 0;
+        if (args.length() >= 2 && !ToNumber(cx, initArg, &d)) return false;
+        cell.f32 = float(d);
+        break;
+      }
+      case wasm::interp::VT::F64: {
+        double d = 0;
+        if (args.length() >= 2 && !ToNumber(cx, initArg, &d)) return false;
+        cell.f64 = d;
+        break;
+      }
+      default:
+        break;  // ref types use initRef
+    }
+    JSObject* gObj =
+        wasm::interp::NewGlobalObjectJS(cx, vt, mut, &cell, initRef);
+    if (!gObj) {
+      return false;
+    }
+    args.rval().setObject(*gObj);
+    return true;
+  }
   if (wasm::UseHostPassthrough()) {
     if (!args.requireAtLeast(cx, "WebAssembly.Global", 1) ||
         !args.get(0).isObject()) {
@@ -5331,6 +5537,28 @@ static bool WebAssembly_compile(JSContext* cx, unsigned argc, Value* vp) {
   CallArgs callArgs = CallArgsFromVp(argc, vp);
 
 #if defined(__EMSCRIPTEN__)
+  if (wasm::UseInterp()) {
+    if (!callArgs.requireAtLeast(cx, "WebAssembly.compile", 1)) {
+      return RejectWithPendingException(cx, promise, callArgs);
+    }
+    RootedValue arg0(cx, callArgs.get(0));
+    if (!arg0.isObject()) {
+      JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr,
+                               JSMSG_WASM_BAD_BUF_MOD_ARG);
+      return RejectWithPendingException(cx, promise, callArgs);
+    }
+    RootedObject bytesObj(cx, &arg0.toObject());
+    RootedObject moduleObj(cx, InterpCompileArg(cx, bytesObj));
+    if (!moduleObj) {
+      return RejectWithPendingException(cx, promise, callArgs);
+    }
+    RootedValue result(cx, ObjectValue(*moduleObj));
+    if (!PromiseObject::resolve(cx, promise, result)) {
+      return RejectWithPendingException(cx, promise, callArgs);
+    }
+    callArgs.rval().setObject(*promise);
+    return true;
+  }
   if (wasm::UseHostPassthrough()) {
     if (!callArgs.requireAtLeast(cx, "WebAssembly.compile", 1)) {
       return RejectWithPendingException(cx, promise, callArgs);
@@ -6185,9 +6413,33 @@ static bool HostStream_OnBytes(JSContext* cx, unsigned argc, Value* vp) {
 
   RootedValue result(cx);
   bool ok;
-  if (instVal.toBoolean()) {
-    RootedObject importObj(
-        cx, importVal.isObject() ? &importVal.toObject() : nullptr);
+  RootedObject importObj(
+      cx, importVal.isObject() ? &importVal.toObject() : nullptr);
+  if (wasm::UseInterp()) {
+    RootedObject imod(cx, InterpCompileArg(cx, bytesObj));
+    ok = imod != nullptr;
+    if (ok && instVal.toBoolean()) {
+      RootedObject inst(
+          cx, wasm::interp::InstantiateModuleObject(cx, imod, importObj));
+      ok = inst != nullptr;
+      if (ok) {
+        RootedObject resultObj(cx, JS_NewPlainObject(cx));
+        ok = resultObj != nullptr;
+        if (ok) {
+          RootedValue v(cx, ObjectValue(*imod));
+          ok = JS_DefineProperty(cx, resultObj, "module", v, JSPROP_ENUMERATE);
+          if (ok) {
+            v.setObject(*inst);
+            ok = JS_DefineProperty(cx, resultObj, "instance", v,
+                                   JSPROP_ENUMERATE);
+          }
+          if (ok) result.setObject(*resultObj);
+        }
+      }
+    } else if (ok) {
+      result.setObject(*imod);
+    }
+  } else if (instVal.toBoolean()) {
     ok = HostPassthroughInstantiate(cx, bytesObj, importObj, &result);
   } else {
     int handle = HostCompileBytes(cx, bytesObj);
@@ -6277,6 +6529,46 @@ static bool WebAssembly_instantiate(JSContext* cx, unsigned argc, Value* vp) {
   }
 
 #if defined(__EMSCRIPTEN__)
+  if (wasm::UseInterp()) {
+    RootedObject imod(cx);
+    bool wasModule = wasm::interp::IsModuleObject(firstArg);
+    if (wasModule) {
+      imod = firstArg;
+    } else {
+      imod = InterpCompileArg(cx, firstArg);
+      if (!imod) {
+        return RejectWithPendingException(cx, promise, callArgs);
+      }
+    }
+    RootedObject instanceObj(
+        cx, wasm::interp::InstantiateModuleObject(cx, imod, importObj));
+    if (!instanceObj) {
+      return RejectWithPendingException(cx, promise, callArgs);
+    }
+    RootedValue result(cx);
+    if (wasModule) {
+      result.setObject(*instanceObj);
+    } else {
+      RootedObject resultObj(cx, JS_NewPlainObject(cx));
+      if (!resultObj) {
+        return RejectWithPendingException(cx, promise, callArgs);
+      }
+      RootedValue v(cx, ObjectValue(*imod));
+      if (!JS_DefineProperty(cx, resultObj, "module", v, JSPROP_ENUMERATE)) {
+        return RejectWithPendingException(cx, promise, callArgs);
+      }
+      v.setObject(*instanceObj);
+      if (!JS_DefineProperty(cx, resultObj, "instance", v, JSPROP_ENUMERATE)) {
+        return RejectWithPendingException(cx, promise, callArgs);
+      }
+      result.setObject(*resultObj);
+    }
+    if (!PromiseObject::resolve(cx, promise, result)) {
+      return RejectWithPendingException(cx, promise, callArgs);
+    }
+    callArgs.rval().setObject(*promise);
+    return true;
+  }
   if (wasm::UseHostPassthrough()) {
     RootedValue result(cx);
     if (!HostPassthroughInstantiate(cx, firstArg, importObj, &result)) {
@@ -6960,7 +7252,7 @@ static bool WebAssembly_compileStreaming(JSContext* cx, unsigned argc,
   Rooted<Value> responsePromise(cx, callArgs.get(0));
   Rooted<Value> featureOptions(cx, callArgs.get(1));
 #if defined(__EMSCRIPTEN__)
-  if (wasm::UseHostPassthrough()) {
+  if (wasm::UseHostPassthrough() || wasm::UseInterp()) {
     if (!HostStreamingInstantiate(cx, responsePromise, nullptr,
                                   /*instantiate*/ false, resultPromise)) {
       return RejectWithPendingException(cx, resultPromise, callArgs);
@@ -7019,7 +7311,7 @@ static bool WebAssembly_instantiateStreaming(JSContext* cx, unsigned argc,
   Rooted<Value> responsePromise(cx, ObjectValue(*firstArg.get()));
 
 #if defined(__EMSCRIPTEN__)
-  if (wasm::UseHostPassthrough()) {
+  if (wasm::UseHostPassthrough() || wasm::UseInterp()) {
     if (!HostStreamingInstantiate(cx, responsePromise, importObj,
                                   /*instantiate*/ true, resultPromise)) {
       return RejectWithPendingException(cx, resultPromise, callArgs);
@@ -7215,6 +7507,28 @@ static bool WebAssemblyDefineConstructor(JSContext* cx,
   return DefineDataProperty(cx, wasm, id, ctorValue, 0);
 }
 
+#if defined(__EMSCRIPTEN__)
+// Non-suspending JSPI stubs for the in-process interpreter. Real JSPI needs a
+// compiler for stack switching (absent here), but content such as a nested
+// gecko.js constructs `new WebAssembly.Suspending(fn)` and calls
+// `WebAssembly.promising(fn)` at load time. Both stubs just return their
+// argument: a Suspending wraps to the raw import (called normally), and a
+// promising export is awaited -- `await` on a synchronous (non-promise) result
+// is a no-op. This lets nested glue load + instantiate; true suspension (e.g.
+// yielding the engine main loop) is a separate, larger task.
+static bool InterpJspiIdentity(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  if (args.length() < 1 || !IsCallable(args.get(0))) {
+    JS_ReportErrorASCII(cx,
+                        "WebAssembly.Suspending/promising: argument must be a "
+                        "function");
+    return false;
+  }
+  args.rval().set(args.get(0));
+  return true;
+}
+#endif
+
 static bool WebAssemblyClassFinish(JSContext* cx, HandleObject object,
                                    HandleObject proto) {
   Handle<WasmNamespaceObject*> wasm = object.as<WasmNamespaceObject>();
@@ -7235,6 +7549,15 @@ static bool WebAssemblyClassFinish(JSContext* cx, HandleObject object,
   RootedValue ctorValue(cx);
   RootedId id(cx);
   for (const auto& entry : entries) {
+#if defined(__EMSCRIPTEN__)
+    // WebAssembly.Function (type reflection) needs a JIT backend to build its
+    // call trampoline; under the in-process interpreter it has none and throws
+    // OOM on construction. Omit it so emscripten's addFunction falls back to
+    // the module-build path (which the interpreter handles).
+    if (entry.key == JSProto_WasmFunction && wasm::UseInterp()) {
+      continue;
+    }
+#endif
     if (!WebAssemblyDefineConstructor(cx, wasm, entry, &ctorValue, &id)) {
       return false;
     }
@@ -7314,6 +7637,27 @@ static bool WebAssemblyClassFinish(JSContext* cx, HandleObject object,
   if (MozIntGemmAvailable(cx) &&
       !JS_DefineFunctions(cx, wasm, WebAssembly_mozIntGemm_methods)) {
     return false;
+  }
+#endif
+
+#if defined(__EMSCRIPTEN__)
+  // Install non-suspending JSPI stubs when real JSPI is unavailable (the
+  // interpreter has no compiler for stack switching) so nested gecko.js content
+  // that uses WebAssembly.Suspending/promising can load + instantiate.
+  if (wasm::UseInterp() && !JSPromiseIntegrationAvailable(cx)) {
+    JSFunction* suspCtor =
+        JS_NewFunction(cx, InterpJspiIdentity, 1, JSFUN_CONSTRUCTOR, "Suspending");
+    if (!suspCtor) {
+      return false;
+    }
+    RootedValue suspVal(cx, ObjectValue(*JS_GetFunctionObject(suspCtor)));
+    if (!JS_DefineProperty(cx, wasm, "Suspending", suspVal, JSPROP_ENUMERATE)) {
+      return false;
+    }
+    if (!JS_DefineFunction(cx, wasm, "promising", InterpJspiIdentity, 1,
+                           JSPROP_ENUMERATE)) {
+      return false;
+    }
   }
 #endif
 

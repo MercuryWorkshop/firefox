@@ -113,8 +113,13 @@ namespace workerinternals {
 // pref.
 #define WORKER_DEFAULT_ALLOCATION_THRESHOLD 30
 
-// Half the size of the actual C stack, to be safe.
-#define WORKER_CONTEXT_NATIVE_STACK_LIMIT 128 * sizeof(size_t) * 1024
+// Normally half the size of the actual C stack, to be safe. Raised here: when
+// running content wasm in the in-process interpreter (GECKO_WASM_INTERP, e.g.
+// embed-demo-in-embed-demo), each guest wasm call recurses one C++ frame in the
+// outer interpreter, so a guest's deep init recursion needs a much larger native
+// stack quota. Kept under LargeStackSize() (the physical worker stack) with
+// margin.
+#define WORKER_CONTEXT_NATIVE_STACK_LIMIT 6 * 1024 * 1024
 
 // The maximum number of threads to use for workers, overridable via pref.
 #define MAX_WORKERS_PER_DOMAIN 512

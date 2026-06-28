@@ -38,6 +38,11 @@ bool HasSupport(JSContext* cx);
 // WebAssembly engine. When true, the WebAssembly object is exposed and its
 // operations are bridged to the host instead of compiled in-process.
 bool UseHostPassthrough();
+
+// When the GECKO_WASM_INTERP env var is set, guest WebAssembly runs in an
+// in-process bytecode interpreter (WasmInterp.h) instead of the host
+// passthrough. Checked once and cached.
+bool UseInterp();
 #endif
 
 // Predicates for compiler availability.

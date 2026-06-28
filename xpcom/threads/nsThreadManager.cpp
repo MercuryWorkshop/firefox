@@ -274,7 +274,13 @@ NS_IMPL_CI_INTERFACE_GETTER(nsThreadManager, nsIThreadManager)
   // 2MB huge page for the stack on first access.  ASan and TSan builds are
   // given a larger stack size due to extra data and red-zones which consume
   // stack space.
-#if defined(MOZ_ASAN) || defined(MOZ_TSAN)
+#if defined(__EMSCRIPTEN__)
+  // The in-process wasm interpreter (GECKO_WASM_INTERP) recurses one C++ frame
+  // per guest wasm call, so worker threads running guest wasm (e.g.
+  // embed-demo-in-embed-demo) need a much deeper physical stack than the JS
+  // native-stack quota (WORKER_CONTEXT_NATIVE_STACK_LIMIT). Keep this above it.
+  return 8192 * 1024 - 2 * mozilla::ipc::shared_memory::SystemPageSize();
+#elif defined(MOZ_ASAN) || defined(MOZ_TSAN)
   return 4096 * 1024 - 2 * mozilla::ipc::shared_memory::SystemPageSize();
 #else
   return 2048 * 1024 - 2 * mozilla::ipc::shared_memory::SystemPageSize();

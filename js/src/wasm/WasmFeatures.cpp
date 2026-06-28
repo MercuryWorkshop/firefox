@@ -284,12 +284,19 @@ bool wasm::HasPlatformSupport() {
 }
 
 #if defined(__EMSCRIPTEN__)
-bool wasm::UseInterp() {
+// The in-process interpreter is the DEFAULT for content wasm (it is correct and
+// self-contained: real linear memory, i64/bulk-mem/atomics/threads, no host
+// engine dependency). The legacy host passthrough is opt-in via
+// GECKO_WASM_PASSTHROUGH for the rare case where its raw speed is wanted and its
+// warts (full-heap mirror per call, lossy i64, broken grow/shared-memory) are
+// acceptable. GECKO_WASM_INTERP is still accepted as a no-op (interp is default)
+// for back-compat with existing callers that set it.
+bool wasm::UseHostPassthrough() {
   static int sEnabled = -1;
-  if (sEnabled < 0) sEnabled = getenv("GECKO_WASM_INTERP") ? 1 : 0;
+  if (sEnabled < 0) sEnabled = getenv("GECKO_WASM_PASSTHROUGH") ? 1 : 0;
   return sEnabled != 0;
 }
-bool wasm::UseHostPassthrough() { return !UseInterp(); }
+bool wasm::UseInterp() { return !UseHostPassthrough(); }
 #endif
 
 bool wasm::HasSupport(JSContext* cx) {

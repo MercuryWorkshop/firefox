@@ -17,6 +17,10 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <unordered_map>
+#include <map>
+#include <vector>
+#include <string>
+#include <algorithm>
 
 #include "js/CallAndConstruct.h"  // JS::Call
 #include "js/PropertyAndElement.h"  // JS_GetProperty
@@ -80,7 +84,8 @@ extern bool WasmJitResumeViaPBL(JSContext* cx, JSScript* script, uint64_t thisBi
                                 uint32_t nLocals, uint32_t pcOff, uint64_t* retBits,
                                 const uint64_t* osrStack, uint32_t osrStackDepth,
                                 JSObject* enclosingEnv = nullptr,
-                                bool keepFrameEnv = false);
+                                bool keepFrameEnv = false,
+                                bool resumeInError = false);
 }  // namespace pbl
 }  // namespace js
 
@@ -103,6 +108,11 @@ uint32_t gWJResumeStackDepth[kWJMaxResumeFrames] = {0};
 uint32_t gWJResumeScriptPtr[kWJMaxResumeFrames] = {0};
 uint32_t gWJResumeEnvPtr[kWJMaxResumeFrames] = {0};
 uint32_t gWJResumeEnclosingEnv[kWJMaxResumeFrames] = {0};
+// try/catch: set to 1 by emitted code before a WJH_RESUME that is an in-try-region
+// exception deopt (the JS exn is pending on cx). WJH_RESUME passes it to
+// WasmJitResumeViaPBL -> gPBLResumeInError -> PBL `goto error` -> HandleException runs
+// the catch. Cleared by WJH_RESUME after reading.
+uint32_t gWJResumeInError = 0;
 uint32_t gWJDeoptByOp[js::wasm::kWJNumOps] = {0};
 uint32_t gWJResumeNArgs[kWJMaxResumeFrames] = {0};
 uint32_t gWJResumeNLocals[kWJMaxResumeFrames] = {0};
@@ -306,12 +316,18 @@ static std::unordered_map<JSScript*, WJEntry>* gEntries = nullptr;
 
 static WJEntry& EntryFor(JSScript* script) {
   if (!gEntries) gEntries = new std::unordered_map<JSScript*, WJEntry>();
-  static JSScript* sLast = nullptr;
-  static WJEntry* sLastE = nullptr;
-  if (script == sLast && sLastE) return *sLastE;  // skip the map find on repeats
+  // Direct-mapped cache (512-way): a 1-entry cache thrashed on uBlock's alternating
+  // callees -> the operator[] emplace showed ~0.9% in the profile. Element addresses
+  // are stable across rehashes, so caching WJEntry* is safe.
+  static const uint32_t kECBits = 9;
+  static const uint32_t kECMask = (1u << kECBits) - 1;
+  static JSScript* sECScript[1u << kECBits] = {};
+  static WJEntry* sECEntry[1u << kECBits] = {};
+  uint32_t h = uint32_t(uintptr_t(script) >> 3) & kECMask;
+  if (sECScript[h] == script && sECEntry[h]) return *sECEntry[h];
   WJEntry& e = (*gEntries)[script];
-  sLast = script;
-  sLastE = &e;
+  sECScript[h] = script;
+  sECEntry[h] = &e;
   return e;
 }
 
@@ -381,6 +397,15 @@ bool js::wasm::WasmJitObserveCall(JSScript* script) {
     const char* s = getenv("GECKO_WJWARP_LOOPWARM");
     kLoopWarm = s ? uint32_t(atoi(s)) : 2000;
     if (!kLoopWarm) kLoopWarm = 2000;
+  }
+  static int obsDbg = getenv("GECKO_WJ_OBSDBG") ? atoi(getenv("GECKO_WJ_OBSDBG")) : -1;
+  bool obsMatch = obsDbg >= 0 && uint32_t(obsDbg) == unsigned(script->lineno());
+  if (obsMatch) {
+    static uint64_t oc = 0;
+    if ((++oc % 5000) == 0 || oc < 5)
+      fprintf(stderr, "[wj-obsdbg] :%u state=%d observes=%u nextTry=%u warm=%u kLoop=%u fails=%u len=%u\n",
+              unsigned(script->lineno()), int(e.state), e.observes, e.nextTry, warm,
+              kLoopWarm, e.fails, unsigned(script->length()));
   }
   if (e.observes < e.nextTry && warm < kLoopWarm) return false;
 
@@ -481,11 +506,18 @@ int js::wasm::WasmJitRunCall(JSScript* script, uint64_t thisBits,
   // so skip the unordered_map find (per-PBL->JIT-entry cost on entry-heavy benches
   // like splay). Map element addresses are stable across rehashes, so caching the
   // WJEntry* is safe; state is re-read fresh each call.
-  static JSScript* sLastScript = nullptr;
-  static WJEntry* sLastEntry = nullptr;
+  // Direct-mapped cache (512-way) over the unordered_map: uBlock alternates between
+  // many callees per call site, so a 1-entry cache thrashed -> the hash find showed
+  // ~0.9% in the profile. Map element addresses are stable across rehashes, so
+  // caching the WJEntry* is safe; state is re-read fresh each call.
+  static const uint32_t kLCBits = 9;
+  static const uint32_t kLCMask = (1u << kLCBits) - 1;
+  static JSScript* sLScript[1u << kLCBits] = {};
+  static WJEntry* sLEntry[1u << kLCBits] = {};
+  uint32_t lch = uint32_t(uintptr_t(script) >> 3) & kLCMask;
   WJEntry* ep;
-  if (script == sLastScript) {
-    ep = sLastEntry;
+  if (sLScript[lch] == script) {
+    ep = sLEntry[lch];
   } else {
     auto it = gEntries->find(script);
     if (it == gEntries->end()) {
@@ -500,8 +532,8 @@ int js::wasm::WasmJitRunCall(JSScript* script, uint64_t thisBits,
       return 0;
     }
     ep = &it->second;
-    sLastScript = script;
-    sLastEntry = ep;
+    sLScript[lch] = script;
+    sLEntry[lch] = ep;
   }
   WJEntry& e = *ep;
   static int pblWho = getenv("GECKO_WJ_PBLWHO") ? 1 : 0;
@@ -620,6 +652,15 @@ int js::wasm::WasmJitRunCall(JSScript* script, uint64_t thisBits,
   // The function's runtime environment (for MFunctionEnvironment): stash it so the
   // JIT'd code reads the correct closure env at entry (no GC before it reads it).
   gWJCurrentEnv = uint32_t(uintptr_t(static_cast<void*>(envChain)));
+  if (js::wasm::kWJEHABI) {
+    // EHABI trampoline reads the boxed callee from gWJScratch[kWJCalleeSlot] (ABI slot 1).
+    // The param is currently unused (Callee/HomeObject still bake the canonical fn); stage
+    // the canonical function so it's well-defined. Wiring Callee/HomeObject to this param +
+    // threading the real runtime callee here is the Option-B-consumer follow-up.
+    JSFunction* f = script->function();
+    gWJScratch[js::wasm::kWJCalleeSlot] =
+        f ? JS::ObjectValue(*f).asRawBits() : JS::UndefinedValue().asRawBits();
+  }
   // CACHED: this is the per-call JIT entry (millions of calls on gbemu); a bare
   // getenv here cost ~3% (getenv+strncmp) in the profile. See [[wjhelp-getenv-tax]].
   static int envDbg = getenv("GECKO_WJ_ENVDBG") ? 1 : 0;
@@ -1078,6 +1119,10 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
     // slot (the top of its expr stack at the resume-after-call point).
     uint32_t nframes = gWJResumeNFrames;
     if (nframes == 0 || nframes > js::wasm::kWJMaxResumeFrames) return 1.0;
+    // try/catch: capture + clear the in-error flag now so it can't leak to a later
+    // (normal) deopt. Used for the innermost frame below.
+    const uint32_t resumeErr = gWJResumeInError;
+    gWJResumeInError = 0;
     // Mark gWJResumeVals as a live GC-root region for the whole resume: the spilled
     // boxed pointers must survive the allocations (RootedValueVector reserve, PBL
     // frame setup, per-frame GC) between the deopt spill and the read of each frame's
@@ -1213,10 +1258,15 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
         }
         fprintf(stderr, "\n");
       }
+      // try/catch: error-mode resume for the innermost (throwing) frame -> PBL runs the
+      // catch via HandleException. gWJResumeInError was set by emitted code before this
+      // WJH_RESUME for an in-try exception deopt.
+      bool inErr = (resumeErr != 0) && (f == 0);
       if (!js::pbl::WasmJitResumeViaPBL(cx, script, thisBits, args, nargs, env,
                                         locals, nlocals, gWJResumePc[f], &rbits,
-                                        stack, depth, enclosingEnv, keepFrameEnv)) {
-        return 1.0;  // resumed execution threw -> propagate
+                                        stack, depth, enclosingEnv, keepFrameEnv,
+                                        inErr)) {
+        return 1.0;  // resumed execution threw (uncaught) -> propagate
       }
       if (getenv("GECKO_WJ_DB414") && uint32_t(script->lineno()) ==
               uint32_t(atoi(getenv("GECKO_WJ_DB414")))) {
@@ -1274,9 +1324,16 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
         // wasm path + fill the inline call IC.
         js::wasm::WasmJitObserveCall(cs);
         auto it = gEntries->find(cs);
+        // argc < nargs is OK: the callee's register ABI reads nargs arg slots, so we
+        // pad the missing ones with undefined below (exactly what the backend's inline
+        // fast-call path does, 6302). The old `argc >= nargs` guard forced these
+        // underflow calls (uBlock compileToFilter/getNodeFlags-class, ~52K/iter) to the
+        // full JS::Call AND -- since the IC fill is inside this block -- never cached
+        // them, so EVERY call slow-pathed. nargs <= kWJMaxArgs always holds for a
+        // register-ABI-compiled callee.
         if (it != gEntries->end() &&
             it->second.state == WJEntry::State::Compiled &&
-            argc >= it->second.nargs &&
+            it->second.nargs <= js::wasm::kWJMaxArgs &&
             it->second.handle >= 0) {  // invalid handle (post-valve reset / failed
                                        // recompile) -> fall to slow JS::Call, never
                                        // call_indirect a -1 handle (wasm "null function
@@ -1310,20 +1367,57 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
                     (void*)fun, gWJCurrentEnv, dsc ? dsc->filename() : "?",
                     dsc ? dsc->lineno() : 0);
           }
+          // Underflow call: pad the missing arg slots with undefined (the callee's
+          // register ABI reads nargs slots; the caller only stored argc).
+          for (uint32_t a = argc; a < ce.nargs; a++)
+            gWJScratch[a] = JS::UndefinedValue().asRawBits();
+          if (js::wasm::kWJEHABI)  // EHABI: stage the boxed callee for the trampoline.
+            gWJScratch[js::wasm::kWJCalleeSlot] = JS::ObjectValue(*fun).asRawBits();
           double ptr = double(uintptr_t(static_cast<void*>(gWJScratch)));
           double flag = wasmhost_call(ce.handle, 0, &ptr, 1);
           gWJFastCalls++;
           return flag;  // 0 = result in gWJScratch[result]; 1 = threw
         }
+        // FELL THROUGH to JS::Call though callee is interpreted-with-bytecode:
+        // diagnose WHY (state/handle/tblSlot/nargs-vs-argc). [CTFDBG]
+        static int ctfDbg = getenv("GECKO_WJ_CTFDBG") ? 1 : 0;
+        if (ctfDbg) {
+          static std::map<std::string, uint64_t> why;
+          static uint64_t tw = 0;
+          int st = (it == gEntries->end()) ? -2 : int(it->second.state);
+          int hd = (it == gEntries->end()) ? -99 : it->second.handle;
+          int ts = (it == gEntries->end()) ? -99 : it->second.tblSlot;
+          uint32_t nn = (it == gEntries->end()) ? 0 : it->second.nargs;
+          char k[96];
+          snprintf(k, sizeof k, "%s:%u st=%d hd%s ts%s argc%s",
+                   cs->filename() ? "f" : "?", unsigned(cs->lineno()), st,
+                   hd >= 0 ? ">=0" : "<0", ts >= 0 ? ">=0" : "<0",
+                   argc >= nn ? ">=n" : "<n");
+          why[k]++;
+          if ((++tw % 100000) == 0) {
+            std::vector<std::pair<uint64_t, std::string>> v;
+            for (auto& kv : why) v.push_back({kv.second, kv.first});
+            std::sort(v.rbegin(), v.rend());
+            fprintf(stderr, "[wb-ctfdbg] %llu interp-callee->JS::Call, top:",
+                    (unsigned long long)tw);
+            for (size_t i = 0; i < v.size() && i < 12; i++)
+              fprintf(stderr, " [%s]=%llu", v[i].second.c_str(),
+                      (unsigned long long)v[i].first);
+            fprintf(stderr, "\n");
+          }
+        }
       }
     }
 
-    RootedValue thisv(cx, JS::Value::fromRawBits(gWJScratch[js::wasm::kWJThisSlot]));
-    JS::RootedValueVector argv(cx);
-    if (!argv.reserve(argc)) return 1.0;
-    for (uint32_t i = 0; i < argc; i++) {
-      argv.infallibleAppend(JS::Value::fromRawBits(gWJScratch[i]));
-    }
+    // gWJScratch[0..kWJThisSlot] is GC-traced by WJTraceRoots, so hand JS::Call
+    // non-owning Handles straight into it -- no per-call RootedValueVector copy or
+    // thisv rooting (the per-call Rooted overhead was ~1.3% across ~1M slow calls).
+    // JS::Call copies the args into the callee's frame before running it, and the
+    // callee (native/PBL on this JS::Call fallback path) doesn't clobber gWJScratch.
+    JS::HandleValue thisv = JS::HandleValue::fromMarkedLocation(
+        reinterpret_cast<const JS::Value*>(&gWJScratch[js::wasm::kWJThisSlot]));
+    JS::HandleValueArray argv = JS::HandleValueArray::fromMarkedLocation(
+        argc, reinterpret_cast<const JS::Value*>(&gWJScratch[0]));
     RootedValue rval(cx);
     gWJSlowCalls++;
     // getenv is a hot-path tax here (~1.2M slow calls in ubo); cache all debug gates
@@ -1365,7 +1459,44 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
                   (void*)f, f->flags().toRaw(), argc);
       }
     }
-    if (!JS::Call(cx, thisv, callee, JS::HandleValueArray(argv), &rval)) {
+    static int callHist = getenv("GECKO_WJ_CALLHIST") ? 1 : 0;
+    if (callHist) {
+      static std::map<std::string, uint64_t> hist;
+      static uint64_t tot = 0;
+      char key[80];
+      if (callee.isObject() && callee.toObject().is<JSFunction>()) {
+        JSFunction* f = &callee.toObject().as<JSFunction>();
+        JSAtom* a = f->maybePartialDisplayAtom();
+        char nm[48] = "?";
+        if (a && a->length() > 0) {
+          JS::AutoCheckCannotGC nogc;
+          size_t n = std::min<size_t>(a->length(), 47);
+          if (a->hasLatin1Chars()) {
+            const JS::Latin1Char* c = a->latin1Chars(nogc);
+            for (size_t i = 0; i < n; i++) nm[i] = char(c[i]);
+            nm[n] = 0;
+          } else {
+            const char16_t* c = a->twoByteChars(nogc);
+            for (size_t i = 0; i < n; i++) nm[i] = char(c[i]);
+            nm[n] = 0;
+          }
+        }
+        snprintf(key, sizeof key, "%s:%s", f->isNativeFun() ? "N" : "J", nm);
+      } else {
+        snprintf(key, sizeof key, "non-fn");
+      }
+      hist[key]++;
+      if ((++tot % 200000) == 0) {
+        std::vector<std::pair<uint64_t, std::string>> v;
+        for (auto& kv : hist) v.push_back({kv.second, kv.first});
+        std::sort(v.rbegin(), v.rend());
+        fprintf(stderr, "[wb-callhist] %llu slow calls, top:", (unsigned long long)tot);
+        for (size_t i = 0; i < v.size() && i < 18; i++)
+          fprintf(stderr, " %s=%llu", v[i].second.c_str(), (unsigned long long)v[i].first);
+        fprintf(stderr, "\n");
+      }
+    }
+    if (!JS::Call(cx, thisv, callee, argv, &rval)) {
       return 1.0;  // callee threw -> propagate
     }
     gWJScratch[js::wasm::kWJResultSlot] = rval.asRawBits();
@@ -1721,6 +1852,29 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
     return 0.0;
   }
 
+  if (kind == js::wasm::WJH_ARRAYSLICE) {
+    // MArraySlice: array.slice(begin,end). The JIT guarded IsPackedArray before
+    // calling (ArraySliceDense asserts it). result=nullptr -> ArraySliceDense
+    // allocates the result array.
+    JS::RootedObject obj(cx, &JS::Value::fromRawBits(gWJScratch[0]).toObject());
+    int32_t begin = JS::Value::fromRawBits(gWJScratch[1]).toInt32();
+    int32_t end = JS::Value::fromRawBits(gWJScratch[2]).toInt32();
+    JS::RootedObject none(cx, nullptr);
+    JSObject* res = js::ArraySliceDense(cx, obj, begin, end, none);
+    if (!res) return 1.0;
+    gWJScratch[js::wasm::kWJResultSlot] = JS::ObjectValue(*res).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_CLOSEITER) {
+    // MCloseIterCache: for-of early-exit cleanup -- call iter's return() if present.
+    // site = CompletionKind (0 Normal / 1 Throw / 2 Return).
+    JS::RootedObject iter(cx, &JS::Value::fromRawBits(gWJScratch[0]).toObject());
+    if (!js::CloseIterOperation(cx, iter, js::CompletionKind(int(siteF))))
+      return 1.0;
+    return 0.0;
+  }
+
   // String.fromCharCode (MFromCharCode): scratch[0]=code(int32) -> 1-char string.
   if (kind == js::wasm::WJH_FROMCHARCODE) {
     int32_t code = JS::Value::fromRawBits(gWJScratch[0]).toInt32();
@@ -1869,7 +2023,45 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
         break;  // accessor / non-data on the chain -> generic
       }
     }
-    // Fallback: accessor/non-native/missing -> generic get (no caching).
+    // MISSING-PROPERTY cache (~92% of ubo PROPIC misses): if the property is absent
+    // on the receiver AND the entire NATIVE proto chain, cache (receiverShape ->
+    // MISSING sentinel) so the inline fast path returns `undefined` with no C++ hop.
+    // Same soundness tier as the proto-read cache: the receiver shape encodes proto
+    // IDENTITY + own absence; a receiver-shape match => same chain => still absent
+    // (unless a proto dynamically GAINS the prop without a receiver-shape change --
+    // the proto-read cache accepts the same caveat; uBlock protos are static).
+    // GECKO_WJ_NOMISSINGIC disables.
+    static int noMissingIC = -1;
+    if (noMissingIC < 0) noMissingIC = getenv("GECKO_WJ_NOMISSINGIC") ? 1 : 0;
+    if (!noMissingIC && objv.isObject() &&
+        objv.toObject().is<js::NativeObject>()) {
+      bool allNativeMissing = true;
+      for (JSObject* p = &objv.toObject(); p; p = p->staticPrototype()) {
+        if (!p->is<js::NativeObject>()) { allNativeMissing = false; break; }
+        if (p->as<js::NativeObject>().lookupPure(id).isSome()) {
+          allNativeMissing = false;
+          break;
+        }
+      }
+      if (allNativeMissing) {
+        js::NativeObject* recv = &objv.toObject().as<js::NativeObject>();
+        uint32_t base = site * js::wasm::kWJPropWays;
+        uint32_t recvShape =
+            uint32_t(uintptr_t(static_cast<void*>(recv->shape())));
+        uint32_t w = 0;
+        for (; w < js::wasm::kWJPropWays; w++) {
+          if (gWJPropShape[base + w] == 0 || gWJPropShape[base + w] == recvShape)
+            break;
+        }
+        if (w == js::wasm::kWJPropWays) w = 0;
+        gWJPropShape[base + w] = recvShape;
+        gWJPropOff[base + w] = js::wasm::kWJPropMissingSentinel;
+        gWJPropHolder[base + w] = 0;
+        gWJScratch[js::wasm::kWJResultSlot] = JS::UndefinedValue().asRawBits();
+        return 0.0;
+      }
+    }
+    // Fallback: accessor/non-native/proxy -> generic get (no caching).
     RootedValue keyv(cx, js::IdToValue(id));
     RootedValue res(cx);
     if (!js::GetElementOperation(cx, objv, keyv, &res)) return 1.0;
@@ -2403,6 +2595,8 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
                 js::Shape* sh = thisv.toObject().as<js::NativeObject>().shape();
                 if (sh->isShared()) gWJCC_shape[fillSlot] = &sh->asShared();
               }
+              if (js::wasm::kWJEHABI)  // EHABI: stage boxed callee for the trampoline.
+                gWJScratch[js::wasm::kWJCalleeSlot] = JS::ObjectValue(*ifun).asRawBits();
               double iptr = double(uintptr_t(static_cast<void*>(gWJScratch)));
               double iflag = wasmhost_call(iit->second.handle, 0, &iptr, 1);
               if (iflag != 0.0) return 1.0;  // initialize threw
@@ -2462,6 +2656,8 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
             argc >= cit->second.nargs && cit->second.handle >= 0) {
           gWJCurrentEnv =
               uint32_t(uintptr_t(static_cast<void*>(cfun->environment())));
+          if (js::wasm::kWJEHABI)  // EHABI: stage boxed callee for the trampoline.
+            gWJScratch[js::wasm::kWJCalleeSlot] = JS::ObjectValue(*cfun).asRawBits();
           double cptr = double(uintptr_t(static_cast<void*>(gWJScratch)));
           double cflag = wasmhost_call(cit->second.handle, 0, &cptr, 1);
           if (cflag != 0.0) return 1.0;  // threw

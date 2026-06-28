@@ -104,6 +104,8 @@ enum WJHelpKind : int {
   WJH_REGEXPCLONE = 41,      // scratch[0]=source RegExpObject(boxed) -> CloneRegExpObject (Object); MRegExp
   WJH_TYPEOFNAME = 42,       // scratch[0]=int32 JSType -> TypeName atom (String); MTypeOfName
   WJH_NEWLEXENV = 43,        // gWJLexScope=LexicalScope* (raw) -> BlockLexicalEnvironmentObject::createWithoutEnclosing (Object); MNewLexicalEnvironmentObject
+  WJH_CLOSEITER = 44,        // scratch[0]=iter(boxed Object), site=completionKind -> js::CloseIterOperation (for-of cleanup); MCloseIterCache
+  WJH_ARRAYSLICE = 45,       // scratch[0]=array(boxed Object),[1]=begin(int32),[2]=end(int32) -> js::ArraySliceDense (Object); MArraySlice (caller guards packed)
 };
 // MNewLexicalEnvironmentObject: the LexicalScope* baked from the template object.
 extern uint32_t gWJLexScope;
@@ -200,6 +202,9 @@ extern uint32_t gWJResumeEnvPtr[];      // JSObject* env chain (i32), per frame
 // = unknown (PBL falls back to func->environment()). Only the outermost frame
 // (this compiled fn) has it; inlined frames keep 0.
 extern uint32_t gWJResumeEnclosingEnv[];
+// try/catch: emitted code sets this to 1 before a WJH_RESUME that is an in-try-region
+// exception deopt (so PBL enters error-mode -> HandleException runs the catch).
+extern uint32_t gWJResumeInError;
 // Debug (GECKO_WJ_DEOPTHIST): per-MIR-op deopt counter. The emitted deopt path
 // increments gWJDeoptByOp[curOp]; WJH_RESUME periodically prints the histogram so
 // we can see WHICH guard kind deopts most (MIRDUMP is unreliable for nondeterm-
@@ -261,7 +266,10 @@ uint32_t WJAllocCtorSite();
 // is shape-pointer REUSE after a compacting GC, handled by clearing this IC on
 // major-GC marking in WJTraceRoots. Indexed [site * kWJPropWays + way].
 static constexpr uint32_t kWJPropSites = 16384;
-static constexpr uint32_t kWJPropWays = 4;
+static constexpr uint32_t kWJPropWays = 8;
+// gWJPropOff sentinel meaning "this shape -> property is MISSING, yield undefined"
+// (no slot load). A real TaggedSlotOffset is small; 0xFFFFFFFF can't collide.
+static constexpr uint32_t kWJPropMissingSentinel = 0xFFFFFFFFu;
 extern uint32_t gWJPropShape[];   // cached receiver Shape* (0 = empty)
 extern uint32_t gWJPropOff[];     // cached TaggedSlotOffset bits ((off<<1)|isFixed)
 extern uint32_t gWJAddOldShape[];  // ADD-IC: pool addr of pre-add shape (0 = unset)
@@ -314,6 +322,17 @@ extern uint32_t gWJRootSP;
 // the host-entry path (the JS<->wasm boundary can't carry i64 safely). Functions
 // with more than kWJMaxArgs actual args fall back (stay PBL).
 static constexpr uint32_t kWJMaxArgs = 8;
+
+// EHABI rewrite (EHABI_REWRITE_PLAN.md): when true, the main wasm function ABI is
+// `(f64 sb, i64 callee, i64 this, i64 args...) -> i64 result` with exceptions carried by
+// native wasm EH (try/catch_all/throw + a $wjexn tag) instead of the legacy
+// `(f64 sb, i64 this, args...) -> (f64 flag, i64 result)` return-flag ABI. Staged: keep
+// false (old ABI builds + runs) until the new path is complete + validated, then flip.
+static constexpr bool kWJEHABI = false;
+// wasm param indices under each ABI (callee shifts this/args by 1 under EHABI).
+static constexpr uint32_t kWJThisParam = kWJEHABI ? 2 : 1;
+static constexpr uint32_t kWJArg0Param = kWJEHABI ? 3 : 2;
+static constexpr uint32_t kWJCalleeParam = 1;  // EHABI only
 
 static constexpr uint32_t kWJResultSlot = 64;
 static constexpr uint32_t kWJThisSlot = 65;

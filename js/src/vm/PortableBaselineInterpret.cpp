@@ -127,6 +127,14 @@ static JSObject* gPBLResumeEnclosingEnv = nullptr;
 // InitFunctionEnvironmentObjects (which would discard live mid-function env state
 // -> navier wrong values). Cleared on consume.
 static bool gPBLResumeKeepEnv = false;
+// JS->wasm JIT try/catch: when true, the deopt resume is due to an exception thrown
+// inside a try region of a JIT'd function (signalled at an in-try call's intact
+// flag-check, NOT via lossy wasm-EH unwinding). After reconstructing the frame at the
+// throwing pc (exception already pending on cx), jump straight to the exception handler
+// (`goto error` -> HandleException), which walks the frame's trynotes and runs the
+// catch/finally in PBL (Warp skips catch blocks, so the JIT cannot run them). No
+// re-execution of the throwing op. Cleared on consume.
+static bool gPBLResumeInError = false;
 
 // Whether to compile interpreter dispatch loops using computed gotos
 // or direct switches.
@@ -6063,6 +6071,9 @@ PBIResult PortableBaselineInterpret(
 
   PBIResult ic_result = PBIResult::Ok;
   uint64_t ic_arg0 = 0, ic_arg1 = 0, ic_arg2 = 0, ic_ret = 0;
+  // JS->wasm JIT try/catch: declared here (before the IsRestart `goto ic_fail`) so that
+  // goto doesn't jump over its init; assigned after the frame/locals are seeded.
+  bool wjResumeInError = false;
 
   ICCtx ctx(cx_, frame, state, stack);
   auto* icEntries = frame->icScript()->icEntries();
@@ -6134,6 +6145,13 @@ PBIResult PortableBaselineInterpret(
   }
   ret->setUndefined();
 
+  // JS->wasm JIT try/catch: capture the resume-in-error flag before any PUSH_EXIT_FRAME
+  // below (which runs C++/JS that could re-enter a resume and clobber the global). Only
+  // meaningful on the JIT-resume path. Acted on just before the dispatch loop. (Declared
+  // earlier so the IsRestart goto doesn't cross its init.)
+  wjResumeInError = (osrLocals || osrStack) && gPBLResumeInError;
+  gPBLResumeInError = false;
+
   // Check if we are being debugged, and set a flag in the frame if so. This
   // flag must be set before calling InitFunctionEnvironmentObjects.
   if (frame->script()->isDebuggee()) {
@@ -6204,6 +6222,16 @@ PBIResult PortableBaselineInterpret(
                sp, ctx.stack.fp, frame, frame->script(), pc);
   TRACE_PRINTF("nslots = %d nfixed = %d\n", int(frame->script()->nslots()),
                int(frame->script()->nfixed()));
+
+  // JS->wasm JIT try/catch: the resume is an exception thrown inside a try region of a
+  // JIT'd function (frame now reconstructed at the throwing pc, exception pending on cx).
+  // Hand off to the standard exception handler -> walks this frame's trynotes -> catch/
+  // finally (or propagates if uncovered).
+  if (wjResumeInError) {
+    frame->interpreterPC() = pc;
+    SYNCSP();
+    goto error;
+  }
 
   while (true) {
     DEBUG_CHECK();
@@ -9513,7 +9541,8 @@ bool WasmJitResumeViaPBL(JSContext* cx, JSScript* script, uint64_t thisBits,
                          const uint64_t* osrLocals, uint32_t nLocals,
                          uint32_t pcOff, uint64_t* retBits,
                          const uint64_t* osrStack, uint32_t osrStackDepth,
-                         JSObject* enclosingEnv, bool keepFrameEnv) {
+                         JSObject* enclosingEnv, bool keepFrameEnv,
+                         bool resumeInError) {
   JSFunction* fun = script->function();
   if (!fun) return false;
   // Enter the function's realm: the resumed frame's realm must equal cx->realm() (the normal
@@ -9564,6 +9593,7 @@ bool WasmJitResumeViaPBL(JSContext* cx, JSScript* script, uint64_t thisBits,
   Value result;
   gPBLResumeEnclosingEnv = enclosingEnv;
   gPBLResumeKeepEnv = keepFrameEnv;
+  gPBLResumeInError = resumeInError;
   PBIResult ret = PortableBaselineInterpret<false, kHybridICsInterp>(
       cx, state, stack, sp, envChain, &result, pc, isd, nullptr, nullptr,
       nullptr, PBIResult::Ok, osrLocals, nLocals, osrStack, osrStackDepth);

@@ -105,27 +105,52 @@ static int AssembleAndInstall(MIRGenerator& mirGen, MIRGraph& graph,
     return -1;
   }
   size_t s;
-  // 3 types: type0 = main (f64 scratchbase, i64 this, i64 arg0..arg[kWJMaxArgs-1])
-  // -> f64; type1 = wjhelp (f64,f64)->f64; type2 = trampoline (f64)->f64.
-  if (!e.startSection(SectionId::Type, &s) || !e.writeVarU32(3)) return -1;
-  if (!e.writeFixedU8(0x60) || !e.writeVarU32(2 + kWJMaxArgs) ||
-      !e.writeFixedU8(kF64)) {
-    return -1;
+  if constexpr (kWJEHABI) {
+    // EHABI: 4 types. type0 = main (f64 sb, i64 callee, i64 this, i64 args...) -> i64
+    // (no flag; exceptions via wasm EH). type1 = wjhelp (f64,f64)->f64. type2 =
+    // trampoline (f64)->f64. type3 = $wjexn tag ()->() (payload-less; the JS exception
+    // value stays on cx).
+    if (!e.startSection(SectionId::Type, &s) || !e.writeVarU32(4)) return -1;
+    if (!e.writeFixedU8(0x60) || !e.writeVarU32(3 + kWJMaxArgs) ||
+        !e.writeFixedU8(kF64)) {
+      return -1;
+    }
+    for (uint32_t i = 0; i < 2 + kWJMaxArgs; i++) {
+      if (!e.writeFixedU8(kI64)) return -1;  // callee + this + args
+    }
+    if (!e.writeVarU32(1) || !e.writeFixedU8(kI64)) return -1;  // result: i64 only
+    if (!e.writeFixedU8(0x60) || !e.writeVarU32(2) || !e.writeFixedU8(kF64) ||
+        !e.writeFixedU8(kF64) || !e.writeVarU32(1) || !e.writeFixedU8(kF64))
+      return -1;  // type1 wjhelp
+    if (!e.writeFixedU8(0x60) || !e.writeVarU32(1) || !e.writeFixedU8(kF64) ||
+        !e.writeVarU32(1) || !e.writeFixedU8(kF64))
+      return -1;  // type2 trampoline
+    if (!e.writeFixedU8(0x60) || !e.writeVarU32(0) || !e.writeVarU32(0))
+      return -1;  // type3 tag ()->()
+    e.finishSection(s);
+  } else {
+    // 3 types: type0 = main (f64 scratchbase, i64 this, i64 arg0..arg[kWJMaxArgs-1])
+    // -> f64; type1 = wjhelp (f64,f64)->f64; type2 = trampoline (f64)->f64.
+    if (!e.startSection(SectionId::Type, &s) || !e.writeVarU32(3)) return -1;
+    if (!e.writeFixedU8(0x60) || !e.writeVarU32(2 + kWJMaxArgs) ||
+        !e.writeFixedU8(kF64)) {
+      return -1;
+    }
+    for (uint32_t i = 0; i < 1 + kWJMaxArgs; i++) {
+      if (!e.writeFixedU8(kI64)) return -1;  // this + args
+    }
+    if (!e.writeVarU32(2) || !e.writeFixedU8(kF64) || !e.writeFixedU8(kI64))
+      return -1;  // main results: [f64 deopt-flag, i64 boxed-result]
+    if (!e.writeFixedU8(0x60) || !e.writeVarU32(2) || !e.writeFixedU8(kF64) ||
+        !e.writeFixedU8(kF64) || !e.writeVarU32(1) || !e.writeFixedU8(kF64)) {
+      return -1;  // type1 wjhelp
+    }
+    if (!e.writeFixedU8(0x60) || !e.writeVarU32(1) || !e.writeFixedU8(kF64) ||
+        !e.writeVarU32(1) || !e.writeFixedU8(kF64)) {
+      return -1;  // type2 trampoline
+    }
+    e.finishSection(s);
   }
-  for (uint32_t i = 0; i < 1 + kWJMaxArgs; i++) {
-    if (!e.writeFixedU8(kI64)) return -1;  // this + args
-  }
-  if (!e.writeVarU32(2) || !e.writeFixedU8(kF64) || !e.writeFixedU8(kI64))
-    return -1;  // main results: [f64 deopt-flag, i64 boxed-result]
-  if (!e.writeFixedU8(0x60) || !e.writeVarU32(2) || !e.writeFixedU8(kF64) ||
-      !e.writeFixedU8(kF64) || !e.writeVarU32(1) || !e.writeFixedU8(kF64)) {
-    return -1;  // type1 wjhelp
-  }
-  if (!e.writeFixedU8(0x60) || !e.writeVarU32(1) || !e.writeFixedU8(kF64) ||
-      !e.writeVarU32(1) || !e.writeFixedU8(kF64)) {
-    return -1;  // type2 trampoline
-  }
-  e.finishSection(s);
 
   int memId = wasmhost_guest_mem_objid();
   if (memId < 0) return -1;
@@ -158,6 +183,18 @@ static int AssembleAndInstall(MIRGenerator& mirGen, MIRGraph& graph,
     return -1;
   }
   e.finishSection(s);
+
+  if constexpr (kWJEHABI) {
+    // Tag section (id 13): one local tag $wjexn (index 0), attribute 0x00 (exception),
+    // type index 3 (()->()). `throw 0` raises it; caught by try/catch_all. The JS
+    // exception value rides on cx, not the tag payload.
+    if (!e.startSection(SectionId::Tag, &s) || !e.writeVarU32(1) ||
+        !e.writeFixedU8(0x00) || !e.writeVarU32(3)) {
+      return -1;
+    }
+    e.finishSection(s);
+  }
+
   // Exports: "f" = trampoline (host entry, func idx 2) FIRST so it is export 0;
   // "m" = main (func idx 1) for shared-table registration.
   if (!e.startSection(SectionId::Export, &s) || !e.writeVarU32(2) ||
@@ -250,9 +287,14 @@ int WJWarpCompile(JSContext* cx, JSScript* script, uint32_t* nargsOut,
   // of landing in it -- e.g. gbemu initLCD's `try { new GameBoyCanvas() } catch`
   // (the headless canvas op throws; the catch must run) hard-failed. Bail such
   // functions to PBL, which handles try/catch correctly. They are typically cold
-  // (setup / feature-detection), so the perf cost is ~nil. GECKO_WJ_NOTRYBAIL
-  // keeps JIT-compiling them (for when catch landing pads are implemented).
-  if (!getenv("GECKO_WJ_NOTRYBAIL")) {
+  // (setup / feature-detection), so the perf cost is ~nil.
+  // 2026-06-27: NOW DEFAULT-OFF (try/catch fns COMPILE). The catch runs in PBL via
+  // deopt-in-error: an in-try call/helper that throws sets gWJResumeInError + deopts;
+  // PBL's HandleException walks the trynotes and runs the catch (Warp builds no
+  // catch-block MIR). try-body runs in JIT (the win: ubo compileToFilter et al.).
+  // Validated: tc_repro + octane no-regression + ubo correct. GECKO_WJ_TRYBAIL restores
+  // the old whole-function bail.
+  if (getenv("GECKO_WJ_TRYBAIL")) {
     // Only Catch/Finally need an exception LANDING pad (they swallow/handle a
     // throw). ForIn/ForOf/Destructuring/Loop try-notes are normal control-flow
     // cleanup -- bailing on those too is far too broad (it tanked richards 5x:

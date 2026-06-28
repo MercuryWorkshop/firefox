@@ -200,6 +200,7 @@ class Encoder {
   }
 
   size_t currentOffset() const { return bytes_.length(); }
+  const uint8_t* peekBytes() const { return bytes_.begin(); }
   bool empty() const { return currentOffset() == 0; }
 
   // Fixed-size encoding operations simply copy the literal bytes (without

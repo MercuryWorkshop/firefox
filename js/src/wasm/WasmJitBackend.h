@@ -106,6 +106,8 @@ enum WJHelpKind : int {
   WJH_NEWLEXENV = 43,        // gWJLexScope=LexicalScope* (raw) -> BlockLexicalEnvironmentObject::createWithoutEnclosing (Object); MNewLexicalEnvironmentObject
   WJH_CLOSEITER = 44,        // scratch[0]=iter(boxed Object), site=completionKind -> js::CloseIterOperation (for-of cleanup); MCloseIterCache
   WJH_ARRAYSLICE = 45,       // scratch[0]=array(boxed Object),[1]=begin(int32),[2]=end(int32) -> js::ArraySliceDense (Object); MArraySlice (caller guards packed)
+  WJH_ARRAYJOIN = 46,        // scratch[0]=array(boxed Object),[1]=sep(boxed String) -> js::jit::ArrayJoin (String); MArrayJoin
+  WJH_INCACHE = 47,          // scratch[0]=key(Value),[1]=obj(boxed Object) -> js::jit::OperatorIn (Boolean); MInCache (`key in obj`)
 };
 // MNewLexicalEnvironmentObject: the LexicalScope* baked from the template object.
 extern uint32_t gWJLexScope;
@@ -266,7 +268,7 @@ uint32_t WJAllocCtorSite();
 // is shape-pointer REUSE after a compacting GC, handled by clearing this IC on
 // major-GC marking in WJTraceRoots. Indexed [site * kWJPropWays + way].
 static constexpr uint32_t kWJPropSites = 16384;
-static constexpr uint32_t kWJPropWays = 8;
+static constexpr uint32_t kWJPropWays = 4;
 // gWJPropOff sentinel meaning "this shape -> property is MISSING, yield undefined"
 // (no slot load). A real TaggedSlotOffset is small; 0xFFFFFFFF can't collide.
 static constexpr uint32_t kWJPropMissingSentinel = 0xFFFFFFFFu;

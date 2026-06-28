@@ -1866,6 +1866,28 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
     return 0.0;
   }
 
+  if (kind == js::wasm::WJH_ARRAYJOIN) {
+    // MArrayJoin: array.join(sep). js::jit::ArrayJoin handles any array (calls
+    // array_join). scratch[0]=array(Object), scratch[1]=separator(String).
+    JS::RootedObject arr(cx, &JS::Value::fromRawBits(gWJScratch[0]).toObject());
+    JS::RootedString sep(cx, JS::Value::fromRawBits(gWJScratch[1]).toString());
+    JSString* res = js::jit::ArrayJoin(cx, arr, sep);
+    if (!res) return 1.0;
+    gWJScratch[js::wasm::kWJResultSlot] = JS::StringValue(res).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_INCACHE) {
+    // MInCache (`key in obj`): general OperatorIn (ToPropertyKey + HasProperty).
+    // scratch[0]=key(Value), scratch[1]=obj(Object).
+    RootedValue key(cx, JS::Value::fromRawBits(gWJScratch[0]));
+    JS::RootedObject obj(cx, &JS::Value::fromRawBits(gWJScratch[1]).toObject());
+    bool out = false;
+    if (!js::jit::OperatorIn(cx, key, obj, &out)) return 1.0;
+    gWJScratch[js::wasm::kWJResultSlot] = JS::BooleanValue(out).asRawBits();
+    return 0.0;
+  }
+
   if (kind == js::wasm::WJH_CLOSEITER) {
     // MCloseIterCache: for-of early-exit cleanup -- call iter's return() if present.
     // site = CompletionKind (0 Normal / 1 Throw / 2 Return).

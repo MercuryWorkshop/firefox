@@ -663,8 +663,13 @@ JSObject* GetOrCreateFuncWrapper(JSContext* cx, Instance* inst,
 // ---- compile ---------------------------------------------------------------
 
 JSObject* CompileBytes(JSContext* cx, const uint8_t* bytes, size_t len) {
-  // Validate with Core features only so SIMD/threads/EH/GC modules are rejected
-  // cleanly instead of trapping mid-execution.
+  if (getenv("GECKO_INTERP_DEBUG")) {
+    fprintf(stderr, "[interp] CompileBytes len=%zu simdAvail=%d\n", len,
+            (int)SimdAvailable(cx));
+  }
+  // Validate with the interpreter's supported feature set. SIMD is accepted when
+  // SimdAvailable() (the interp implements it); unsupported features still get a
+  // clean CompileError instead of trapping mid-execution.
   FeatureOptions options;
   UniqueChars error;
   BytecodeSource source(bytes, len);

@@ -193,6 +193,36 @@ static bool SkipImmediates(Reader& r, uint8_t op) {
       (void)r.u32leb();  // offset
       return r.ok;
     }
+    case Op::SimdPrefix: {
+      uint32_t sub = r.u32leb();  // SimdOp (varU32; relaxed ops are > 0xff)
+      if (!r.ok) return false;
+      // Memory loads/stores + splats + load{32,64}_zero: memarg (align + offset).
+      // SimdOp 0x00..0x0b = V128Load..V128Store; 0x5c/0x5d = Load32/64Zero.
+      if (sub <= 0x0b || sub == 0x5c || sub == 0x5d) {
+        (void)r.u32leb();  // align
+        (void)r.u32leb();  // offset
+        return r.ok;
+      }
+      // Load/store lane (0x54..0x5b): memarg + 1-byte lane index.
+      if (sub >= 0x54 && sub <= 0x5b) {
+        (void)r.u32leb();
+        (void)r.u32leb();
+        (void)r.u8();
+        return r.ok;
+      }
+      // v128.const (0x0c) + i8x16.shuffle (0x0d): 16-byte immediate.
+      if (sub == 0x0c || sub == 0x0d) {
+        r.skip(16);
+        return r.ok;
+      }
+      // extract_lane / replace_lane (0x15..0x22): 1-byte lane index.
+      if (sub >= 0x15 && sub <= 0x22) {
+        (void)r.u8();
+        return r.ok;
+      }
+      // Everything else (splat/arith/compare/convert/...): no immediate.
+      return r.ok;
+    }
     default:
       // All remaining Core ops have no immediates.
       return true;

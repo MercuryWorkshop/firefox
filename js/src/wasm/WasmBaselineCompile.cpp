@@ -139,6 +139,15 @@
  *      to the Ion version of the function.  Hence lazy tier-up is achieved.
  */
 
+// SIMD codegen requires a real assembler backend. In a JS_CODEGEN_NONE build
+// (--disable-jit) there is none, and content wasm runs via the in-process
+// interpreter (which handles SIMD itself), so this codegen path is dead. Drop
+// ENABLE_WASM_SIMD here so the dead SIMD emitters don't reference backend-only
+// macro-assembler ops that the none-backend lacks.
+#if defined(JS_CODEGEN_NONE) && defined(ENABLE_WASM_SIMD)
+#  undef ENABLE_WASM_SIMD
+#endif
+
 #include "wasm/WasmBaselineCompile.h"
 
 #include "wasm/WasmAnyRef.h"

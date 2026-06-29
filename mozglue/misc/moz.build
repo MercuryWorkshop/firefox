@@ -51,6 +51,12 @@ SOURCES += [
     "StackWalk.cpp",
 ]
 
+if CONFIG["OS_TARGET"] == "EMSCRIPTEN":
+    # SIMD.cpp's SSE2 string-scan paths are gated on MOZILLA_PRESUME_SSE2 (presumed on
+    # wasm in SSE.h). On x86_64 the intrinsics come from the default -march; on wasm we
+    # must pass -msse2 explicitly so emscripten lowers the SSE2 intrinsics to wasm SIMD.
+    SOURCES["SIMD.cpp"].flags += CONFIG["SSE2_FLAGS"]
+
 if CONFIG["TARGET_CPU"].startswith("x86"):
     SOURCES += [
         "SIMD_avx2.cpp",

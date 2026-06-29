@@ -797,6 +797,11 @@ set_define("ENABLE_SHARED_MEMORY", enable_shared_memory)
 
 @depends("--enable-jit", "--enable-simulator", target)
 def default_wasm_simd(jit_enabled, simulator, target):
+    # wasm32 (emscripten) build: SIMD is executed by the in-process interpreter
+    # (GECKO_WASM_INTERP), which needs no JIT codegen, so enable it by default.
+    if target.cpu == "wasm32":
+        return True
+
     if not jit_enabled:
         return
 
@@ -824,6 +829,12 @@ option(
 def wasm_simd(value, jit_enabled, simulator, target, no_experimental):
     if no_experimental or not value:
         return
+
+    # wasm32 interpreter build: the interpreter executes the SIMD opcodes itself
+    # (see wasm::SimdAvailable / WasmInterp), so it does not require a JIT backend
+    # the way the historical x86/arm64 SIMD codegen did.
+    if target.cpu == "wasm32":
+        return True
 
     if not jit_enabled:
         die("--enable-wasm-simd requires --enable-jit")

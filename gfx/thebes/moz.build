@@ -189,8 +189,9 @@ elif CONFIG["MOZ_WIDGET_TOOLKIT"] == "windows":
         "gfxDWriteFontList.cpp",
     ]
 
-# Are we targeting x86 or x64?  If so, build gfxAlphaRecoverySSE2.cpp.
-if CONFIG["INTEL_ARCHITECTURE"]:
+# x86/x64 natively, or wasm via emscripten's SSE->wasm-SIMD shim (gfxAlphaRecovery uses
+# xsimd, which has a native wasm backend / works over the SSE2 shim).
+if CONFIG["INTEL_ARCHITECTURE"] or CONFIG["OS_TARGET"] == "EMSCRIPTEN":
     SOURCES += ["gfxAlphaRecoverySSE2.cpp"]
     # The file uses SSE2 intrinsics, so it needs special compile flags on some
     # compilers.

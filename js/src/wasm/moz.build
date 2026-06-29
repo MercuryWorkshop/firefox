@@ -14,9 +14,6 @@ include("../js-cxxflags.mozbuild")
 UNIFIED_SOURCES += [
     "AsmJS.cpp",
     "WasmAnyRef.cpp",
-    "WasmBaselineCompile.cpp",
-    "WasmBCFrame.cpp",
-    "WasmBCMemory.cpp",
     "WasmBinary.cpp",
     "WasmBuiltinModule.cpp",
     "WasmBuiltins.cpp",
@@ -67,6 +64,25 @@ SOURCES += [
     "WasmJitRuntime.cpp",
     "WasmJitWarp.cpp",
 ]
+
+# In a JS_CODEGEN_NONE build (--disable-jit) the rabaldr baseline compiler is
+# dead, but with ENABLE_WASM_SIMD enabled (for the in-process interpreter's
+# front-end validation) its SIMD emitters reference backend-only macro-assembler
+# ops the none-backend lacks. These TUs locally `#undef ENABLE_WASM_SIMD`; build
+# them non-unified so that undef cannot leak into the SIMD-aware front-end TUs
+# (e.g. WasmBinary.cpp) that share a unified compilation unit.
+if CONFIG["JS_CODEGEN_NONE"]:
+    SOURCES += [
+        "WasmBaselineCompile.cpp",
+        "WasmBCFrame.cpp",
+        "WasmBCMemory.cpp",
+    ]
+else:
+    UNIFIED_SOURCES += [
+        "WasmBaselineCompile.cpp",
+        "WasmBCFrame.cpp",
+        "WasmBCMemory.cpp",
+    ]
 
 # Generate wasm/WasmBuiltinModuleGenerated.h from wasm/WasmBuiltinModule.yaml
 GeneratedFile(

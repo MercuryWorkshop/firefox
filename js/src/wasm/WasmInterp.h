@@ -45,6 +45,14 @@
 #  include <emscripten.h>
 #endif
 
+// WebAssembly SIMD (v128): the interpreter executes the 0xFD opcodes by passing
+// them through to the host's native wasm SIMD via these intrinsics (the engine
+// is built -msimd128). Available only when the TU is compiled with SIMD; the
+// exec loop's SIMD cases are guarded on the same macro.
+#if defined(__wasm_simd128__)
+#  include <wasm_simd128.h>
+#endif
+
 namespace js {
 namespace wasm {
 namespace interp {
@@ -53,7 +61,7 @@ using mozilla::Vector;
 
 // ---- Value types -----------------------------------------------------------
 
-enum class VT : uint8_t { I32, I64, F32, F64, FuncRef, ExternRef, Void };
+enum class VT : uint8_t { I32, I64, F32, F64, FuncRef, ExternRef, Void, V128 };
 
 static inline bool IsRefVT(VT t) {
   return t == VT::FuncRef || t == VT::ExternRef;
@@ -68,6 +76,7 @@ static inline bool DecodeVT(uint8_t b, VT* out) {
     case uint8_t(TypeCode::F64): *out = VT::F64; return true;
     case uint8_t(TypeCode::FuncRef): *out = VT::FuncRef; return true;
     case uint8_t(TypeCode::ExternRef): *out = VT::ExternRef; return true;
+    case uint8_t(TypeCode::V128): *out = VT::V128; return true;
     default: return false;
   }
 }
@@ -81,6 +90,11 @@ union Cell {
   uint64_t u64;
   float f32;
   double f64;
+  // SIMD v128: 16 raw bytes. Makes Cell 16 bytes. GC tracing keys off tags[]
+  // (only externref cells are traced, via the leading u64), so a v128 cell is
+  // never misread as a ref. The exec loop loads/stores it via wasm_v128_load/
+  // store (unaligned-safe), so the 8-byte union alignment is fine.
+  uint8_t v128[16];
 };
 
 // ---- Module structures (immutable after decode) ----------------------------

@@ -236,6 +236,15 @@ bool wasm::IsPrivilegedContext(JSContext* cx) {
 }
 
 bool wasm::SimdAvailable(JSContext* cx) {
+#if defined(__EMSCRIPTEN__) && defined(__wasm_simd128__)
+  // The in-process interpreter implements SIMD (v128) itself, executing the 0xFD
+  // opcodes via the host's native wasm SIMD (the engine is compiled -msimd128),
+  // so it needs no JIT backend (JitSupportsWasmSimd is false under --disable-jit).
+  // Report SIMD available so validation accepts v128 + the SIMD opcodes. Gated on
+  // __wasm_simd128__ so a non-SIMD interp build still rejects SIMD at validation
+  // (consistent with the exec loop, which has no SIMD cases without the header).
+  if (UseInterp()) return true;
+#endif
   return js::jit::JitSupportsWasmSimd();
 }
 

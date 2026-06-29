@@ -131,13 +131,15 @@ if CONFIG["TARGET_CPU"] == "aarch64" or CONFIG["BUILD_ARM_NEON"]:
     SOURCES += ["AudioNodeEngineNEON.cpp"]
     SOURCES["AudioNodeEngineNEON.cpp"].flags += CONFIG["NEON_FLAGS"]
 
-# Are we targeting x86 or x64?  If so, build SSEX files.
-if CONFIG["INTEL_ARCHITECTURE"]:
+# x86/x64 natively, or wasm via emscripten's SSE->wasm-SIMD shim (uses xsimd).
+if CONFIG["INTEL_ARCHITECTURE"] or CONFIG["OS_TARGET"] == "EMSCRIPTEN":
     DEFINES["USE_SSE2"] = True
     SOURCES += ["AudioNodeEngineSSE2.cpp"]
     LOCAL_INCLUDES += ["/third_party/xsimd/include"]
     SOURCES["AudioNodeEngineSSE2.cpp"].flags += CONFIG["SSE2_FLAGS"]
-    if CONFIG["SSE4_2_FLAGS"]:
+    # SSE4.2 stays x86-only: supports_sse4_2() is false on wasm (not presumed) and the
+    # file is built with SSE2 flags only, so USE_SSE4_2 there would be a dead/broken path.
+    if CONFIG["SSE4_2_FLAGS"] and CONFIG["OS_TARGET"] != "EMSCRIPTEN":
         DEFINES["USE_SSE4_2"] = True
         SOURCES += ["AudioNodeEngineSSE4_2.cpp"]
         SOURCES["AudioNodeEngineSSE4_2.cpp"].flags += CONFIG["SSE4_2_FLAGS"]

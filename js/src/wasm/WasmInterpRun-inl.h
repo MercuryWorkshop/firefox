@@ -1234,6 +1234,436 @@ bool Instance::runFunc(const FuncDef& fn, uint32_t fi, Cell* args,
         break;
       }
 
+      // ---- SIMD (v128, 0xFD prefix) ------------------------------------------
+      // Pass-through: each guest SIMD op maps to the host's native wasm SIMD via
+      // wasm_simd128.h intrinsics (the engine is built -msimd128), so the guest's
+      // vector op executes as ONE host SIMD instruction. Ops with runtime
+      // immediates the intrinsics can't take as constants (extract/replace lane,
+      // shuffle, load/store lane) are done by indexing the 16 v128 bytes.
+      case Op::SimdPrefix: {
+#if defined(__wasm_simd128__)
+        uint32_t sub = rdU32();
+#define SIMD_BINOP(FN)                                       \
+  {                                                          \
+    v128_t b_ = wasm_v128_load(stk[sp - 1].v128);            \
+    v128_t a_ = wasm_v128_load(stk[sp - 2].v128);            \
+    sp--;                                                    \
+    wasm_v128_store(stk[sp - 1].v128, (FN)(a_, b_));         \
+    tags[sp - 1] = 0;                                        \
+    break;                                                   \
+  }
+#define SIMD_UNOP(FN)                                        \
+  {                                                          \
+    v128_t a_ = wasm_v128_load(stk[sp - 1].v128);            \
+    wasm_v128_store(stk[sp - 1].v128, (FN)(a_));             \
+    tags[sp - 1] = 0;                                        \
+    break;                                                   \
+  }
+#define SIMD_SPLAT(FN, FIELD)                                \
+  {                                                          \
+    auto s_ = stk[sp - 1].FIELD;                             \
+    wasm_v128_store(stk[sp - 1].v128, (FN)(s_));             \
+    tags[sp - 1] = 0;                                        \
+    break;                                                   \
+  }
+#define SIMD_SHIFT(FN)                                       \
+  {                                                          \
+    uint32_t c_ = stk[sp - 1].u32;                           \
+    v128_t a_ = wasm_v128_load(stk[sp - 2].v128);            \
+    sp--;                                                    \
+    wasm_v128_store(stk[sp - 1].v128, (FN)(a_, c_));         \
+    tags[sp - 1] = 0;                                        \
+    break;                                                   \
+  }
+#define SIMD_LOAD(SZ, FN)                                          \
+  {                                                                \
+    rdU32();                                                       \
+    uint64_t off_ = rdU32();                                       \
+    uint64_t a_ = stk[sp - 1].u32;                                 \
+    uint64_t ea_ = a_ + off_;                                      \
+    if (ea_ + (SZ) > lm->size) TRAP(JSMSG_WASM_OUT_OF_BOUNDS);     \
+    wasm_v128_store(stk[sp - 1].v128, (FN)(lm->base + ea_));       \
+    tags[sp - 1] = 0;                                              \
+    break;                                                         \
+  }
+#define SIMD_EXTRACT(CTYPE, DST, SEXT)                       \
+  {                                                          \
+    uint8_t lane_ = *pc++;                                   \
+    CTYPE* p_ = (CTYPE*)stk[sp - 1].v128;                    \
+    stk[sp - 1].DST = (SEXT)p_[lane_];                       \
+    tags[sp - 1] = 0;                                        \
+    break;                                                   \
+  }
+#define SIMD_REPLACE(CTYPE, SRC)                             \
+  {                                                          \
+    uint8_t lane_ = *pc++;                                   \
+    CTYPE v_ = (CTYPE)stk[sp - 1].SRC;                       \
+    sp--;                                                    \
+    ((CTYPE*)stk[sp - 1].v128)[lane_] = v_;                  \
+    tags[sp - 1] = 0;                                        \
+    break;                                                   \
+  }
+#define SIMD_TEST(EXPR)                                      \
+  {                                                          \
+    v128_t a_ = wasm_v128_load(stk[sp - 1].v128);            \
+    stk[sp - 1].i32 = (int32_t)(EXPR);                       \
+    tags[sp - 1] = 0;                                        \
+    break;                                                   \
+  }
+        switch (SimdOp(sub)) {
+          // -- loads / stores --
+          case SimdOp::V128Load: SIMD_LOAD(16, wasm_v128_load)
+          case SimdOp::V128Load8Splat: SIMD_LOAD(1, wasm_v128_load8_splat)
+          case SimdOp::V128Load16Splat: SIMD_LOAD(2, wasm_v128_load16_splat)
+          case SimdOp::V128Load32Splat: SIMD_LOAD(4, wasm_v128_load32_splat)
+          case SimdOp::V128Load64Splat: SIMD_LOAD(8, wasm_v128_load64_splat)
+          case SimdOp::V128Load8x8S: SIMD_LOAD(8, wasm_i16x8_load8x8)
+          case SimdOp::V128Load8x8U: SIMD_LOAD(8, wasm_u16x8_load8x8)
+          case SimdOp::V128Load16x4S: SIMD_LOAD(8, wasm_i32x4_load16x4)
+          case SimdOp::V128Load16x4U: SIMD_LOAD(8, wasm_u32x4_load16x4)
+          case SimdOp::V128Load32x2S: SIMD_LOAD(8, wasm_i64x2_load32x2)
+          case SimdOp::V128Load32x2U: SIMD_LOAD(8, wasm_u64x2_load32x2)
+          case SimdOp::V128Load32Zero: SIMD_LOAD(4, wasm_v128_load32_zero)
+          case SimdOp::V128Load64Zero: SIMD_LOAD(8, wasm_v128_load64_zero)
+          case SimdOp::V128Store: {
+            rdU32();
+            uint64_t off_ = rdU32();
+            v128_t v_ = wasm_v128_load(stk[sp - 1].v128);
+            uint64_t a_ = stk[sp - 2].u32;
+            uint64_t ea_ = a_ + off_;
+            if (ea_ + 16 > lm->size) TRAP(JSMSG_WASM_OUT_OF_BOUNDS);
+            wasm_v128_store(lm->base + ea_, v_);
+            sp -= 2;
+            break;
+          }
+#define SIMD_LOAD_LANE(SZ, CTYPE)                                  \
+  {                                                                \
+    rdU32();                                                       \
+    uint64_t off_ = rdU32();                                       \
+    uint8_t lane_ = *pc++;                                         \
+    v128_t v_ = wasm_v128_load(stk[sp - 1].v128);                  \
+    uint64_t a_ = stk[sp - 2].u32;                                 \
+    uint64_t ea_ = a_ + off_;                                      \
+    if (ea_ + (SZ) > lm->size) TRAP(JSMSG_WASM_OUT_OF_BOUNDS);     \
+    CTYPE e_;                                                      \
+    memcpy(&e_, lm->base + ea_, SZ);                              \
+    ((CTYPE*)&v_)[lane_] = e_;                                     \
+    sp--;                                                          \
+    wasm_v128_store(stk[sp - 1].v128, v_);                         \
+    tags[sp - 1] = 0;                                              \
+    break;                                                         \
+  }
+          case SimdOp::V128Load8Lane: SIMD_LOAD_LANE(1, uint8_t)
+          case SimdOp::V128Load16Lane: SIMD_LOAD_LANE(2, uint16_t)
+          case SimdOp::V128Load32Lane: SIMD_LOAD_LANE(4, uint32_t)
+          case SimdOp::V128Load64Lane: SIMD_LOAD_LANE(8, uint64_t)
+#undef SIMD_LOAD_LANE
+#define SIMD_STORE_LANE(SZ, CTYPE)                                 \
+  {                                                                \
+    rdU32();                                                       \
+    uint64_t off_ = rdU32();                                       \
+    uint8_t lane_ = *pc++;                                         \
+    v128_t v_ = wasm_v128_load(stk[sp - 1].v128);                  \
+    uint64_t a_ = stk[sp - 2].u32;                                 \
+    uint64_t ea_ = a_ + off_;                                      \
+    if (ea_ + (SZ) > lm->size) TRAP(JSMSG_WASM_OUT_OF_BOUNDS);     \
+    CTYPE e_ = ((CTYPE*)&v_)[lane_];                               \
+    memcpy(lm->base + ea_, &e_, SZ);                              \
+    sp -= 2;                                                       \
+    break;                                                         \
+  }
+          case SimdOp::V128Store8Lane: SIMD_STORE_LANE(1, uint8_t)
+          case SimdOp::V128Store16Lane: SIMD_STORE_LANE(2, uint16_t)
+          case SimdOp::V128Store32Lane: SIMD_STORE_LANE(4, uint32_t)
+          case SimdOp::V128Store64Lane: SIMD_STORE_LANE(8, uint64_t)
+#undef SIMD_STORE_LANE
+
+          // -- const / shuffle / swizzle --
+          case SimdOp::V128Const: {
+            memcpy(stk[sp].v128, pc, 16);
+            pc += 16;
+            tags[sp] = 0;
+            sp++;
+            break;
+          }
+          case SimdOp::I8x16Shuffle: {
+            const uint8_t* idx_ = pc;
+            pc += 16;
+            uint8_t a_[16], b_[16], out_[16];
+            memcpy(a_, stk[sp - 2].v128, 16);
+            memcpy(b_, stk[sp - 1].v128, 16);
+            for (int i = 0; i < 16; i++) {
+              uint8_t k = idx_[i];
+              out_[i] = k < 16 ? a_[k] : b_[k - 16];
+            }
+            sp--;
+            memcpy(stk[sp - 1].v128, out_, 16);
+            tags[sp - 1] = 0;
+            break;
+          }
+          case SimdOp::I8x16Swizzle: SIMD_BINOP(wasm_i8x16_swizzle)
+
+          // -- splat --
+          case SimdOp::I8x16Splat: SIMD_SPLAT(wasm_i8x16_splat, i32)
+          case SimdOp::I16x8Splat: SIMD_SPLAT(wasm_i16x8_splat, i32)
+          case SimdOp::I32x4Splat: SIMD_SPLAT(wasm_i32x4_splat, i32)
+          case SimdOp::I64x2Splat: SIMD_SPLAT(wasm_i64x2_splat, i64)
+          case SimdOp::F32x4Splat: SIMD_SPLAT(wasm_f32x4_splat, f32)
+          case SimdOp::F64x2Splat: SIMD_SPLAT(wasm_f64x2_splat, f64)
+
+          // -- extract / replace lane (runtime lane index) --
+          case SimdOp::I8x16ExtractLaneS: SIMD_EXTRACT(int8_t, i32, int32_t)
+          case SimdOp::I8x16ExtractLaneU: SIMD_EXTRACT(uint8_t, i32, uint32_t)
+          case SimdOp::I16x8ExtractLaneS: SIMD_EXTRACT(int16_t, i32, int32_t)
+          case SimdOp::I16x8ExtractLaneU: SIMD_EXTRACT(uint16_t, i32, uint32_t)
+          case SimdOp::I32x4ExtractLane: SIMD_EXTRACT(int32_t, i32, int32_t)
+          case SimdOp::I64x2ExtractLane: SIMD_EXTRACT(int64_t, i64, int64_t)
+          case SimdOp::F32x4ExtractLane: SIMD_EXTRACT(float, f32, float)
+          case SimdOp::F64x2ExtractLane: SIMD_EXTRACT(double, f64, double)
+          case SimdOp::I8x16ReplaceLane: SIMD_REPLACE(int8_t, i32)
+          case SimdOp::I16x8ReplaceLane: SIMD_REPLACE(int16_t, i32)
+          case SimdOp::I32x4ReplaceLane: SIMD_REPLACE(int32_t, i32)
+          case SimdOp::I64x2ReplaceLane: SIMD_REPLACE(int64_t, i64)
+          case SimdOp::F32x4ReplaceLane: SIMD_REPLACE(float, f32)
+          case SimdOp::F64x2ReplaceLane: SIMD_REPLACE(double, f64)
+
+          // -- comparisons --
+          case SimdOp::I8x16Eq: SIMD_BINOP(wasm_i8x16_eq)
+          case SimdOp::I8x16Ne: SIMD_BINOP(wasm_i8x16_ne)
+          case SimdOp::I8x16LtS: SIMD_BINOP(wasm_i8x16_lt)
+          case SimdOp::I8x16LtU: SIMD_BINOP(wasm_u8x16_lt)
+          case SimdOp::I8x16GtS: SIMD_BINOP(wasm_i8x16_gt)
+          case SimdOp::I8x16GtU: SIMD_BINOP(wasm_u8x16_gt)
+          case SimdOp::I8x16LeS: SIMD_BINOP(wasm_i8x16_le)
+          case SimdOp::I8x16LeU: SIMD_BINOP(wasm_u8x16_le)
+          case SimdOp::I8x16GeS: SIMD_BINOP(wasm_i8x16_ge)
+          case SimdOp::I8x16GeU: SIMD_BINOP(wasm_u8x16_ge)
+          case SimdOp::I16x8Eq: SIMD_BINOP(wasm_i16x8_eq)
+          case SimdOp::I16x8Ne: SIMD_BINOP(wasm_i16x8_ne)
+          case SimdOp::I16x8LtS: SIMD_BINOP(wasm_i16x8_lt)
+          case SimdOp::I16x8LtU: SIMD_BINOP(wasm_u16x8_lt)
+          case SimdOp::I16x8GtS: SIMD_BINOP(wasm_i16x8_gt)
+          case SimdOp::I16x8GtU: SIMD_BINOP(wasm_u16x8_gt)
+          case SimdOp::I16x8LeS: SIMD_BINOP(wasm_i16x8_le)
+          case SimdOp::I16x8LeU: SIMD_BINOP(wasm_u16x8_le)
+          case SimdOp::I16x8GeS: SIMD_BINOP(wasm_i16x8_ge)
+          case SimdOp::I16x8GeU: SIMD_BINOP(wasm_u16x8_ge)
+          case SimdOp::I32x4Eq: SIMD_BINOP(wasm_i32x4_eq)
+          case SimdOp::I32x4Ne: SIMD_BINOP(wasm_i32x4_ne)
+          case SimdOp::I32x4LtS: SIMD_BINOP(wasm_i32x4_lt)
+          case SimdOp::I32x4LtU: SIMD_BINOP(wasm_u32x4_lt)
+          case SimdOp::I32x4GtS: SIMD_BINOP(wasm_i32x4_gt)
+          case SimdOp::I32x4GtU: SIMD_BINOP(wasm_u32x4_gt)
+          case SimdOp::I32x4LeS: SIMD_BINOP(wasm_i32x4_le)
+          case SimdOp::I32x4LeU: SIMD_BINOP(wasm_u32x4_le)
+          case SimdOp::I32x4GeS: SIMD_BINOP(wasm_i32x4_ge)
+          case SimdOp::I32x4GeU: SIMD_BINOP(wasm_u32x4_ge)
+          case SimdOp::I64x2Eq: SIMD_BINOP(wasm_i64x2_eq)
+          case SimdOp::I64x2Ne: SIMD_BINOP(wasm_i64x2_ne)
+          case SimdOp::I64x2LtS: SIMD_BINOP(wasm_i64x2_lt)
+          case SimdOp::I64x2GtS: SIMD_BINOP(wasm_i64x2_gt)
+          case SimdOp::I64x2LeS: SIMD_BINOP(wasm_i64x2_le)
+          case SimdOp::I64x2GeS: SIMD_BINOP(wasm_i64x2_ge)
+          case SimdOp::F32x4Eq: SIMD_BINOP(wasm_f32x4_eq)
+          case SimdOp::F32x4Ne: SIMD_BINOP(wasm_f32x4_ne)
+          case SimdOp::F32x4Lt: SIMD_BINOP(wasm_f32x4_lt)
+          case SimdOp::F32x4Gt: SIMD_BINOP(wasm_f32x4_gt)
+          case SimdOp::F32x4Le: SIMD_BINOP(wasm_f32x4_le)
+          case SimdOp::F32x4Ge: SIMD_BINOP(wasm_f32x4_ge)
+          case SimdOp::F64x2Eq: SIMD_BINOP(wasm_f64x2_eq)
+          case SimdOp::F64x2Ne: SIMD_BINOP(wasm_f64x2_ne)
+          case SimdOp::F64x2Lt: SIMD_BINOP(wasm_f64x2_lt)
+          case SimdOp::F64x2Gt: SIMD_BINOP(wasm_f64x2_gt)
+          case SimdOp::F64x2Le: SIMD_BINOP(wasm_f64x2_le)
+          case SimdOp::F64x2Ge: SIMD_BINOP(wasm_f64x2_ge)
+
+          // -- bitwise / boolean --
+          case SimdOp::V128Not: SIMD_UNOP(wasm_v128_not)
+          case SimdOp::V128And: SIMD_BINOP(wasm_v128_and)
+          case SimdOp::V128AndNot: SIMD_BINOP(wasm_v128_andnot)
+          case SimdOp::V128Or: SIMD_BINOP(wasm_v128_or)
+          case SimdOp::V128Xor: SIMD_BINOP(wasm_v128_xor)
+          case SimdOp::V128AnyTrue: SIMD_TEST(wasm_v128_any_true(a_) ? 1 : 0)
+          case SimdOp::I8x16AllTrue: SIMD_TEST(wasm_i8x16_all_true(a_) ? 1 : 0)
+          case SimdOp::I16x8AllTrue: SIMD_TEST(wasm_i16x8_all_true(a_) ? 1 : 0)
+          case SimdOp::I32x4AllTrue: SIMD_TEST(wasm_i32x4_all_true(a_) ? 1 : 0)
+          case SimdOp::I64x2AllTrue: SIMD_TEST(wasm_i64x2_all_true(a_) ? 1 : 0)
+          case SimdOp::I8x16Bitmask: SIMD_TEST(wasm_i8x16_bitmask(a_))
+          case SimdOp::I16x8Bitmask: SIMD_TEST(wasm_i16x8_bitmask(a_))
+          case SimdOp::I32x4Bitmask: SIMD_TEST(wasm_i32x4_bitmask(a_))
+          case SimdOp::I64x2Bitmask: SIMD_TEST(wasm_i64x2_bitmask(a_))
+          case SimdOp::V128Bitselect: {
+            v128_t m_ = wasm_v128_load(stk[sp - 1].v128);
+            v128_t b_ = wasm_v128_load(stk[sp - 2].v128);
+            v128_t a_ = wasm_v128_load(stk[sp - 3].v128);
+            sp -= 2;
+            wasm_v128_store(stk[sp - 1].v128, wasm_v128_bitselect(a_, b_, m_));
+            tags[sp - 1] = 0;
+            break;
+          }
+
+          // -- integer unary --
+          case SimdOp::I8x16Abs: SIMD_UNOP(wasm_i8x16_abs)
+          case SimdOp::I8x16Neg: SIMD_UNOP(wasm_i8x16_neg)
+          case SimdOp::I8x16Popcnt: SIMD_UNOP(wasm_i8x16_popcnt)
+          case SimdOp::I16x8Abs: SIMD_UNOP(wasm_i16x8_abs)
+          case SimdOp::I16x8Neg: SIMD_UNOP(wasm_i16x8_neg)
+          case SimdOp::I32x4Abs: SIMD_UNOP(wasm_i32x4_abs)
+          case SimdOp::I32x4Neg: SIMD_UNOP(wasm_i32x4_neg)
+          case SimdOp::I64x2Abs: SIMD_UNOP(wasm_i64x2_abs)
+          case SimdOp::I64x2Neg: SIMD_UNOP(wasm_i64x2_neg)
+
+          // -- integer add/sub/mul/min/max/sat/avgr --
+          case SimdOp::I8x16Add: SIMD_BINOP(wasm_i8x16_add)
+          case SimdOp::I8x16AddSatS: SIMD_BINOP(wasm_i8x16_add_sat)
+          case SimdOp::I8x16AddSatU: SIMD_BINOP(wasm_u8x16_add_sat)
+          case SimdOp::I8x16Sub: SIMD_BINOP(wasm_i8x16_sub)
+          case SimdOp::I8x16SubSatS: SIMD_BINOP(wasm_i8x16_sub_sat)
+          case SimdOp::I8x16SubSatU: SIMD_BINOP(wasm_u8x16_sub_sat)
+          case SimdOp::I8x16MinS: SIMD_BINOP(wasm_i8x16_min)
+          case SimdOp::I8x16MinU: SIMD_BINOP(wasm_u8x16_min)
+          case SimdOp::I8x16MaxS: SIMD_BINOP(wasm_i8x16_max)
+          case SimdOp::I8x16MaxU: SIMD_BINOP(wasm_u8x16_max)
+          case SimdOp::I8x16AvgrU: SIMD_BINOP(wasm_u8x16_avgr)
+          case SimdOp::I16x8Add: SIMD_BINOP(wasm_i16x8_add)
+          case SimdOp::I16x8AddSatS: SIMD_BINOP(wasm_i16x8_add_sat)
+          case SimdOp::I16x8AddSatU: SIMD_BINOP(wasm_u16x8_add_sat)
+          case SimdOp::I16x8Sub: SIMD_BINOP(wasm_i16x8_sub)
+          case SimdOp::I16x8SubSatS: SIMD_BINOP(wasm_i16x8_sub_sat)
+          case SimdOp::I16x8SubSatU: SIMD_BINOP(wasm_u16x8_sub_sat)
+          case SimdOp::I16x8Mul: SIMD_BINOP(wasm_i16x8_mul)
+          case SimdOp::I16x8MinS: SIMD_BINOP(wasm_i16x8_min)
+          case SimdOp::I16x8MinU: SIMD_BINOP(wasm_u16x8_min)
+          case SimdOp::I16x8MaxS: SIMD_BINOP(wasm_i16x8_max)
+          case SimdOp::I16x8MaxU: SIMD_BINOP(wasm_u16x8_max)
+          case SimdOp::I16x8AvgrU: SIMD_BINOP(wasm_u16x8_avgr)
+          case SimdOp::I16x8Q15MulrSatS: SIMD_BINOP(wasm_i16x8_q15mulr_sat)
+          case SimdOp::I32x4Add: SIMD_BINOP(wasm_i32x4_add)
+          case SimdOp::I32x4Sub: SIMD_BINOP(wasm_i32x4_sub)
+          case SimdOp::I32x4Mul: SIMD_BINOP(wasm_i32x4_mul)
+          case SimdOp::I32x4MinS: SIMD_BINOP(wasm_i32x4_min)
+          case SimdOp::I32x4MinU: SIMD_BINOP(wasm_u32x4_min)
+          case SimdOp::I32x4MaxS: SIMD_BINOP(wasm_i32x4_max)
+          case SimdOp::I32x4MaxU: SIMD_BINOP(wasm_u32x4_max)
+          case SimdOp::I32x4DotI16x8S: SIMD_BINOP(wasm_i32x4_dot_i16x8)
+          case SimdOp::I64x2Add: SIMD_BINOP(wasm_i64x2_add)
+          case SimdOp::I64x2Sub: SIMD_BINOP(wasm_i64x2_sub)
+          case SimdOp::I64x2Mul: SIMD_BINOP(wasm_i64x2_mul)
+
+          // -- shifts --
+          case SimdOp::I8x16Shl: SIMD_SHIFT(wasm_i8x16_shl)
+          case SimdOp::I8x16ShrS: SIMD_SHIFT(wasm_i8x16_shr)
+          case SimdOp::I8x16ShrU: SIMD_SHIFT(wasm_u8x16_shr)
+          case SimdOp::I16x8Shl: SIMD_SHIFT(wasm_i16x8_shl)
+          case SimdOp::I16x8ShrS: SIMD_SHIFT(wasm_i16x8_shr)
+          case SimdOp::I16x8ShrU: SIMD_SHIFT(wasm_u16x8_shr)
+          case SimdOp::I32x4Shl: SIMD_SHIFT(wasm_i32x4_shl)
+          case SimdOp::I32x4ShrS: SIMD_SHIFT(wasm_i32x4_shr)
+          case SimdOp::I32x4ShrU: SIMD_SHIFT(wasm_u32x4_shr)
+          case SimdOp::I64x2Shl: SIMD_SHIFT(wasm_i64x2_shl)
+          case SimdOp::I64x2ShrS: SIMD_SHIFT(wasm_i64x2_shr)
+          case SimdOp::I64x2ShrU: SIMD_SHIFT(wasm_u64x2_shr)
+
+          // -- narrow / extend / extadd / extmul --
+          case SimdOp::I8x16NarrowI16x8S: SIMD_BINOP(wasm_i8x16_narrow_i16x8)
+          case SimdOp::I8x16NarrowI16x8U: SIMD_BINOP(wasm_u8x16_narrow_i16x8)
+          case SimdOp::I16x8NarrowI32x4S: SIMD_BINOP(wasm_i16x8_narrow_i32x4)
+          case SimdOp::I16x8NarrowI32x4U: SIMD_BINOP(wasm_u16x8_narrow_i32x4)
+          case SimdOp::I16x8ExtendLowI8x16S: SIMD_UNOP(wasm_i16x8_extend_low_i8x16)
+          case SimdOp::I16x8ExtendHighI8x16S: SIMD_UNOP(wasm_i16x8_extend_high_i8x16)
+          case SimdOp::I16x8ExtendLowI8x16U: SIMD_UNOP(wasm_u16x8_extend_low_u8x16)
+          case SimdOp::I16x8ExtendHighI8x16U: SIMD_UNOP(wasm_u16x8_extend_high_u8x16)
+          case SimdOp::I32x4ExtendLowI16x8S: SIMD_UNOP(wasm_i32x4_extend_low_i16x8)
+          case SimdOp::I32x4ExtendHighI16x8S: SIMD_UNOP(wasm_i32x4_extend_high_i16x8)
+          case SimdOp::I32x4ExtendLowI16x8U: SIMD_UNOP(wasm_u32x4_extend_low_u16x8)
+          case SimdOp::I32x4ExtendHighI16x8U: SIMD_UNOP(wasm_u32x4_extend_high_u16x8)
+          case SimdOp::I64x2ExtendLowI32x4S: SIMD_UNOP(wasm_i64x2_extend_low_i32x4)
+          case SimdOp::I64x2ExtendHighI32x4S: SIMD_UNOP(wasm_i64x2_extend_high_i32x4)
+          case SimdOp::I64x2ExtendLowI32x4U: SIMD_UNOP(wasm_u64x2_extend_low_u32x4)
+          case SimdOp::I64x2ExtendHighI32x4U: SIMD_UNOP(wasm_u64x2_extend_high_u32x4)
+          case SimdOp::I16x8ExtaddPairwiseI8x16S: SIMD_UNOP(wasm_i16x8_extadd_pairwise_i8x16)
+          case SimdOp::I16x8ExtaddPairwiseI8x16U: SIMD_UNOP(wasm_u16x8_extadd_pairwise_u8x16)
+          case SimdOp::I32x4ExtaddPairwiseI16x8S: SIMD_UNOP(wasm_i32x4_extadd_pairwise_i16x8)
+          case SimdOp::I32x4ExtaddPairwiseI16x8U: SIMD_UNOP(wasm_u32x4_extadd_pairwise_u16x8)
+          case SimdOp::I16x8ExtmulLowI8x16S: SIMD_BINOP(wasm_i16x8_extmul_low_i8x16)
+          case SimdOp::I16x8ExtmulHighI8x16S: SIMD_BINOP(wasm_i16x8_extmul_high_i8x16)
+          case SimdOp::I16x8ExtmulLowI8x16U: SIMD_BINOP(wasm_u16x8_extmul_low_u8x16)
+          case SimdOp::I16x8ExtmulHighI8x16U: SIMD_BINOP(wasm_u16x8_extmul_high_u8x16)
+          case SimdOp::I32x4ExtmulLowI16x8S: SIMD_BINOP(wasm_i32x4_extmul_low_i16x8)
+          case SimdOp::I32x4ExtmulHighI16x8S: SIMD_BINOP(wasm_i32x4_extmul_high_i16x8)
+          case SimdOp::I32x4ExtmulLowI16x8U: SIMD_BINOP(wasm_u32x4_extmul_low_u16x8)
+          case SimdOp::I32x4ExtmulHighI16x8U: SIMD_BINOP(wasm_u32x4_extmul_high_u16x8)
+          case SimdOp::I64x2ExtmulLowI32x4S: SIMD_BINOP(wasm_i64x2_extmul_low_i32x4)
+          case SimdOp::I64x2ExtmulHighI32x4S: SIMD_BINOP(wasm_i64x2_extmul_high_i32x4)
+          case SimdOp::I64x2ExtmulLowI32x4U: SIMD_BINOP(wasm_u64x2_extmul_low_u32x4)
+          case SimdOp::I64x2ExtmulHighI32x4U: SIMD_BINOP(wasm_u64x2_extmul_high_u32x4)
+
+          // -- float unary --
+          case SimdOp::F32x4Abs: SIMD_UNOP(wasm_f32x4_abs)
+          case SimdOp::F32x4Neg: SIMD_UNOP(wasm_f32x4_neg)
+          case SimdOp::F32x4Sqrt: SIMD_UNOP(wasm_f32x4_sqrt)
+          case SimdOp::F32x4Ceil: SIMD_UNOP(wasm_f32x4_ceil)
+          case SimdOp::F32x4Floor: SIMD_UNOP(wasm_f32x4_floor)
+          case SimdOp::F32x4Trunc: SIMD_UNOP(wasm_f32x4_trunc)
+          case SimdOp::F32x4Nearest: SIMD_UNOP(wasm_f32x4_nearest)
+          case SimdOp::F64x2Abs: SIMD_UNOP(wasm_f64x2_abs)
+          case SimdOp::F64x2Neg: SIMD_UNOP(wasm_f64x2_neg)
+          case SimdOp::F64x2Sqrt: SIMD_UNOP(wasm_f64x2_sqrt)
+          case SimdOp::F64x2Ceil: SIMD_UNOP(wasm_f64x2_ceil)
+          case SimdOp::F64x2Floor: SIMD_UNOP(wasm_f64x2_floor)
+          case SimdOp::F64x2Trunc: SIMD_UNOP(wasm_f64x2_trunc)
+          case SimdOp::F64x2Nearest: SIMD_UNOP(wasm_f64x2_nearest)
+
+          // -- float binary --
+          case SimdOp::F32x4Add: SIMD_BINOP(wasm_f32x4_add)
+          case SimdOp::F32x4Sub: SIMD_BINOP(wasm_f32x4_sub)
+          case SimdOp::F32x4Mul: SIMD_BINOP(wasm_f32x4_mul)
+          case SimdOp::F32x4Div: SIMD_BINOP(wasm_f32x4_div)
+          case SimdOp::F32x4Min: SIMD_BINOP(wasm_f32x4_min)
+          case SimdOp::F32x4Max: SIMD_BINOP(wasm_f32x4_max)
+          case SimdOp::F32x4PMin: SIMD_BINOP(wasm_f32x4_pmin)
+          case SimdOp::F32x4PMax: SIMD_BINOP(wasm_f32x4_pmax)
+          case SimdOp::F64x2Add: SIMD_BINOP(wasm_f64x2_add)
+          case SimdOp::F64x2Sub: SIMD_BINOP(wasm_f64x2_sub)
+          case SimdOp::F64x2Mul: SIMD_BINOP(wasm_f64x2_mul)
+          case SimdOp::F64x2Div: SIMD_BINOP(wasm_f64x2_div)
+          case SimdOp::F64x2Min: SIMD_BINOP(wasm_f64x2_min)
+          case SimdOp::F64x2Max: SIMD_BINOP(wasm_f64x2_max)
+          case SimdOp::F64x2PMin: SIMD_BINOP(wasm_f64x2_pmin)
+          case SimdOp::F64x2PMax: SIMD_BINOP(wasm_f64x2_pmax)
+
+          // -- conversions --
+          case SimdOp::I32x4TruncSatF32x4S: SIMD_UNOP(wasm_i32x4_trunc_sat_f32x4)
+          case SimdOp::I32x4TruncSatF32x4U: SIMD_UNOP(wasm_u32x4_trunc_sat_f32x4)
+          case SimdOp::I32x4TruncSatF64x2SZero: SIMD_UNOP(wasm_i32x4_trunc_sat_f64x2_zero)
+          case SimdOp::I32x4TruncSatF64x2UZero: SIMD_UNOP(wasm_u32x4_trunc_sat_f64x2_zero)
+          case SimdOp::F32x4ConvertI32x4S: SIMD_UNOP(wasm_f32x4_convert_i32x4)
+          case SimdOp::F32x4ConvertI32x4U: SIMD_UNOP(wasm_f32x4_convert_u32x4)
+          case SimdOp::F64x2ConvertLowI32x4S: SIMD_UNOP(wasm_f64x2_convert_low_i32x4)
+          case SimdOp::F64x2ConvertLowI32x4U: SIMD_UNOP(wasm_f64x2_convert_low_u32x4)
+          case SimdOp::F32x4DemoteF64x2Zero: SIMD_UNOP(wasm_f32x4_demote_f64x2_zero)
+          case SimdOp::F64x2PromoteLowF32x4: SIMD_UNOP(wasm_f64x2_promote_low_f32x4)
+
+          default:
+            JS_ReportErrorASCII(cx, "wasm interp: unsupported SIMD op 0x%x",
+                                unsigned(sub));
+            FAIL();
+        }
+#undef SIMD_BINOP
+#undef SIMD_UNOP
+#undef SIMD_SPLAT
+#undef SIMD_SHIFT
+#undef SIMD_LOAD
+#undef SIMD_EXTRACT
+#undef SIMD_REPLACE
+#undef SIMD_TEST
+        break;
+#else
+        JS_ReportErrorASCII(cx, "wasm interp: SIMD unsupported in this build");
+        FAIL();
+#endif
+      }
+
       default:
         JS_ReportErrorASCII(cx, "wasm interp: unsupported opcode 0x%x", op);
         FAIL();

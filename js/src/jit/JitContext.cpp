@@ -2,6 +2,13 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+// A JS_CODEGEN_NONE build (--disable-jit) has no assembler backend, so
+// MacroAssembler::SupportsWasmSimd() is absent. Drop ENABLE_WASM_SIMD here so
+// JitSupportsWasmSimd() compiles to its no-backend (false) path.
+#if defined(JS_CODEGEN_NONE) && defined(ENABLE_WASM_SIMD)
+#  undef ENABLE_WASM_SIMD
+#endif
+
 #include "jit/JitContext.h"
 
 #include "mozilla/Assertions.h"

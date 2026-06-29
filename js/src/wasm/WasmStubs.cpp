@@ -42,6 +42,16 @@
 #include "jit/MacroAssembler-inl.h"
 #include "wasm/WasmInstance-inl.h"
 
+// The includes above re-pull js-config.h, which re-#defines ENABLE_WASM_SIMD
+// even though we dropped it at the top of this file. Drop it again here, after
+// all includes, so the dead SIMD stub-generation below (this is a
+// JS_CODEGEN_NONE build) doesn't reference backend-only ops. This TU is built
+// non-unified (see js/src/wasm/moz.build) so the undef cannot leak into the
+// SIMD-aware front-end TUs.
+#if defined(JS_CODEGEN_NONE) && defined(ENABLE_WASM_SIMD)
+#  undef ENABLE_WASM_SIMD
+#endif
+
 using namespace js;
 using namespace js::jit;
 using namespace js::wasm;

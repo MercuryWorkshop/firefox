@@ -40,6 +40,7 @@
 #include "gc/Tracer.h"
 #include "vm/BigIntType.h"
 #include "wasm/WasmConstants.h"
+#include "wasm/WasmInterpSimdScalar.h"  // scalar v128 helpers (no -msimd128 TU)
 
 #if defined(__EMSCRIPTEN__)
 #  include <emscripten.h>
@@ -226,6 +227,10 @@ struct Module {
   // function, allocated once at decode (stable address; atomics aren't movable).
   std::unique_ptr<std::atomic<uint8_t>[]> preparedFlags;
   std::mutex prepareLock;
+  // Per-defined-function call counter for the Flavor-B wasm->wasm JIT tier-up
+  // (WasmInterpJit-inl.h). Separate array (FuncDef can't hold a non-movable
+  // atomic); allocated with preparedFlags. Null if no defined functions.
+  std::unique_ptr<std::atomic<uint32_t>[]> bCounts;
 
   const FuncType& funcType(uint32_t fi) const { return types[funcTypes[fi]]; }
 };
@@ -364,6 +369,14 @@ JSObject* NewTableObjectJS(JSContext* cx, VT elem, uint32_t initial,
 JSObject* NewGlobalObjectJS(JSContext* cx, VT type, bool isMutable,
                             const Cell* initVal, JS::HandleValue initRef);
 
+// Flavor-B wasm->wasm JIT (WasmInterpJit-inl.h), called from Instance::invoke.
+// BEnabled() caches the GECKO_WASM_JIT env flag. BTryInvoke returns 0 (ran on
+// the host JIT), 1 (ran + trapped, exception pending), or -1 (declined -> run
+// the interpreter).
+bool BEnabled();
+int BTryInvoke(Instance* inst, const FuncDef& fn, uint32_t fi, Cell* args,
+               Cell* results);
+
 }  // namespace interp
 }  // namespace wasm
 }  // namespace js
@@ -371,5 +384,6 @@ JSObject* NewGlobalObjectJS(JSContext* cx, VT type, bool isMutable,
 #include "wasm/WasmInterpDecode-inl.h"
 #include "wasm/WasmInterpRun-inl.h"
 #include "wasm/WasmInterpObj-inl.h"
+#include "wasm/WasmInterpJit-inl.h"
 
 #endif  // wasm_WasmInterp_h

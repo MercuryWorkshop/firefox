@@ -9,6 +9,27 @@ namespace js {
 namespace wasm {
 namespace interp {
 
+// A v128 stack/local/global cell is 16 bytes; every v128 move must copy all 16.
+// (The local.get/set + global.get/set ops historically copied only the low
+// .u64, truncating v128 values to their low 8 lanes -- the cause of a subtle
+// SIMD-corruption bug.) These noinline helpers do the full-width transfer in
+// one place so no v128 move in the giant exec loop can silently drop the high
+// half; noinline keeps them out of the loop body's codegen and is trivially
+// cheap. Used for every cell<->v128 and memory<->v128 move.
+static __attribute__((noinline)) v128_t ICellLoad(const void* p) {
+  v128_t r;
+  memcpy(&r, p, 16);
+  return r;
+}
+static __attribute__((noinline)) void ICellStore(void* p, v128_t v) {
+  memcpy(p, &v, 16);
+}
+// Full-width 16-byte move between a cell and a scratch byte buffer (the SIMD
+// scalar helpers' operands/results, v128.const).
+static __attribute__((noinline)) void IBytes16(void* dst, const void* src) {
+  memcpy(dst, src, 16);
+}
+
 // ---- funcref packing (wasm32: Instance* fits in the high 32 bits) ----------
 
 static inline uint64_t PackFunc(Instance* inst, uint32_t idx) {
@@ -410,6 +431,16 @@ bool Instance::invoke(uint32_t fi, Cell* args, Cell* results) {
       module->preparedFlags[defIdx].store(1, std::memory_order_release);
     }
   }
+#if defined(__EMSCRIPTEN__)
+  // Flavor-B wasm->wasm JIT tier (WasmInterpJit-inl.h): run hot functions as
+  // host wasm over the shared engine memory. Declines (-1) fall through to the
+  // interpreter; 0/1 mean the host JIT ran (ok / trapped).
+  if (BEnabled()) {
+    int r = BTryInvoke(this, fn, fi, args, results);
+    if (r == 0) return true;
+    if (r == 1) return false;
+  }
+#endif
   return runFunc(fn, fi, args, results);
 }
 
@@ -695,31 +726,54 @@ bool Instance::runFunc(const FuncDef& fn, uint32_t fi, Cell* args,
       }
       case Op::LocalGet: {
         uint32_t i = rdU32();
-        stk[sp].u64 = locals[i].u64;
+        // v128 locals are 16 bytes; a u64 copy would drop the high lanes.
+        if (fn.localTypes[i] == VT::V128) {
+          IBytes16(stk[sp].v128, locals[i].v128);
+        } else {
+          stk[sp].u64 = locals[i].u64;
+        }
         tags[sp] = (fn.localTypes[i] == VT::ExternRef) ? 1 : 0;
         sp++;
         break;
       }
       case Op::LocalSet: {
         uint32_t i = rdU32();
-        locals[i].u64 = stk[--sp].u64;
+        if (fn.localTypes[i] == VT::V128) {
+          sp--;
+          IBytes16(locals[i].v128, stk[sp].v128);
+        } else {
+          locals[i].u64 = stk[--sp].u64;
+        }
         break;
       }
       case Op::LocalTee: {
         uint32_t i = rdU32();
-        locals[i].u64 = stk[sp - 1].u64;
+        if (fn.localTypes[i] == VT::V128) {
+          IBytes16(locals[i].v128, stk[sp - 1].v128);
+        } else {
+          locals[i].u64 = stk[sp - 1].u64;
+        }
         break;
       }
       case Op::GlobalGet: {
         uint32_t i = rdU32();
-        stk[sp].u64 = globalCells[i].u64;
+        if (module->globals[i].type == VT::V128) {
+          IBytes16(stk[sp].v128, globalCells[i].v128);
+        } else {
+          stk[sp].u64 = globalCells[i].u64;
+        }
         tags[sp] = (module->globals[i].type == VT::ExternRef) ? 1 : 0;
         sp++;
         break;
       }
       case Op::GlobalSet: {
         uint32_t i = rdU32();
-        globalCells[i].u64 = stk[--sp].u64;
+        if (module->globals[i].type == VT::V128) {
+          sp--;
+          IBytes16(globalCells[i].v128, stk[sp].v128);
+        } else {
+          globalCells[i].u64 = stk[--sp].u64;
+        }
         break;
       }
       case Op::TableGet: {
@@ -1074,14 +1128,28 @@ bool Instance::runFunc(const FuncDef& fn, uint32_t fi, Cell* args,
         // timeout+expected) -- the address is always the deepest operand. The
         // (shared) memory lives in the outer engine's shared heap, so __atomic_*
         // builtins give real cross-thread atomicity.
-#define ATOMIC_ADDR(SZ, POPVALS)                            \
-  rdU32(); /* align (ignored) */                            \
-  uint64_t off = rdU32();                                   \
-  POPVALS                                                   \
-  uint64_t addr = stk[--sp].u32;                            \
-  uint64_t ea = addr + off;                                 \
-  if (ea & ((SZ) - 1)) TRAP(JSMSG_WASM_UNALIGNED_ACCESS);   \
-  if (ea + (SZ) > lm->size) TRAP(JSMSG_WASM_OUT_OF_BOUNDS); \
+#define ATOMIC_ADDR(SZ, POPVALS)                                              \
+  rdU32(); /* align (ignored) */                                              \
+  uint64_t off = rdU32();                                                     \
+  POPVALS                                                                     \
+  uint64_t addr = stk[--sp].u32;                                              \
+  uint64_t ea = addr + off;                                                   \
+  if (ea & ((SZ) - 1)) {                                                      \
+    static const bool admsg = getenv("GECKO_INTERP_ATOMDBG") != nullptr;      \
+    if (admsg) {                                                              \
+      char dbgbuf[192];                                                       \
+      snprintf(dbgbuf, sizeof(dbgbuf),                                        \
+               "ATOMDBG unaligned atomic sub=%u fi=%u pcoff=%u addr=%llu "    \
+               "off=%llu ea=%llu sz=%u",                                      \
+               sub, fi, uint32_t(pc - fn.body), (unsigned long long)addr,     \
+               (unsigned long long)off, (unsigned long long)ea, unsigned(SZ)); \
+      JS_ReportErrorASCII(cx, "%s", dbgbuf);                                  \
+      return false;                                                           \
+    }                                                                         \
+    static const bool noalign = getenv("GECKO_INTERP_NOALIGN") != nullptr;    \
+    if (!noalign) TRAP(JSMSG_WASM_UNALIGNED_ACCESS);                          \
+  }                                                                           \
+  if (ea + (SZ) > lm->size) TRAP(JSMSG_WASM_OUT_OF_BOUNDS);                   \
   uint8_t* ptr = lm->base + ea;
         switch (ThreadOp(sub)) {
           case ThreadOp::Fence:
@@ -1245,33 +1313,33 @@ bool Instance::runFunc(const FuncDef& fn, uint32_t fi, Cell* args,
         uint32_t sub = rdU32();
 #define SIMD_BINOP(FN)                                       \
   {                                                          \
-    v128_t b_ = wasm_v128_load(stk[sp - 1].v128);            \
-    v128_t a_ = wasm_v128_load(stk[sp - 2].v128);            \
+    v128_t b_ = ICellLoad(stk[sp - 1].v128);            \
+    v128_t a_ = ICellLoad(stk[sp - 2].v128);            \
     sp--;                                                    \
-    wasm_v128_store(stk[sp - 1].v128, (FN)(a_, b_));         \
+    ICellStore(stk[sp - 1].v128, (FN)(a_, b_));         \
     tags[sp - 1] = 0;                                        \
     break;                                                   \
   }
 #define SIMD_UNOP(FN)                                        \
   {                                                          \
-    v128_t a_ = wasm_v128_load(stk[sp - 1].v128);            \
-    wasm_v128_store(stk[sp - 1].v128, (FN)(a_));             \
+    v128_t a_ = ICellLoad(stk[sp - 1].v128);            \
+    ICellStore(stk[sp - 1].v128, (FN)(a_));             \
     tags[sp - 1] = 0;                                        \
     break;                                                   \
   }
 #define SIMD_SPLAT(FN, FIELD)                                \
   {                                                          \
     auto s_ = stk[sp - 1].FIELD;                             \
-    wasm_v128_store(stk[sp - 1].v128, (FN)(s_));             \
+    ICellStore(stk[sp - 1].v128, (FN)(s_));             \
     tags[sp - 1] = 0;                                        \
     break;                                                   \
   }
 #define SIMD_SHIFT(FN)                                       \
   {                                                          \
     uint32_t c_ = stk[sp - 1].u32;                           \
-    v128_t a_ = wasm_v128_load(stk[sp - 2].v128);            \
+    v128_t a_ = ICellLoad(stk[sp - 2].v128);            \
     sp--;                                                    \
-    wasm_v128_store(stk[sp - 1].v128, (FN)(a_, c_));         \
+    ICellStore(stk[sp - 1].v128, (FN)(a_, c_));         \
     tags[sp - 1] = 0;                                        \
     break;                                                   \
   }
@@ -1282,7 +1350,7 @@ bool Instance::runFunc(const FuncDef& fn, uint32_t fi, Cell* args,
     uint64_t a_ = stk[sp - 1].u32;                                 \
     uint64_t ea_ = a_ + off_;                                      \
     if (ea_ + (SZ) > lm->size) TRAP(JSMSG_WASM_OUT_OF_BOUNDS);     \
-    wasm_v128_store(stk[sp - 1].v128, (FN)(lm->base + ea_));       \
+    ICellStore(stk[sp - 1].v128, (FN)(lm->base + ea_));       \
     tags[sp - 1] = 0;                                              \
     break;                                                         \
   }
@@ -1305,14 +1373,48 @@ bool Instance::runFunc(const FuncDef& fn, uint32_t fi, Cell* args,
   }
 #define SIMD_TEST(EXPR)                                      \
   {                                                          \
-    v128_t a_ = wasm_v128_load(stk[sp - 1].v128);            \
+    v128_t a_ = ICellLoad(stk[sp - 1].v128);            \
     stk[sp - 1].i32 = (int32_t)(EXPR);                       \
     tags[sp - 1] = 0;                                        \
     break;                                                   \
   }
+// Manual scalar avgr / extmul. clang 23 at -O2 miscompiles the COMPOSITE
+// wasm_simd128.h intrinsics for these (extmul = extend*extend; extmul_high
+// returns 0, avgr/extmul_low return wrong lanes), while direct-builtin ops
+// (narrow/dot/min) are fine. Scalar loops sidestep the SIMD codegen bug.
+// clang 23 MISCOMPILES the composite <wasm_simd128.h> extmul/avgr intrinsics
+// (extend*mul drops/zeros half the lanes), and inline scalar/volatile/optnone
+// replacements get idiom-recognized back into the buggy instruction. Route these
+// to SimdScalarExtmul/Avgr in WasmInterpSimdScalar.cpp, a separate TU compiled
+// -mno-simd128 (clang can't emit the SIMD instr there). Verified vs the host.
+// The scalar helpers read their operands a byte at a time inside the
+// -mno-simd128 TU (correct), so we pass the stack-cell pointers directly --
+// copying them into local uint8_t[16] buffers here would re-introduce the same
+// inline-v128-move miscompile. The result is written to a scratch buffer and
+// copied back via the noinline IBytes16.
+#define SIMD_AVGR(ELEMBYTES)                                            \
+  {                                                                     \
+    uint8_t ov_[16];                                                   \
+    SimdScalarAvgr(stk[sp - 2].v128, stk[sp - 1].v128, ov_,            \
+                   (ELEMBYTES));                                       \
+    sp--;                                                               \
+    IBytes16(stk[sp - 1].v128, ov_);                                   \
+    tags[sp - 1] = 0;                                                   \
+    break;                                                              \
+  }
+#define SIMD_EXTMUL(SRCBYTES, SIGNED, HI)                              \
+  {                                                                     \
+    uint8_t ov_[16];                                                   \
+    SimdScalarExtmul(stk[sp - 2].v128, stk[sp - 1].v128, ov_,          \
+                     (SRCBYTES), (SIGNED), (HI));                      \
+    sp--;                                                               \
+    IBytes16(stk[sp - 1].v128, ov_);                                   \
+    tags[sp - 1] = 0;                                                   \
+    break;                                                              \
+  }
         switch (SimdOp(sub)) {
           // -- loads / stores --
-          case SimdOp::V128Load: SIMD_LOAD(16, wasm_v128_load)
+          case SimdOp::V128Load: SIMD_LOAD(16, ICellLoad)
           case SimdOp::V128Load8Splat: SIMD_LOAD(1, wasm_v128_load8_splat)
           case SimdOp::V128Load16Splat: SIMD_LOAD(2, wasm_v128_load16_splat)
           case SimdOp::V128Load32Splat: SIMD_LOAD(4, wasm_v128_load32_splat)
@@ -1328,11 +1430,11 @@ bool Instance::runFunc(const FuncDef& fn, uint32_t fi, Cell* args,
           case SimdOp::V128Store: {
             rdU32();
             uint64_t off_ = rdU32();
-            v128_t v_ = wasm_v128_load(stk[sp - 1].v128);
+            v128_t v_ = ICellLoad(stk[sp - 1].v128);
             uint64_t a_ = stk[sp - 2].u32;
             uint64_t ea_ = a_ + off_;
             if (ea_ + 16 > lm->size) TRAP(JSMSG_WASM_OUT_OF_BOUNDS);
-            wasm_v128_store(lm->base + ea_, v_);
+            ICellStore(lm->base + ea_, v_);
             sp -= 2;
             break;
           }
@@ -1341,7 +1443,7 @@ bool Instance::runFunc(const FuncDef& fn, uint32_t fi, Cell* args,
     rdU32();                                                       \
     uint64_t off_ = rdU32();                                       \
     uint8_t lane_ = *pc++;                                         \
-    v128_t v_ = wasm_v128_load(stk[sp - 1].v128);                  \
+    v128_t v_ = ICellLoad(stk[sp - 1].v128);                  \
     uint64_t a_ = stk[sp - 2].u32;                                 \
     uint64_t ea_ = a_ + off_;                                      \
     if (ea_ + (SZ) > lm->size) TRAP(JSMSG_WASM_OUT_OF_BOUNDS);     \
@@ -1349,7 +1451,7 @@ bool Instance::runFunc(const FuncDef& fn, uint32_t fi, Cell* args,
     memcpy(&e_, lm->base + ea_, SZ);                              \
     ((CTYPE*)&v_)[lane_] = e_;                                     \
     sp--;                                                          \
-    wasm_v128_store(stk[sp - 1].v128, v_);                         \
+    ICellStore(stk[sp - 1].v128, v_);                         \
     tags[sp - 1] = 0;                                              \
     break;                                                         \
   }
@@ -1363,7 +1465,7 @@ bool Instance::runFunc(const FuncDef& fn, uint32_t fi, Cell* args,
     rdU32();                                                       \
     uint64_t off_ = rdU32();                                       \
     uint8_t lane_ = *pc++;                                         \
-    v128_t v_ = wasm_v128_load(stk[sp - 1].v128);                  \
+    v128_t v_ = ICellLoad(stk[sp - 1].v128);                  \
     uint64_t a_ = stk[sp - 2].u32;                                 \
     uint64_t ea_ = a_ + off_;                                      \
     if (ea_ + (SZ) > lm->size) TRAP(JSMSG_WASM_OUT_OF_BOUNDS);     \
@@ -1380,24 +1482,20 @@ bool Instance::runFunc(const FuncDef& fn, uint32_t fi, Cell* args,
 
           // -- const / shuffle / swizzle --
           case SimdOp::V128Const: {
-            memcpy(stk[sp].v128, pc, 16);
+            IBytes16(stk[sp].v128, pc);
             pc += 16;
             tags[sp] = 0;
             sp++;
             break;
           }
           case SimdOp::I8x16Shuffle: {
-            const uint8_t* idx_ = pc;
+            uint8_t out_[16];
+            // Read the 16-byte lane-index immediate straight from the bytecode
+            // (the scalar helper reads it byte-wise in its -mno-simd128 TU).
+            SimdScalarShuffle(stk[sp - 2].v128, stk[sp - 1].v128, pc, out_);
             pc += 16;
-            uint8_t a_[16], b_[16], out_[16];
-            memcpy(a_, stk[sp - 2].v128, 16);
-            memcpy(b_, stk[sp - 1].v128, 16);
-            for (int i = 0; i < 16; i++) {
-              uint8_t k = idx_[i];
-              out_[i] = k < 16 ? a_[k] : b_[k - 16];
-            }
             sp--;
-            memcpy(stk[sp - 1].v128, out_, 16);
+            IBytes16(stk[sp - 1].v128, out_);
             tags[sp - 1] = 0;
             break;
           }
@@ -1493,11 +1591,11 @@ bool Instance::runFunc(const FuncDef& fn, uint32_t fi, Cell* args,
           case SimdOp::I32x4Bitmask: SIMD_TEST(wasm_i32x4_bitmask(a_))
           case SimdOp::I64x2Bitmask: SIMD_TEST(wasm_i64x2_bitmask(a_))
           case SimdOp::V128Bitselect: {
-            v128_t m_ = wasm_v128_load(stk[sp - 1].v128);
-            v128_t b_ = wasm_v128_load(stk[sp - 2].v128);
-            v128_t a_ = wasm_v128_load(stk[sp - 3].v128);
+            v128_t m_ = ICellLoad(stk[sp - 1].v128);
+            v128_t b_ = ICellLoad(stk[sp - 2].v128);
+            v128_t a_ = ICellLoad(stk[sp - 3].v128);
             sp -= 2;
-            wasm_v128_store(stk[sp - 1].v128, wasm_v128_bitselect(a_, b_, m_));
+            ICellStore(stk[sp - 1].v128, wasm_v128_bitselect(a_, b_, m_));
             tags[sp - 1] = 0;
             break;
           }
@@ -1524,7 +1622,7 @@ bool Instance::runFunc(const FuncDef& fn, uint32_t fi, Cell* args,
           case SimdOp::I8x16MinU: SIMD_BINOP(wasm_u8x16_min)
           case SimdOp::I8x16MaxS: SIMD_BINOP(wasm_i8x16_max)
           case SimdOp::I8x16MaxU: SIMD_BINOP(wasm_u8x16_max)
-          case SimdOp::I8x16AvgrU: SIMD_BINOP(wasm_u8x16_avgr)
+          case SimdOp::I8x16AvgrU: SIMD_AVGR(1)
           case SimdOp::I16x8Add: SIMD_BINOP(wasm_i16x8_add)
           case SimdOp::I16x8AddSatS: SIMD_BINOP(wasm_i16x8_add_sat)
           case SimdOp::I16x8AddSatU: SIMD_BINOP(wasm_u16x8_add_sat)
@@ -1536,7 +1634,7 @@ bool Instance::runFunc(const FuncDef& fn, uint32_t fi, Cell* args,
           case SimdOp::I16x8MinU: SIMD_BINOP(wasm_u16x8_min)
           case SimdOp::I16x8MaxS: SIMD_BINOP(wasm_i16x8_max)
           case SimdOp::I16x8MaxU: SIMD_BINOP(wasm_u16x8_max)
-          case SimdOp::I16x8AvgrU: SIMD_BINOP(wasm_u16x8_avgr)
+          case SimdOp::I16x8AvgrU: SIMD_AVGR(2)
           case SimdOp::I16x8Q15MulrSatS: SIMD_BINOP(wasm_i16x8_q15mulr_sat)
           case SimdOp::I32x4Add: SIMD_BINOP(wasm_i32x4_add)
           case SimdOp::I32x4Sub: SIMD_BINOP(wasm_i32x4_sub)
@@ -1585,18 +1683,18 @@ bool Instance::runFunc(const FuncDef& fn, uint32_t fi, Cell* args,
           case SimdOp::I16x8ExtaddPairwiseI8x16U: SIMD_UNOP(wasm_u16x8_extadd_pairwise_u8x16)
           case SimdOp::I32x4ExtaddPairwiseI16x8S: SIMD_UNOP(wasm_i32x4_extadd_pairwise_i16x8)
           case SimdOp::I32x4ExtaddPairwiseI16x8U: SIMD_UNOP(wasm_u32x4_extadd_pairwise_u16x8)
-          case SimdOp::I16x8ExtmulLowI8x16S: SIMD_BINOP(wasm_i16x8_extmul_low_i8x16)
-          case SimdOp::I16x8ExtmulHighI8x16S: SIMD_BINOP(wasm_i16x8_extmul_high_i8x16)
-          case SimdOp::I16x8ExtmulLowI8x16U: SIMD_BINOP(wasm_u16x8_extmul_low_u8x16)
-          case SimdOp::I16x8ExtmulHighI8x16U: SIMD_BINOP(wasm_u16x8_extmul_high_u8x16)
-          case SimdOp::I32x4ExtmulLowI16x8S: SIMD_BINOP(wasm_i32x4_extmul_low_i16x8)
-          case SimdOp::I32x4ExtmulHighI16x8S: SIMD_BINOP(wasm_i32x4_extmul_high_i16x8)
-          case SimdOp::I32x4ExtmulLowI16x8U: SIMD_BINOP(wasm_u32x4_extmul_low_u16x8)
-          case SimdOp::I32x4ExtmulHighI16x8U: SIMD_BINOP(wasm_u32x4_extmul_high_u16x8)
-          case SimdOp::I64x2ExtmulLowI32x4S: SIMD_BINOP(wasm_i64x2_extmul_low_i32x4)
-          case SimdOp::I64x2ExtmulHighI32x4S: SIMD_BINOP(wasm_i64x2_extmul_high_i32x4)
-          case SimdOp::I64x2ExtmulLowI32x4U: SIMD_BINOP(wasm_u64x2_extmul_low_u32x4)
-          case SimdOp::I64x2ExtmulHighI32x4U: SIMD_BINOP(wasm_u64x2_extmul_high_u32x4)
+          case SimdOp::I16x8ExtmulLowI8x16S: SIMD_EXTMUL(1, true, 0)
+          case SimdOp::I16x8ExtmulHighI8x16S: SIMD_EXTMUL(1, true, 1)
+          case SimdOp::I16x8ExtmulLowI8x16U: SIMD_EXTMUL(1, false, 0)
+          case SimdOp::I16x8ExtmulHighI8x16U: SIMD_EXTMUL(1, false, 1)
+          case SimdOp::I32x4ExtmulLowI16x8S: SIMD_EXTMUL(2, true, 0)
+          case SimdOp::I32x4ExtmulHighI16x8S: SIMD_EXTMUL(2, true, 1)
+          case SimdOp::I32x4ExtmulLowI16x8U: SIMD_EXTMUL(2, false, 0)
+          case SimdOp::I32x4ExtmulHighI16x8U: SIMD_EXTMUL(2, false, 1)
+          case SimdOp::I64x2ExtmulLowI32x4S: SIMD_EXTMUL(4, true, 0)
+          case SimdOp::I64x2ExtmulHighI32x4S: SIMD_EXTMUL(4, true, 1)
+          case SimdOp::I64x2ExtmulLowI32x4U: SIMD_EXTMUL(4, false, 0)
+          case SimdOp::I64x2ExtmulHighI32x4U: SIMD_EXTMUL(4, false, 1)
 
           // -- float unary --
           case SimdOp::F32x4Abs: SIMD_UNOP(wasm_f32x4_abs)

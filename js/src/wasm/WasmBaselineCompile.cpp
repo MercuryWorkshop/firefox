@@ -165,6 +165,15 @@
 #include "wasm/WasmBCRegMgmt-inl.h"
 #include "wasm/WasmBCStkMgmt-inl.h"
 
+// The includes above re-pull js-config.h, which re-#defines ENABLE_WASM_SIMD
+// even though we dropped it at the top of this file. Drop it again here, after
+// all includes, so the dead SIMD codegen below (this is a JS_CODEGEN_NONE
+// build) doesn't reference backend-only macro-assembler ops. This TU is
+// non-unified (see js/src/wasm/moz.build) so the undef cannot leak.
+#if defined(JS_CODEGEN_NONE) && defined(ENABLE_WASM_SIMD)
+#  undef ENABLE_WASM_SIMD
+#endif
+
 namespace js {
 namespace wasm {
 

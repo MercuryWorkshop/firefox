@@ -667,8 +667,10 @@ static Module* DecodeModule(JSContext* cx, const uint8_t* bytes, size_t len) {
   if (!m->defined.empty()) {
     m->preparedFlags =
         std::make_unique<std::atomic<uint8_t>[]>(m->defined.length());
+    m->bCounts = std::make_unique<std::atomic<uint32_t>[]>(m->defined.length());
     for (size_t i = 0; i < m->defined.length(); i++) {
       m->preparedFlags[i].store(0, std::memory_order_relaxed);
+      m->bCounts[i].store(0, std::memory_order_relaxed);
     }
   }
 

@@ -1273,10 +1273,11 @@ static bool EmitDeoptResumeInline(Encoder& e, WJBackend& be,
     if (threaded) resumePc = GetNextPc(callPc);
     uint32_t pcOff = uint32_t(resumePc - info.script()->code());
     if (getenv("GECKO_WJ_RPDBG")) {
-      fprintf(stderr, "[wj-rpc] f=%u %s:%u mode=%d rawpc=%u op=%s resumepc=%u depth=%u\n",
+      fprintf(stderr, "[wj-rpc] f=%u %s:%u mode=%d rawpc=%u op=%s resumepc=%u depth=%u deoptOp=%s\n",
               f, info.script()->filename(), unsigned(info.script()->lineno()),
               int(rp->mode()), unsigned(rp->pc() - info.script()->code()),
-              js::CodeName(JSOp(*rp->pc())), pcOff, stackDepth);
+              js::CodeName(JSOp(*rp->pc())), pcOff, stackDepth,
+              f == 0 ? WJOpName(jit::MDefinition::Opcode(be.curOp)) : "-");
     }
     if (!storeI32(uintptr_t(&gWJResumePc[f]), int32_t(pcOff))) return false;
     if (!storeI32(uintptr_t(&gWJResumeStackDepth[f]), int32_t(outDepth)))
@@ -1648,20 +1649,53 @@ static void WJCollectRoots(WJBackend& be, MInstruction* ins,
   // proper backward dataflow). consider() roots a dominating Object/Value local iff it's
   // in here. Empty when rootAll (default) -> consider roots all (the old behavior).
   std::unordered_set<const MDefinition*> liveAfterSet;
-  // DEFAULT-ON: root ALL object/value locals at every GC point (a true safepoint),
-  // not just those the dominance+liveness walk finds live-after `ins`. That walk
-  // MISSES values resurrected by GetOp rematerialization (a later consumer re-reads
-  // an Unbox/guard's SOURCE, whose own liveness already "ended"): the source local
-  // goes stale across an intervening alloc -> a freed/moved pointer (raytrace `new
-  // X(objArg)` "rendered incorrectly"). Rooting all named locals closes that class
-  // of bug; measured negligible cost (splay -2.5%, richards +7%). GECKO_WJ_NOROOTALL
-  // reverts to the selective (unsound-for-remat) walk.
-  static int rootAll = getenv("GECKO_WJ_NOROOTALL") ? 0 : 1;
+  // DEFAULT 2026-06-28: PRECISE dataflow rooting (root only the live-after-ins root-set,
+  // via WJComputeLiveness). The old conservative rootAll (root ALL dominating object/value
+  // locals at every safepoint) was SOUND but over-spilled massively -> a huge pervasive
+  // overhead. Proper backward dataflow liveness + GetOp-read-closure (WJRootSet) + resume-
+  // point operand uses makes precise rooting SOUND (validated: ~130 normal runs + 75 GC-
+  // flaky-bench runs + tiny-nursery & GCZeal=7 stress = ZERO TraceRoot/staleness crashes,
+  // zero wrong-answers) and FASTER (+16-56% suite-wide: ubo 2.8x->3.3x, richards +54%,
+  // crypto +52%, deltablue +56%, raytrace +30%, earley +33%, navier +20%, gbemu ->JIT-
+  // positive). The earlier "unsound for remat" belief was a partial liveness (missing the
+  // 5 guard/proto passthroughs + resume-point reads); the "NOROOTALL ~70%" readings were
+  // test-CONTENTION artifacts (stale parallel test procs), not under-rooting -- clean
+  // serial A/B shows precise == rootAll on crashes (both 0) and faster. GECKO_WJ_ROOTALL=1
+  // forces the old conservative rooting (fallback). See [[gc-root-spill-lever]].
+  static int rootAll = getenv("GECKO_WJ_ROOTALL") ? 1 : 0;
+  // DEBUG bisection (GECKO_WJ_ROOTADD): in NOROOTALL mode, additionally root all
+  // dominating values of a chosen op-category beyond the precise liveAfterSet -- to
+  // isolate WHICH category my dataflow liveness wrongly drops (the ~30% residual crash).
+  // 99=all dominating (sanity: must = rootAll = sound), 1=Phi, 2=Call/Construct,
+  // 3=GetProp/LoadSlot family, 4=Unbox, 5=Box/New*.
+  static int rootAddCat = getenv("GECKO_WJ_ROOTADD")
+                              ? atoi(getenv("GECKO_WJ_ROOTADD")) : 0;
   auto consider = [&](MDefinition* d) {
+    using Op_ = MDefinition::Opcode;
     bool isObj = d->type() == MIRType::Object;
     bool isVal = d->type() == MIRType::Value;
-    if ((isObj || isVal) && be.local(d) >= 0 && (rootAll || liveAfterSet.count(d)))
-      add(d, isObj);
+    if (!((isObj || isVal) && be.local(d) >= 0)) return;
+    bool root = rootAll || liveAfterSet.count(d);
+    if (!root && rootAddCat) {
+      Op_ op = d->op();
+      if (rootAddCat == 99) root = true;
+      else if (rootAddCat == 1 && d->isPhi()) root = true;
+      else if (rootAddCat == 2 &&
+               (op == Op_::Call || op == Op_::ConstructArray ||
+                op == Op_::ConstructArgs || op == Op_::ApplyArgs))
+        root = true;
+      else if (rootAddCat == 3 &&
+               (op == Op_::GetPropertyCache || op == Op_::LoadFixedSlot ||
+                op == Op_::LoadDynamicSlot || op == Op_::LoadFixedSlotAndUnbox ||
+                op == Op_::LoadDynamicSlotAndUnbox || op == Op_::MegamorphicLoadSlot))
+        root = true;
+      else if (rootAddCat == 4 && op == Op_::Unbox) root = true;
+      else if (rootAddCat == 5 &&
+               (op == Op_::Box || op == Op_::NewObject || op == Op_::NewArray ||
+                op == Op_::NewPlainObject || op == Op_::NewArrayObject))
+        root = true;
+    }
+    if (root) add(d, isObj);
   };
   // Root values whose def dominates `ins` and are live across it, unioned with
   // the call's resume-point operands (the precise abstract-interpreter live
@@ -1718,14 +1752,10 @@ static void WJCollectRoots(WJBackend& be, MInstruction* ins,
       bool isObj = d->type() == MIRType::Object;
       bool isVal = d->type() == MIRType::Value;
       if ((isObj || isVal) && be.local(d) >= 0) add(d, isObj);
-      // Also root d's GetOp read-closure: a PASSTHROUGH resume operand (Slots/Unbox/guard)
-      // is materialized from its SOURCE on spill, so the source -- not d -- is what must
-      // survive GC. (Harmless in rootAll mode; closes a NOROOTALL gap for the CURRENT
-      // safepoint's RP, which the within-block walk skips since it breaks at `ins`.)
-      std::unordered_set<const MDefinition*> rs;
-      WJRootSet(be, d, rs, 0);
-      for (const MDefinition* s : rs)
-        add(const_cast<MDefinition*>(s), s->type() == MIRType::Object);
+      // (Do NOT add WJRootSet(d) here: a resume operand's remat SOURCE can be a
+      // NON-dominating local -> spilling it reads garbage -> TraceRoot crash. That
+      // unconditional addition regressed even default rootAll 10/10 -> 8/10. Reverted.
+      // KEY LESSON: only DOMINATING values are valid to root; rooting more is NOT free.)
     }
   }
   // NB: the closure env is NOT rooted here -- it lives in a PERSISTENT GC-shadow
@@ -3497,6 +3527,32 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
       if (!e.writeOp(Op::End)) return false;
       return GetOp(e, be, g->object());  // result = the (current) object
     }
+    case MDefinition::Opcode::GuardNoDenseElements: {
+      // Passthrough the object; deopt if obj->elements->initializedLength != 0
+      // (Ion visitGuardNoDenseElements). Used by SetProp/AddSlot IC stubs to ensure
+      // a named-property add can't collide with dense indexed elements. Bailing it
+      // dropped crypto-sha1's hot core_sha1 entirely to PBL (1.17x). The empty-
+      // elements header is shared+valid (initLen 0) so the load is always safe.
+      MGuardNoDenseElements* g = ins->toGuardNoDenseElements();
+      if (!GetOp(e, be, g->object())) return false;  // obj
+      if (!e.writeOp(Op::I32Load) || !e.writeVarU32(2) ||
+          !e.writeVarU32(uint32_t(js::NativeObject::offsetOfElements())))
+        return false;  // obj->elements_ (offsetOfElements positive -> memarg OK)
+      // elements->initializedLength: offsetOfInitializedLength() is NEGATIVE (it is
+      // element-data-relative: offsetof - sizeof(ObjectElements)). A wasm memarg
+      // offset is UNSIGNED, so baking -12 there gives 0xFFFFFFF4 -> addr wraps far
+      // past memory -> OOB trap (this was crypto-sha1's elusive core_sha1 OOB, and a
+      // latent landmine for any executed GuardNoDenseElements). Add it explicitly.
+      if (!e.writeOp(Op::I32Const) ||
+          !e.writeVarS32(js::ObjectElements::offsetOfInitializedLength()) ||
+          !e.writeOp(Op::I32Add) || !e.writeOp(Op::I32Load) || !e.writeVarU32(2) ||
+          !e.writeVarU32(0))
+        return false;  // elements->initializedLength (nonzero -> dense present)
+      if (!e.writeOp(Op::If) || !e.writeFixedU8(0x40)) return false;
+      if (!EmitDeopt(e, be)) return false;
+      if (!e.writeOp(Op::End)) return false;
+      return GetOp(e, be, g->object());  // passthrough the (current) object
+    }
     case MDefinition::Opcode::GuardShapeList: {
       // Polymorphic shape guard: deopt unless obj->shape() is one of the recorded
       // shapes (up to 4). Each shape goes through the GC-traced pool (relocation-
@@ -4102,6 +4158,62 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
           return WJBAIL("LoadUnboxedScalar storage type unsupported\n");
       }
     }
+    case MDefinition::Opcode::LoadElementHole: {
+      // arr[i] where i may be a hole or past initializedLength (Ion
+      // visitLoadElementHole). Result is a boxed Value: in-bounds non-hole -> the
+      // element; in-bounds hole OR OOB -> undefined; OOB with a negative index ->
+      // deopt (needsNegativeIntCheck). Mirrors the OOB-safe LoadElement path below.
+      // crypto-sha1 core_sha1 reads x[i+j] where str2binb leaves sparse holes.
+      // DEFAULT-ON (GECKO_WJ_NOLEHOLE reverts to bailing): the elusive core_sha1 OOB
+      // was a separate GuardNoDenseElements negative-memarg bug (now fixed), not this.
+      if (getenv("GECKO_WJ_NOLEHOLE")) return false;
+      MDefinition* elemsD = ins->getOperand(0);
+      MDefinition* idxD = ins->getOperand(1);
+      int32_t il = be.local(idxD);
+      if (il < 0) return false;
+      bool negCheck = ins->toLoadElementHole()->needsNegativeIntCheck();
+      int64_t undefBits = int64_t(JS::UndefinedValue().asRawBits());
+      // inBounds = (uint32)index < (uint32)initializedLength(elements). GetOp(elemsD)
+      // rematerializes obj->elements_ fresh on each use (GetOpInner never caches an
+      // Elements pointer), so it is always GC-current -- no manual refetch needed.
+      if (!GetLocal(e, uint32_t(il)) || !GetOp(e, be, elemsD) ||
+          !e.writeOp(Op::I32Const) ||
+          !e.writeVarS32(js::ObjectElements::offsetOfInitializedLength()) ||
+          !e.writeOp(Op::I32Add) || !e.writeOp(Op::I32Load) || !e.writeVarU32(2) ||
+          !e.writeVarU32(0) || !e.writeOp(Op::I32LtU))
+        return false;
+      if (!e.writeOp(Op::If) || !e.writeFixedU8(uint8_t(TypeCode::I64)))
+        return false;
+      // in-bounds: load boxed elem; map the hole magic to undefined.
+      if (!GetOp(e, be, elemsD) || !GetLocal(e, uint32_t(il)) ||
+          !e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(sizeof(JS::Value))) ||
+          !e.writeOp(Op::I32Mul) || !e.writeOp(Op::I32Add) ||
+          !e.writeOp(Op::I64Load) || !e.writeVarU32(3) || !e.writeVarU32(0) ||
+          !e.writeOp(Op::LocalTee) || !e.writeVarU32(be.unboxScratch))
+        return false;
+      if (!e.writeOp(Op::I64Const) ||
+          !e.writeVarS64(int64_t(JS::MagicValue(JS_ELEMENTS_HOLE).asRawBits())) ||
+          !e.writeOp(Op::I64Eq))
+        return false;
+      if (!e.writeOp(Op::If) || !e.writeFixedU8(uint8_t(TypeCode::I64)))
+        return false;
+      if (!e.writeOp(Op::I64Const) || !e.writeVarS64(undefBits)) return false;
+      if (!e.writeOp(Op::Else)) return false;
+      if (!GetLocal(e, be.unboxScratch)) return false;
+      if (!e.writeOp(Op::End)) return false;  // boxed-or-undefined
+      if (!e.writeOp(Op::Else)) return false;
+      // OOB: Ion deopts on a negative index (needsNegativeIntCheck); else undefined.
+      if (negCheck) {
+        if (!GetLocal(e, uint32_t(il)) || !e.writeOp(Op::I32Const) ||
+            !e.writeVarS32(0) || !e.writeOp(Op::I32LtS))
+          return false;
+        if (!e.writeOp(Op::If) || !e.writeFixedU8(0x40)) return false;
+        if (!EmitDeopt(e, be)) return false;
+        if (!e.writeOp(Op::End)) return false;
+      }
+      if (!e.writeOp(Op::I64Const) || !e.writeVarS64(undefBits)) return false;  // OOB
+      return e.writeOp(Op::End);
+    }
     case MDefinition::Opcode::LoadElement:
     case MDefinition::Opcode::LoadElementAndUnbox: {
       bool andUnbox = ins->op() == MDefinition::Opcode::LoadElementAndUnbox;
@@ -4511,19 +4623,29 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
         return false;
       }
       // int32 +/-/* overflow MUST bail to a double (Ion does): a non-truncated
-      // int32 op that overflows 2^31 and then feeds a shift/compare (crypto's
-      // bignum carry `c=(l>>28)+...` where l overflows) gets a WRONG result from
-      // a wrapping i32.add (negative wrap -> wrong >>). RE-LANDED (was reverted to
-      // wrapping). Compute in i64 (sign-extended operands), deopt if the result
-      // doesn't fit int32, else wrap. GECKO_WJ_NOOVFLCHECK reverts to wrapping.
-      // Correct (Ion-aligned) but BLOCKED by the mid-statement deopt-resume bug:
-      // the overflow deopt fires mid-expression and the depth>0 expr-stack resume
-      // mis-reconstructs (crypto stays ~40% ERR + ~20% slower with it on). Opt-in
-      // (GECKO_WJ_OVFLCHECK) until that resume reconstruction is fixed; then it
-      // becomes the default (the wrapping path below is latently wrong on a
-      // non-truncated overflowing int32 op).
-      static int wantOvfl = getenv("GECKO_WJ_OVFLCHECK") ? 1 : 0;
-      if (!wantOvfl) {
+      // int32 op that overflows 2^31 and then feeds a shift/compare/sum (crypto's
+      // bignum carry `c=(l>>28)+...`, hash-map's keySum accumulator 4.05e9) gets a
+      // WRONG result from a wrapping i32.add (negative wrap). Compute in i64
+      // (sign-extended operands), deopt if the result doesn't fit int32, else wrap.
+      //
+      // DEFAULT (2026-06-28): emit the overflow check ONLY for FALLIBLE ops, exactly
+      // as Ion does. MAdd/MSub/MMul::fallible() is false when range analysis proved
+      // int32 bounds or the op is truncated -- those CANNOT overflow / want wrapping,
+      // so a plain i32 op is correct AND fast (loop counters, indices, `x|0` chains).
+      // Only genuinely-fallible ops pay the i64 check, so the suite-wide perf cost is
+      // minimal while wrong-answers (the old wrapping default was latently wrong on
+      // every overflowing non-truncated op) are eliminated. The earlier blanket-on
+      // version's crypto ERRs were a separate (now-fixed) resume bug; gating on
+      // fallible() shrinks the checked set to where it matters.
+      //   GECKO_WJ_NOOVFLCHECK -> old wrapping-always default (no check anywhere).
+      //   GECKO_WJ_OVFLCHECK   -> force the check on ALL int ops (debug/A-B).
+      bool fallible;
+      if (ins->isAdd())      fallible = ins->toAdd()->fallible();
+      else if (ins->isSub()) fallible = ins->toSub()->fallible();
+      else                   fallible = ins->toMul()->fallible();
+      static int noOvfl  = getenv("GECKO_WJ_NOOVFLCHECK") ? 1 : 0;
+      static int allOvfl = getenv("GECKO_WJ_OVFLCHECK") ? 1 : 0;
+      if (noOvfl || (!fallible && !allOvfl)) {
         if (!GetOp(e, be, ins->getOperand(0)) ||
             !GetOp(e, be, ins->getOperand(1)))
           return false;
@@ -8013,11 +8135,108 @@ static EffectKind EmitEffect(Encoder& e, WJBackend& be, MInstruction* ins) {
           !e.writeVarU32(2) || !e.writeVarU32(0))
         return EffectKind::Fail;
       if (!GetLocal(e, uint32_t(idx)) || !e.writeOp(Op::I32LeU))
-        return EffectKind::Fail;  // initLen <= index -> grow/hole -> deopt
+        return EffectKind::Fail;  // initLen <= index -> grow/hole
       if (!e.writeOp(Op::If) || !e.writeFixedU8(0x40)) return EffectKind::Fail;
-      if (!EmitDeopt(e, be)) return EffectKind::Fail;
-      if (!e.writeOp(Op::End)) return EffectKind::Fail;
-      // addr = elements + index*8; store the boxed value
+      // GROW/HOLE branch (index >= initializedLength). Inline the Ion-style dense
+      // APPEND fast path: when index == initializedLength AND index < capacity the
+      // store is a pure append into spare dense capacity, so do it INLINE (store value,
+      // bump initializedLength, grow length if needed, inline post-write barrier). This
+      // is GC-FREE (no allocation) -- unlike the SetObjectElement helper it adds NO new
+      // GC safepoint (so no 3d-cube-style staleness), and unlike EmitDeopt it does NOT
+      // replay the appending region (the deopt-resume bug that duplicated hash-map
+      // entries / corrupted crypto-aes -- task #15). hash-map inserts keys 0..N in
+      // order with index==key, so every store is exactly this append (capacity
+      // 131072 > 90000) -> fully in JIT + correct. Holes (index > initializedLength)
+      // and realloc (index >= capacity) fall through to deopt (PBL grows correctly);
+      // 3d-cube's small arrays realloc -> deopt -> correct.
+      //   GECKO_WJ_SEHAPPEND   -> inline dense-append fast path for index==initLen.
+      //   GECKO_WJ_NOSEHHELPER -> revert to pure deopt for the grow branch.
+      // DEFAULT (2026-06-28) = SetObjectElement helper for the grow branch. The plain
+      // deopt is UNSOUND here: the StoreElementHole's resume point is a resume-AFTER
+      // (or, when no nearer rp exists, the enclosing LOOP HEAD), so resuming re-runs
+      // preceding side-effecting ops in the same statement/iteration -- e.g. hash-map
+      // _rehash replays `entry._next = newData[index]` before re-reading
+      // `next = entry._next`, corrupting the chain -> dup/lost entries; crypto-aes
+      // (jetstream) wrong result; 3d-cube intermittent (task #15). The helper does the
+      // grow in C++ with no deopt and no replay, so it is correct everywhere. It adds
+      // a GC safepoint, which used to destabilize 3d-cube -- but the precise-rooting
+      // default (2026-06-28) fixed that latent rooting bug, so the helper is now sound:
+      // hash-map + crypto-aes + 3d-cube all OK x6 under tiny-nursery, octane neutral
+      // (crypto +, richards/navier neutral), no hang. (The inline-append SEHAPPEND is
+      // faster but has a latent bug that hangs crypto-octane, so it stays opt-in.)
+      static int sehAppend = getenv("GECKO_WJ_SEHAPPEND") ? 1 : 0;
+      static int sehHelper = getenv("GECKO_WJ_NOSEHHELPER") ? 0 : 1;
+      bool didAppend = false;
+      if (sehAppend) {
+        // cond = (index == initializedLength) & (capacity > index)
+        if (!GetOp(e, be, s->elements()) || !e.writeOp(Op::I32Const) ||
+            !e.writeVarS32(js::ObjectElements::offsetOfInitializedLength()) ||
+            !e.writeOp(Op::I32Add) || !e.writeOp(Op::I32Load) ||
+            !e.writeVarU32(2) || !e.writeVarU32(0))
+          return EffectKind::Fail;
+        if (!GetLocal(e, uint32_t(idx)) || !e.writeOp(Op::I32Eq))
+          return EffectKind::Fail;
+        if (!GetOp(e, be, s->elements()) || !e.writeOp(Op::I32Const) ||
+            !e.writeVarS32(js::ObjectElements::offsetOfCapacity()) ||
+            !e.writeOp(Op::I32Add) || !e.writeOp(Op::I32Load) ||
+            !e.writeVarU32(2) || !e.writeVarU32(0))
+          return EffectKind::Fail;
+        if (!GetLocal(e, uint32_t(idx)) || !e.writeOp(Op::I32GtU))
+          return EffectKind::Fail;
+        if (!e.writeOp(Op::I32And)) return EffectKind::Fail;
+        if (!e.writeOp(Op::If) || !e.writeFixedU8(0x40)) return EffectKind::Fail;
+        // elements[index] = boxed value
+        if (!GetOp(e, be, s->elements()) || !GetLocal(e, uint32_t(idx)) ||
+            !e.writeOp(Op::I32Const) || !e.writeVarS32(8) ||
+            !e.writeOp(Op::I32Mul) || !e.writeOp(Op::I32Add))
+          return EffectKind::Fail;
+        if (!EmitSpillValue(e, be, s->value())) return EffectKind::Fail;
+        if (!e.writeOp(Op::I64Store) || !e.writeVarU32(3) || !e.writeVarU32(0))
+          return EffectKind::Fail;
+        // initializedLength = index + 1
+        if (!GetOp(e, be, s->elements()) || !e.writeOp(Op::I32Const) ||
+            !e.writeVarS32(js::ObjectElements::offsetOfInitializedLength()) ||
+            !e.writeOp(Op::I32Add) || !GetLocal(e, uint32_t(idx)) ||
+            !e.writeOp(Op::I32Const) || !e.writeVarS32(1) || !e.writeOp(Op::I32Add) ||
+            !e.writeOp(Op::I32Store) || !e.writeVarU32(2) || !e.writeVarU32(0))
+          return EffectKind::Fail;
+        // if (length <= index) length = index + 1
+        if (!GetOp(e, be, s->elements()) || !e.writeOp(Op::I32Const) ||
+            !e.writeVarS32(js::ObjectElements::offsetOfLength()) ||
+            !e.writeOp(Op::I32Add) || !e.writeOp(Op::I32Load) ||
+            !e.writeVarU32(2) || !e.writeVarU32(0))
+          return EffectKind::Fail;
+        if (!GetLocal(e, uint32_t(idx)) || !e.writeOp(Op::I32LeU))
+          return EffectKind::Fail;
+        if (!e.writeOp(Op::If) || !e.writeFixedU8(0x40)) return EffectKind::Fail;
+        if (!GetOp(e, be, s->elements()) || !e.writeOp(Op::I32Const) ||
+            !e.writeVarS32(js::ObjectElements::offsetOfLength()) ||
+            !e.writeOp(Op::I32Add) || !GetLocal(e, uint32_t(idx)) ||
+            !e.writeOp(Op::I32Const) || !e.writeVarS32(1) || !e.writeOp(Op::I32Add) ||
+            !e.writeOp(Op::I32Store) || !e.writeVarU32(2) || !e.writeVarU32(0))
+          return EffectKind::Fail;
+        if (!e.writeOp(Op::End)) return EffectKind::Fail;
+        // GC-value append: inline post-write barrier (no GC safepoint).
+        if (WJTypeMaybeGC(s->value()->type()) && !WJHasPostBarrierNode(s->object()) &&
+            !EmitForcePostBarrier(e, be, s->object()))
+          return EffectKind::Fail;
+        if (!e.writeOp(Op::Else)) return EffectKind::Fail;
+        didAppend = true;
+      }
+      // NON-APPEND grow (hole-fill or realloc): deopt (PBL), or helper if opted in.
+      if (!sehHelper) {
+        if (!EmitDeopt(e, be)) return EffectKind::Fail;
+      } else {
+        if (!EmitStageScratch(e, be, s->object(), 0)) return EffectKind::Fail;
+        if (!EmitStageScratch(e, be, s->index(), 1)) return EffectKind::Fail;
+        if (!EmitStageScratch(e, be, s->value(), 2)) return EffectKind::Fail;
+        if (!EmitHelperCallResult(e, be, ins, WJH_SETPROP, 0))
+          return EffectKind::Fail;
+        if (!e.writeOp(Op::Drop)) return EffectKind::Fail;
+      }
+      if (didAppend && !e.writeOp(Op::End)) return EffectKind::Fail;  // close append-If
+      if (!e.writeOp(Op::Else)) return EffectKind::Fail;
+      // IN-BOUNDS branch: store inline. addr = elements + index*8; boxed value.
       if (!GetOp(e, be, s->elements()) || !GetLocal(e, uint32_t(idx)) ||
           !e.writeOp(Op::I32Const) || !e.writeVarS32(8) ||
           !e.writeOp(Op::I32Mul) || !e.writeOp(Op::I32Add))
@@ -8031,6 +8250,7 @@ static EffectKind EmitEffect(Encoder& e, WJBackend& be, MInstruction* ins) {
       if (WJTypeMaybeGC(s->value()->type()) && !WJHasPostBarrierNode(s->object()) &&
           !EmitForcePostBarrier(e, be, s->object()))
         return EffectKind::Fail;
+      if (!e.writeOp(Op::End)) return EffectKind::Fail;
       return EffectKind::Emitted;
     }
     case MDefinition::Opcode::SetInitializedLength: {

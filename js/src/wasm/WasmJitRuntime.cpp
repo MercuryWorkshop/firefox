@@ -309,6 +309,11 @@ struct WJEntry {
   // property codegen (multi-shape EmitPropIC, no deopt) for GuardShape-guarded
   // reads -- fixes a monomorphic GuardShape storming on a polymorphic receiver.
   bool forceMega = false;
+  // Set when the Ion-style count trigger has spent its recompile attempt on a
+  // MODERATE-rate (<=50%) storm and it did NOT heal: stop re-triggering and keep the
+  // current JIT version (it's net-positive-ish; failing to PBL would cost the JIT<->PBL
+  // boundary, measured WORSE than the residual deopts). Only >50% storms fail to PBL.
+  bool recompileDone = false;
 };
 
 // Per-script compile state. Keyed by JSScript*; entries persist for the process.
@@ -329,6 +334,29 @@ static WJEntry& EntryFor(JSScript* script) {
   sECScript[h] = script;
   sECEntry[h] = &e;
   return e;
+}
+
+// GECKO_WJ_ENTRYDUMP: dump every WJEntry with deopts >= threshold -- script
+// filename:line, deopts, jitRuns, deopt-rate%, recompiles, final state. Tells us
+// which functions storm-in-JIT (Compiled + high deopts) vs failed-to-PBL.
+static void WJDumpEntries() {
+  if (!gEntries) return;
+  int thr = getenv("GECKO_WJ_ENTRYDUMP") ? atoi(getenv("GECKO_WJ_ENTRYDUMP")) : 0;
+  if (thr <= 0) thr = 1000;
+  fprintf(stderr, "[wj-entrydump] (deopts>=%d):\n", thr);
+  for (auto& kv : *gEntries) {
+    JSScript* sc = kv.first;
+    WJEntry& e = kv.second;
+    if (e.deopts < uint32_t(thr)) continue;
+    uint64_t tot = uint64_t(e.deopts) + e.jitRuns;
+    int rate = tot ? int((100ull * e.deopts) / tot) : 0;
+    const char* st = e.state == WJEntry::State::Compiled ? "COMPILED"
+                     : e.state == WJEntry::State::Failed ? "FAILED(PBL)"
+                                                         : "Cold";
+    fprintf(stderr, "  %s:%u deopts=%u jitRuns=%u rate=%d%% recomp=%u %s\n",
+            sc->filename() ? sc->filename() : "?", unsigned(sc->lineno()),
+            e.deopts, e.jitRuns, rate, e.recompiles, st);
+  }
 }
 
 // Warm-up delay: WarpOracle needs PBL-attached CacheIR stubs, which only appear
@@ -698,8 +726,32 @@ int js::wasm::WasmJitRunCall(JSScript* script, uint64_t thisBits,
   if (gWJDidResume) {
     e.deopts++;
     static int valveN = getenv("GECKO_WJ_VALVEN") ? atoi(getenv("GECKO_WJ_VALVEN")) : 300;
-    if (e.deopts >= uint32_t(valveN) && e.deopts > (e.jitRuns + 1) &&
-        !getenv("GECKO_WJ_NODEOPTVALVE")) {
+    static int noDeoptValve = getenv("GECKO_WJ_NODEOPTVALVE") ? 1 : 0;
+    // Ion-style trigger. Ion (frequentBailoutThreshold, default 10) recompiles after an
+    // ABSOLUTE COUNT of fixable bailouts, NOT a deopt RATE -- so a moderate-rate storm
+    // still gets invalidated+recompiled with fresh types. Our OLD gate fired only at
+    // >50% deopt (deopts > jitRuns+1), so cdjs's ~49%-deopt type-storms (Int32 unbox of
+    // double -- now that the IC enriches, see WJ_DBLWARM) NEVER recompiled and stormed
+    // forever. Add a COUNT trigger (deopts >= countN) with a ~>=20% rate floor (so
+    // low-rate net-positive fns are untouched). Count-triggered fns get a FRESH
+    // (type-respec) recompile that reads the enriched ICs and re-types Double; the >50%
+    // rate path keeps the forceMega (shape) recompile. GECKO_WJ_NORECOMPILEN -> rate-only.
+    static int countN = getenv("GECKO_WJ_NORECOMPILEN") ? 0
+                        : (getenv("GECKO_WJ_RECOMPILEN")
+                               ? atoi(getenv("GECKO_WJ_RECOMPILEN"))
+                               : 1500);
+    bool rateGate = e.deopts > (e.jitRuns + 1);
+    // Rate floor for the count trigger. Ion uses an ABSOLUTE bailout count (no rate
+    // floor); our default 25% floor protects low-rate net-positive fns from churn,
+    // but it also blocks recompiling a low-rate-but-EXPENSIVE-resume deopter (e.g.
+    // crypto-sha1 safe_add: ~2838 deopts on a param that's sometimes undefined, but
+    // <<25% rate -> never re-typed). GECKO_WJ_RECOMPILE_RATE tunes the floor %.
+    static int rateFloor =
+        getenv("GECKO_WJ_RECOMPILE_RATE") ? atoi(getenv("GECKO_WJ_RECOMPILE_RATE")) : 25;
+    bool countGate = countN > 0 && e.deopts >= uint32_t(countN) &&
+                     uint64_t(e.deopts) * 100 >= uint64_t(e.jitRuns) * uint64_t(rateFloor);
+    if (e.deopts >= uint32_t(valveN) && (rateGate || countGate) &&
+        !noDeoptValve && !e.recompileDone) {
       // A storming fn with an alwaysBails block deopts from that COLD-IC block;
       // recompiling reproduces it identically (verified: deltablue 741's recompiled
       // MIR is byte-identical), so recompiling is pointless AND the recompile churn
@@ -751,7 +803,10 @@ int js::wasm::WasmJitRunCall(JSScript* script, uint64_t thisBits,
                                    : 1;
       if (int(e.recompiles) < megaRetries) {
         e.recompiles++;
-        e.forceMega = true;
+        // Shape-storm (>50% rate) -> megamorphic recompile (multi-shape GuardShapeList).
+        // Type-storm (count-triggered, moderate rate) -> FRESH recompile (no mega): just
+        // re-read the now-enriched type ICs so Warp re-types the arith/compare Double.
+        e.forceMega = rateGate;
         e.state = WJEntry::State::Cold;  // re-observe + recompile with fresh ICs
         e.handle = -1;
         e.directIdx = -1;
@@ -765,8 +820,15 @@ int js::wasm::WasmJitRunCall(JSScript* script, uint64_t thisBits,
         e.nextTry = 0;
         return 0;
       }
-      // Still storming after the mega recompile(s): deopt-bound, slower than PBL.
-      e.state = WJEntry::State::Failed;
+      // Recompile didn't heal. A >50% storm is clearly net-negative -> fall to PBL. A
+      // moderate-rate (count-triggered) storm STAYS in JIT (recompileDone stops further
+      // triggering): failing it to PBL costs the JIT<->PBL boundary, measured WORSE than
+      // the residual deopts (cdjs: compile-bail-to-PBL = 12.5s vs 11.3s deopting).
+      if (rateGate) {
+        e.state = WJEntry::State::Failed;
+      } else {
+        e.recompileDone = true;
+      }
       return 0;
     }
   } else {
@@ -1079,11 +1141,23 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
 
   if (kind == js::wasm::WJH_RESUME) {
     gWJDidResume = true;  // this JIT entry deopted (safety-valve accounting)
-    if(getenv("GECKO_DEBUG_JIT")){static uint64_t c=0; if((++c%5000)==0) fprintf(stderr,"[wb-resume-count] %llu\n",(unsigned long long)c);}
-    if(getenv("GECKO_WJ_SITEHIST")){static uint64_t c=0; if((++c%200000)==0) js::wasm::WJDumpDeoptSiteHist();}
-    if (getenv("GECKO_WJ_DEOPTHIST")) {
+    // NEVER put a bare getenv() in this path -- WJH_RESUME fires on EVERY deopt
+    // (cdjs: 3.3M/iter), and getenv walks the environ array each call. Cache all the
+    // debug-flag reads in statics (computed once). This was ~5 bare getenvs/resume =
+    // ~16M getenv/iter for a deopt-heavy bench -- pure overhead. See [[wjhelp-getenv-tax]].
+    static int dbgJit = getenv("GECKO_DEBUG_JIT") ? 1 : 0;
+    static int siteHist = getenv("GECKO_WJ_SITEHIST") ? 1 : 0;
+    static int entryDump = getenv("GECKO_WJ_ENTRYDUMP") ? 1 : 0;
+    static int deoptHist = getenv("GECKO_WJ_DEOPTHIST") ? 1 : 0;
+    static int deoptHistN = getenv("GECKO_WJ_DEOPTHISTN") ? 1 : 0;
+    static int stormLine = getenv("GECKO_WJ_STORMLINE") ? 1 : 0;
+    static int stormFirst = getenv("GECKO_WJ_STORMFIRST") ? 1 : 0;
+    if(dbgJit){static uint64_t c=0; if((++c%5000)==0) fprintf(stderr,"[wb-resume-count] %llu\n",(unsigned long long)c);}
+    if(siteHist){static uint64_t c=0; uint64_t thr=getenv("GECKO_WJ_SITEHISTN")?atoi(getenv("GECKO_WJ_SITEHISTN")):200000; if((++c%thr)==0) js::wasm::WJDumpDeoptSiteHist();}
+    if(entryDump){static uint64_t c=0; if((++c%1000000)==0) WJDumpEntries();}
+    if (deoptHist) {
       static uint64_t dc = 0;
-      uint64_t dmod = getenv("GECKO_WJ_DEOPTHISTN") ? 10 : 200;
+      uint64_t dmod = deoptHistN ? 10 : 200;
       if ((++dc % dmod) == 0) {
         fprintf(stderr, "[wb-deopthist] after %llu resumes:\n",
                 (unsigned long long)dc);
@@ -1092,11 +1166,11 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
             fprintf(stderr, "[wb-deopthist]   op#%u = %u\n", o, gWJDeoptByOp[o]);
       }
     }
-    if (getenv("GECKO_WJ_STORMLINE")) {
+    if (stormLine) {
       static uint64_t sc = 0;
       ++sc;
-      uint64_t mod = getenv("GECKO_WJ_STORMFIRST") ? 1 : 2000;
-      uint64_t cap = getenv("GECKO_WJ_STORMFIRST") ? 40 : ~0ull;
+      uint64_t mod = stormFirst ? 1 : 2000;
+      uint64_t cap = stormFirst ? 40 : ~0ull;
       if (sc <= cap && (sc % mod) == 0 && gWJResumeNFrames) {
         uint32_t lf = gWJResumeNFrames - 1;
         JSScript* ds =
@@ -1179,13 +1253,18 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
       // side-effecting inlined callees (deltablue incrementalAdd corruption).
       if (f > 0 && total >= 1) gWJResumeVals[off + total - 1] = rbits;
       (void)haveInner;
-      JS::RootedValueVector vals(cx);
-      if (!vals.reserve(total)) return 1.0;
+      // gWJResumeVals[off..] is ALREADY a rooted GC region (gWJResumeActive, count set
+      // above) and a JS::Value is bit-identical to its uint64_t slot, so view it
+      // DIRECTLY instead of copying every value into a per-resume RootedValueVector
+      // (a heap alloc + a copy of `total` boxed values on EVERY deopt -- cdjs storms
+      // 3.3M deopts/iter). PBL copies args/locals/stack onto its own frame at setup, so
+      // later mutations of gWJResumeVals don't alias the running frame.
+      const JS::Value* vals =
+          reinterpret_cast<const JS::Value*>(&gWJResumeVals[off]);
       static int rchk = getenv("GECKO_WJ_RESUMECHK") ? 1 : 0;
-      for (uint32_t i = 0; i < total; i++) {
-        uint64_t bits = gWJResumeVals[off + i];
-        if (rchk) {
-          JS::Value v = JS::Value::fromRawBits(bits);
+      if (rchk) {
+        for (uint32_t i = 0; i < total; i++) {
+          JS::Value v = vals[i];
           bool ok = v.isObject() || v.isString() || v.isSymbol() ||
                     v.isBigInt() || v.isInt32() || v.isDouble() || v.isBoolean() ||
                     v.isNull() || v.isUndefined() || v.isMagic();
@@ -1198,17 +1277,16 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
                     "[wj-badval] %s:%u f=%u slot=%u(%s) bits=%016llx gcthing=%d\n",
                     script->filename() ? script->filename() : "?",
                     unsigned(script->lineno()), f, i, kind,
-                    (unsigned long long)bits, v.isGCThing());
+                    (unsigned long long)v.asRawBits(), v.isGCThing());
           }
         }
-        vals.infallibleAppend(JS::Value::fromRawBits(bits));
       }
       uint64_t thisBits = vals[0].asRawBits();
-      const JS::Value* args = vals.begin() + 1;
+      const JS::Value* args = vals + 1;
       const uint64_t* locals =
-          reinterpret_cast<const uint64_t*>(vals.begin() + 1 + nargs);
+          reinterpret_cast<const uint64_t*>(vals + 1 + nargs);
       const uint64_t* stack =
-          reinterpret_cast<const uint64_t*>(vals.begin() + 1 + nargs + nlocals);
+          reinterpret_cast<const uint64_t*>(vals + 1 + nargs + nlocals);
       if (rdbg && rn < 4000000 &&
           (!getenv("GECKO_WJ_RESUMEDBGLINE") ||
            uint32_t(script->lineno()) ==
@@ -1268,8 +1346,8 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
                                         inErr)) {
         return 1.0;  // resumed execution threw (uncaught) -> propagate
       }
-      if (getenv("GECKO_WJ_DB414") && uint32_t(script->lineno()) ==
-              uint32_t(atoi(getenv("GECKO_WJ_DB414")))) {
+      static int db414 = getenv("GECKO_WJ_DB414") ? atoi(getenv("GECKO_WJ_DB414")) : -1;
+      if (db414 >= 0 && uint32_t(script->lineno()) == uint32_t(db414)) {
         JS::Value tv = JS::Value::fromRawBits(thisBits);
         if (tv.isObject()) {
           JS::RootedObject to(cx, &tv.toObject());

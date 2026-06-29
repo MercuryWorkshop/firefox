@@ -5969,9 +5969,32 @@ static EnvironmentObject& getEnvironmentFromCoordinate(
 // jit-on/off arms behave identically so timings stay comparable.
 #if defined(__EMSCRIPTEN__)
 #  define WJ_ICWARM(entry) (!(entry)->firstStub()->isFallback())
+// WJ_DBLWARM: the arith IC has a 2nd optimized stub (i.e. it has been enriched
+// beyond the first/Int32 stub -- arith stubs are type-specialized so a 2nd stub
+// means the double case is covered). Used so the HybridICs inline-double fast-path
+// only bypasses the IC fallback ONCE the IC actually has the double stub. Before
+// that, a double op routes through the fallback to ATTACH the double stub -- without
+// this, an IC warmed on int32 then fed doubles (cdjs's Vector3D math: integer coords
+// at warmup, fractional later) never records the double type, so WarpOracle keeps
+// re-typing the JIT'd arith Int32 and it deopt-storms forever (the type can't heal).
+#  define WJ_DBLWARM(entry)                                  \
+    (WJ_ICWARM(entry) && (entry)->firstStub()->maybeNext() && \
+     !(entry)->firstStub()->maybeNext()->isFallback())
 #else
 #  define WJ_ICWARM(entry) true
+#  define WJ_DBLWARM(entry) true
 #endif
+
+// Gate for the arith-IC double-enrichment fix (above). Default ON; set
+// GECKO_WJ_NOARITHENRICH=1 to revert to the old warm-bypasses-fallback behavior.
+static MOZ_ALWAYS_INLINE bool WJArithEnrich() {
+  static int v = getenv("GECKO_WJ_NOARITHENRICH") ? 0 : 1;
+  return v;
+}
+// Inline-double fast-path may bypass the IC fallback only once the double stub is
+// present; otherwise route through the IC so the fallback attaches it.
+#define WJ_DBL_INLINE_OK(entry) \
+  (WJArithEnrich() ? WJ_DBLWARM(entry) : WJ_ICWARM(entry))
 
 #define INVOKE_IC(kind, hasarg2)                                             \
   ctx.sp_ = sp;                                                              \
@@ -6616,7 +6639,7 @@ PBIResult PortableBaselineInterpret(
               END_OP(Add);
             }
           }
-          if (v0.isNumber() && v1.isNumber() && WJ_ICWARM(icEntry)) {
+          if (v0.isNumber() && v1.isNumber() && WJ_DBL_INLINE_OK(icEntry)) {
             double lhs = v1.toNumber();
             double rhs = v0.toNumber();
             VIRTPOP();
@@ -6662,7 +6685,7 @@ PBIResult PortableBaselineInterpret(
               END_OP(Sub);
             }
           }
-          if (v0.isNumber() && v1.isNumber() && WJ_ICWARM(icEntry)) {
+          if (v0.isNumber() && v1.isNumber() && WJ_DBL_INLINE_OK(icEntry)) {
             double lhs = v1.toNumber();
             double rhs = v0.toNumber();
             VIRTPOP();
@@ -6693,7 +6716,7 @@ PBIResult PortableBaselineInterpret(
               END_OP(Mul);
             }
           }
-          if (v0.isNumber() && v1.isNumber() && WJ_ICWARM(icEntry)) {
+          if (v0.isNumber() && v1.isNumber() && WJ_DBL_INLINE_OK(icEntry)) {
             double lhs = v1.toNumber();
             double rhs = v0.toNumber();
             VIRTPOP();
@@ -6710,7 +6733,7 @@ PBIResult PortableBaselineInterpret(
         if (HybridICs) {
           Value v0 = VIRTSP(0).asValue();
           Value v1 = VIRTSP(1).asValue();
-          if (v0.isNumber() && v1.isNumber() && WJ_ICWARM(icEntry)) {
+          if (v0.isNumber() && v1.isNumber() && WJ_DBL_INLINE_OK(icEntry)) {
             double lhs = v1.toNumber();
             double rhs = v0.toNumber();
             VIRTPOP();
@@ -6738,7 +6761,7 @@ PBIResult PortableBaselineInterpret(
               END_OP(Mod);
             }
           }
-          if (v0.isNumber() && v1.isNumber() && WJ_ICWARM(icEntry)) {
+          if (v0.isNumber() && v1.isNumber() && WJ_DBL_INLINE_OK(icEntry)) {
             double lhs = v1.toNumber();
             double rhs = v0.toNumber();
             VIRTPOP();
@@ -6755,7 +6778,7 @@ PBIResult PortableBaselineInterpret(
         if (HybridICs) {
           Value v0 = VIRTSP(0).asValue();
           Value v1 = VIRTSP(1).asValue();
-          if (v0.isNumber() && v1.isNumber() && WJ_ICWARM(icEntry)) {
+          if (v0.isNumber() && v1.isNumber() && WJ_DBL_INLINE_OK(icEntry)) {
             double lhs = v1.toNumber();
             double rhs = v0.toNumber();
             VIRTPOP();
@@ -6902,7 +6925,7 @@ PBIResult PortableBaselineInterpret(
             NEXT_IC();
             END_OP(Eq);
           }
-          if (v0.isNumber() && v1.isNumber() && WJ_ICWARM(icEntry)) {
+          if (v0.isNumber() && v1.isNumber() && WJ_DBL_INLINE_OK(icEntry)) {
             double lhs = v1.toNumber();
             double rhs = v0.toNumber();
             bool result = lhs == rhs;
@@ -6911,7 +6934,7 @@ PBIResult PortableBaselineInterpret(
             NEXT_IC();
             END_OP(Eq);
           }
-          if (v0.isNumber() && v1.isNumber() && WJ_ICWARM(icEntry)) {
+          if (v0.isNumber() && v1.isNumber() && WJ_DBL_INLINE_OK(icEntry)) {
             bool result = v0.toNumber() == v1.toNumber();
             VIRTPOP();
             VIRTSPWRITE(0, StackVal(BooleanValue(result)));
@@ -6933,7 +6956,7 @@ PBIResult PortableBaselineInterpret(
             NEXT_IC();
             END_OP(Ne);
           }
-          if (v0.isNumber() && v1.isNumber() && WJ_ICWARM(icEntry)) {
+          if (v0.isNumber() && v1.isNumber() && WJ_DBL_INLINE_OK(icEntry)) {
             double lhs = v1.toNumber();
             double rhs = v0.toNumber();
             bool result = lhs != rhs;
@@ -6942,7 +6965,7 @@ PBIResult PortableBaselineInterpret(
             NEXT_IC();
             END_OP(Ne);
           }
-          if (v0.isNumber() && v1.isNumber() && WJ_ICWARM(icEntry)) {
+          if (v0.isNumber() && v1.isNumber() && WJ_DBL_INLINE_OK(icEntry)) {
             bool result = v0.toNumber() != v1.toNumber();
             VIRTPOP();
             VIRTSPWRITE(0, StackVal(BooleanValue(result)));
@@ -6964,7 +6987,7 @@ PBIResult PortableBaselineInterpret(
             NEXT_IC();
             END_OP(Lt);
           }
-          if (v0.isNumber() && v1.isNumber() && WJ_ICWARM(icEntry)) {
+          if (v0.isNumber() && v1.isNumber() && WJ_DBL_INLINE_OK(icEntry)) {
             double lhs = v1.toNumber();
             double rhs = v0.toNumber();
             bool result = lhs < rhs;
@@ -6990,7 +7013,7 @@ PBIResult PortableBaselineInterpret(
             NEXT_IC();
             END_OP(Le);
           }
-          if (v0.isNumber() && v1.isNumber() && WJ_ICWARM(icEntry)) {
+          if (v0.isNumber() && v1.isNumber() && WJ_DBL_INLINE_OK(icEntry)) {
             double lhs = v1.toNumber();
             double rhs = v0.toNumber();
             bool result = lhs <= rhs;
@@ -7016,7 +7039,7 @@ PBIResult PortableBaselineInterpret(
             NEXT_IC();
             END_OP(Gt);
           }
-          if (v0.isNumber() && v1.isNumber() && WJ_ICWARM(icEntry)) {
+          if (v0.isNumber() && v1.isNumber() && WJ_DBL_INLINE_OK(icEntry)) {
             double lhs = v1.toNumber();
             double rhs = v0.toNumber();
             bool result = lhs > rhs;
@@ -7042,7 +7065,7 @@ PBIResult PortableBaselineInterpret(
             NEXT_IC();
             END_OP(Ge);
           }
-          if (v0.isNumber() && v1.isNumber() && WJ_ICWARM(icEntry)) {
+          if (v0.isNumber() && v1.isNumber() && WJ_DBL_INLINE_OK(icEntry)) {
             double lhs = v1.toNumber();
             double rhs = v0.toNumber();
             bool result = lhs >= rhs;
@@ -9599,7 +9622,8 @@ bool WasmJitResumeViaPBL(JSContext* cx, JSScript* script, uint64_t thisBits,
       nullptr, PBIResult::Ok, osrLocals, nLocals, osrStack, osrStackDepth);
   gPBLResumeEnclosingEnv = nullptr;
   gPBLResumeKeepEnv = false;
-  if (getenv("GECKO_WJ_RESUMERESDBG")) {
+  static int resumeResDbg = getenv("GECKO_WJ_RESUMERESDBG") ? 1 : 0;
+  if (resumeResDbg) {
     fprintf(stderr, "[wj-resume-res] %s:%u pcOff=%u ret=%d result=%s/%g\n",
             script->filename() ? script->filename() : "?",
             unsigned(script->lineno()), pcOff, int(ret),

@@ -108,9 +108,23 @@ enum WJHelpKind : int {
   WJH_ARRAYSLICE = 45,       // scratch[0]=array(boxed Object),[1]=begin(int32),[2]=end(int32) -> js::ArraySliceDense (Object); MArraySlice (caller guards packed)
   WJH_ARRAYJOIN = 46,        // scratch[0]=array(boxed Object),[1]=sep(boxed String) -> js::jit::ArrayJoin (String); MArrayJoin
   WJH_INCACHE = 47,          // scratch[0]=key(Value),[1]=obj(boxed Object) -> js::jit::OperatorIn (Boolean); MInCache (`key in obj`)
+  WJH_HASPROP = 48,          // scratch[0]=obj(boxed Object),[1]=idVal(Value), site=hasOwn -> Boolean; MMegamorphicHasProp
+  WJH_PARSEINT = 49,         // scratch[0]=string(Value),[1]=radix(Int32 Value) -> Value; MNumberParseInt
+  WJH_OBJTOITER = 50,        // scratch[0]=obj(boxed Object) -> for-of iterator (Object); MObjectToIterator
+  WJH_ISCALLABLE = 51,       // scratch[0]=value -> Boolean; MIsCallable
+  WJH_STRTOINDEX = 52,       // scratch[0]=string(Value) -> Int32 (array index or -1); MGuardStringToIndex
+  WJH_STREQATOM = 53,        // scratch[0]=str(Value),[1]=atom(StringValue) -> Boolean (pointer- or char-equal); MGuardSpecificAtom
+  WJH_HOMEPROTO = 54,        // scratch[0]=homeObject(Object) -> its [[Prototype]] (Object); MHomeObjectSuperBase
+  WJH_SETARRLEN = 55,        // scratch[0]=array(Object),[1]=rhs(Value), site=strict -> SetArrayLength; MCallSetArrayLength
+  WJH_INSHAPELIST = 56,      // scratch[0]=obj(Object),[1]=shapeList(Object) -> Boolean (obj->shape() in the list); MGuardMultipleShapes
 };
 // MNewLexicalEnvironmentObject: the LexicalScope* baked from the template object.
 extern uint32_t gWJLexScope;
+
+// OSR cheap-resume (GECKO_WJ_OSR): runtime sets these to re-enter a dispatch-loop fn
+// at a loop-head block with locals loaded from gWJResumeVals. Cleared by the prologue.
+extern uint32_t gWJOsrActive;
+extern uint32_t gWJOsrBlock;
 
 // Allocation-helper staging (non-GC ints; the shape is in the traced shape pool).
 extern uint32_t gWJNewShapeSlot;  // gWJShapePool index of the template shape
@@ -160,6 +174,12 @@ extern uint32_t gWJCurrentEnv;
 // crash). A storming function WITHOUT one (a stale monomorphic guard) still
 // recompiles to specialize (crypto). Single-threaded synchronous compile.
 extern bool gWJHadAlwaysBails;
+// Per-compile deopt-site category counts (for the count-trigger discriminator): how
+// many GuardShape-family (object/shape) deopt sites vs total. A SHAPE-dominated fn's
+// count-trigger respec recompile is unsound (re-bakes a stale GC const -> acorn bug);
+// a numeric/type-dominated fn's respec is the beneficial re-typing case (crypto/cdjs).
+extern uint32_t gWJEmitShapeDeopts;
+extern uint32_t gWJEmitTotalDeopts;
 extern bool gWJForceMega;  // next compile: megamorphic property reads (post-storm)
 extern bool gWJForceNumberArith;  // next compile: de-speculate Int32 arith/elem ICs (post-deopt)
 

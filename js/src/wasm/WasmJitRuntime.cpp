@@ -17,6 +17,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <unordered_map>
+#include <utility>
 #include <map>
 #include <vector>
 #include <string>
@@ -49,7 +50,10 @@
 #include "builtin/Array.h"    // js::SetLengthProperty, IsArrayFromJit
 #include "vm/RegExpObject.h"  // js::CloneRegExpObject (MRegExp)
 #include "builtin/String.h"   // js::StringFromCharCode
-#include "vm/StringType.h"    // js::ToString
+#include "builtin/Number.h"   // js::NumberParseInt
+#include "vm/StringType.h"    // js::ToString, js::EqualStrings
+#include "vm/ObjectOperations.h"  // js::HasProperty, js::HasOwnProperty
+#include "vm/Iteration.h"     // js::ValueToIterator
 
 #include "vm/NativeObject-inl.h"
 #include "vm/PlainObject-inl.h"  // createWithShape
@@ -124,9 +128,27 @@ uintptr_t gWJMarkBarrierAddr = 0;  // baked zone needs-marking-barrier flag addr
 uintptr_t gWJWholeCellLastAddr = 0;  // baked &storeBuffer.bufferWholeCell.last_
 uint64_t gWJGlobalLexEnvVal = 0;   // boxed global lexical env (for FunctionEnvironment)
 uint32_t gWJCurrentEnv = 0;        // current fn's runtime environment (raw ptr)
+// OSR cheap-resume (GECKO_WJ_OSR): when a deopt resumes at a loop-head, instead of
+// interpreting the rest of the fn in PBL, the runtime sets gWJOsrActive=1 +
+// gWJOsrBlock=<dispatch block index of the loop head> and re-calls the JIT'd fn; its
+// prologue, seeing gWJOsrActive, loads the frame locals from gWJResumeVals and starts
+// the dispatch loop at gWJOsrBlock (instead of block 0). Cleared by the prologue.
+uint32_t gWJOsrActive = 0;
+uint32_t gWJOsrBlock = 0;
+uint32_t gWJOsrDepth = 0;          // nested OSR re-entries on the stack (churn guard)
+uint64_t gWJOsrHits = 0;           // count of OSR re-entries (GECKO_WJ_OSRDBG)
+// Per-compile sink the backend appends OSR targets to: (resume pcOff -> dispatch
+// block index) for each OSR-able loop head. Cleared before each WJWarpCompile,
+// copied into the WJEntry on success.
+static std::vector<std::pair<uint32_t, uint32_t>> gWJPendingOsrTargets;
+extern "C" void WJAddOsrTarget(uint32_t pcOff, uint32_t blockIdx) {
+  gWJPendingOsrTargets.emplace_back(pcOff, blockIdx);
+}
 int gWJExecDepth = 0;              // >0 while emitted wasm-JIT code is on the stack
                                    // (drives inWasmJit()/inJit()/inIon() in the shell)
 bool gWJHadAlwaysBails = false;    // last compile emitted an alwaysBails deopt block
+uint32_t gWJEmitShapeDeopts = 0;   // last compile: # GuardShape-family deopt sites
+uint32_t gWJEmitTotalDeopts = 0;   // last compile: # total deopt sites
 bool gWJForceMega = false;         // megamorphic recompile (set per-compile by the valve)
 bool gWJForceNumberArith = false;  // de-speculate Int32 arith/elem (set per-compile by the valve)
 const char* gWJBailReason = "unknown";  // why the last WJEmitBody returned false
@@ -294,6 +316,7 @@ struct WJEntry {
   uint32_t deopts = 0;   // entries that deopted to PBL (resume)
   uint32_t recompiles = 0;  // deopt-storm-triggered recompiles so far
   bool hasAlwaysBails = false;  // compiled fn has a cold-IC alwaysBails deopt block
+  bool shapeDeoptDom = false;   // compiled fn's deopt sites are GuardShape-family dominated
   uint32_t nargs = 0;
   uint32_t nlocals = 0;
   uint32_t observes = 0;
@@ -314,6 +337,10 @@ struct WJEntry {
   // current JIT version (it's net-positive-ish; failing to PBL would cost the JIT<->PBL
   // boundary, measured WORSE than the residual deopts). Only >50% storms fail to PBL.
   bool recompileDone = false;
+  // OSR cheap-resume targets: (resume pcOff -> dispatch block index) for each
+  // OSR-able loop head, recorded at compile time (GECKO_WJ_OSR). A single-frame
+  // deopt landing at one of these pcs re-enters the JIT there instead of PBL.
+  std::vector<std::pair<uint32_t, uint32_t>> osrTargets;
 };
 
 // Per-script compile state. Keyed by JSScript*; entries persist for the process.
@@ -437,6 +464,24 @@ bool js::wasm::WasmJitObserveCall(JSScript* script) {
   }
   if (e.observes < e.nextTry && warm < kLoopWarm) return false;
 
+  // NOCOMPILE-lineno-range bisection (GECKO_WJ_NOCOMPILERANGE=lo,hi): refuse to
+  // compile any function whose script lineno is in [lo,hi] -> it runs in PURE PBL
+  // (never compiled, NO deopt-resume involved -- unlike FORCEDEOPT which routes
+  // through the resume path and can corrupt). Binary-search lo/hi to find which
+  // function's JIT compilation is the miscompile, cleanly.
+  static int nclo = -2, nchi = -2;
+  if (nclo == -2) {
+    nclo = nchi = -1;
+    if (const char* r = getenv("GECKO_WJ_NOCOMPILERANGE")) {
+      nclo = atoi(r); const char* c = strchr(r, ',');
+      nchi = c ? atoi(c + 1) : nclo;
+    }
+  }
+  if (nclo >= 0) {
+    uint32_t ln = unsigned(script->lineno());
+    if (ln >= uint32_t(nclo) && ln <= uint32_t(nchi)) { e.state = WJEntry::State::Failed; return false; }
+  }
+
   JSContext* cx = js::TlsContext.get();
   if (!cx) return false;
   uint32_t nargs = 0, nlocals = 0;
@@ -445,6 +490,7 @@ bool js::wasm::WasmJitObserveCall(JSScript* script) {
   // must take over the same slot). -1 (first compile) allocates a fresh one.
   int tblSlot = e.tblSlot;
   js::wasm::gWJForceMega = e.forceMega;  // megamorphic recompile (post-storm)
+  gWJPendingOsrTargets.clear();  // backend appends OSR targets during this compile
   int handle = js::wasm::WJWarpCompile(cx, script, &nargs, &nlocals, &tblSlot);
   js::wasm::gWJForceMega = false;
   if (e.forceMega && getenv("GECKO_WJ_MEGADBG")) {
@@ -499,6 +545,8 @@ bool js::wasm::WasmJitObserveCall(JSScript* script) {
   e.handle = handle;
   e.tblSlot = tblSlot;
   e.hasAlwaysBails = js::wasm::gWJHadAlwaysBails;
+  e.shapeDeoptDom = js::wasm::gWJEmitShapeDeopts > 0;  // ANY shape-family deopt site
+  e.osrTargets = gWJPendingOsrTargets;  // OSR loop-head pc->block map for this fn
   if (getenv("GECKO_WJ_COMPILECNT")) {
     static uint64_t cc = 0;
     fprintf(stderr, "[wj-compile] #%llu %s:%u hasAB=%d recomp=%u\n",
@@ -750,6 +798,27 @@ int js::wasm::WasmJitRunCall(JSScript* script, uint64_t thisBits,
         getenv("GECKO_WJ_RECOMPILE_RATE") ? atoi(getenv("GECKO_WJ_RECOMPILE_RATE")) : 25;
     bool countGate = countN > 0 && e.deopts >= uint32_t(countN) &&
                      uint64_t(e.deopts) * 100 >= uint64_t(e.jitRuns) * uint64_t(rateFloor);
+    // The count-trigger respec recompile of a SHAPE-deopt-dominated fn re-bakes a stale
+    // GC const (acorn tokenizer mis-parse, task #27). Block it for such fns -- the
+    // count-trigger is for numeric/type re-typing (crypto/cdjs), where the rate gate
+    // (forceMega) handles shape storms anyway. DEFAULT-ON; GECKO_WJ_NODEOPTCAT reverts.
+    // Validated: fixes acorn (real-app tokenizer mis-parse), suite perf-neutral.
+    static int deoptCat = getenv("GECKO_WJ_NODEOPTCAT") ? 0 : 1;
+    if (deoptCat && countGate && !rateGate && e.shapeDeoptDom) countGate = false;
+    // CRITICAL (2026-06-29): the function ALREADY RAN this call (flag==0 -> its
+    // result is in gWJScratch[kWJResultSlot], and any side effects -- incl. those
+    // completed by the deopt-RESUME -- are done). The valve paths below change e.state
+    // for the NEXT call, but must NOT make THIS call return 0: a 0 return tells the PBL
+    // caller "I didn't run it" so PBL RE-RUNS the function from pc=0, DUPLICATING the
+    // side effects (hash-map _createHashedEntry ran twice -> 2 orphan entries -> result
+    // 210 short; minimal repro /tmp/seh_repro.js SEH=50002). So return the completed
+    // result (return 1) even when the valve fires. GECKO_WJ_NOVALVERESULT reverts.
+    auto valveReturn = [&]() -> int {
+      static int noVR = getenv("GECKO_WJ_NOVALVERESULT") ? 1 : 0;
+      if (noVR) return 0;
+      *retBits = gWJScratch[js::wasm::kWJResultSlot];
+      return 1;
+    };
     if (e.deopts >= uint32_t(valveN) && (rateGate || countGate) &&
         !noDeoptValve && !e.recompileDone) {
       // A storming fn with an alwaysBails block deopts from that COLD-IC block;
@@ -760,15 +829,16 @@ int js::wasm::WasmJitRunCall(JSScript* script, uint64_t thisBits,
       // to specialize it polymorphic (crypto 3.1x). (Cold branches that NEVER fire,
       // e.g. navier lin_solve's a===0, never reach here: deopts stays 0.)
       if (getenv("GECKO_WJ_VALVEDBG")) {
-        fprintf(stderr, "[wj-valve] %s:%u hasAB=%d deopts=%u jitRuns=%u recomp=%u len=%u -> %s\n",
+        fprintf(stderr, "[wj-valve] %s:%u hasAB=%d shapeDom=%d rateG=%d cntG=%d deopts=%u jitRuns=%u recomp=%u len=%u -> %s\n",
                 script->filename() ? script->filename() : "?",
-                unsigned(script->lineno()), e.hasAlwaysBails, e.deopts, e.jitRuns,
+                unsigned(script->lineno()), e.hasAlwaysBails, e.shapeDeoptDom,
+                rateGate, countGate, e.deopts, e.jitRuns,
                 e.recompiles, unsigned(script->length()),
                 e.hasAlwaysBails ? "FAIL" : "recompile");
       }
       if (e.hasAlwaysBails) {
         e.state = WJEntry::State::Failed;
-        return 0;
+        return valveReturn();
       }
       // A TINY function that storms via polymorphic guards (hasAB=0): mega-recompile
       // makes it deopt-free but adds per-access IC overhead, and for a tiny body the
@@ -784,7 +854,7 @@ int js::wasm::WasmJitRunCall(JSScript* script, uint64_t thisBits,
         if (tinyBail > 0 && e.recompiles == 0 &&
             script->length() < uint32_t(tinyBail)) {
           e.state = WJEntry::State::Failed;
-          return 0;
+          return valveReturn();
         }
       }
       // Mega-recompile budget. The FIRST storm triggers a megamorphic recompile
@@ -818,7 +888,7 @@ int js::wasm::WasmJitRunCall(JSScript* script, uint64_t thisBits,
         e.jitRuns = 0;
         e.observes = 0;
         e.nextTry = 0;
-        return 0;
+        return valveReturn();
       }
       // Recompile didn't heal. A >50% storm is clearly net-negative -> fall to PBL. A
       // moderate-rate (count-triggered) storm STAYS in JIT (recompileDone stops further
@@ -829,7 +899,7 @@ int js::wasm::WasmJitRunCall(JSScript* script, uint64_t thisBits,
       } else {
         e.recompileDone = true;
       }
-      return 0;
+      return valveReturn();
     }
   } else {
     e.jitRuns++;
@@ -1110,10 +1180,53 @@ static bool WJIsForwardingWrapper(JSContext* cx, JSScript* s) {
 
 // wasm -> C++ trampoline imported by JIT'd modules ("m"."help"). Returns 0.0 on
 // success (result, if any, in gWJScratch[kWJResultSlot]) or 1.0 if it threw.
+// ---- JIT execution tracer (a real debugger, not printfs): WJH_TRACE(value) appends
+// to a ring buffer; dumped (oldest->newest) at process exit. The backend emits these
+// at block entries of GECKO_WJ_TRACEFN=<lineno>, so we get the exact block-execution
+// PATH of a JIT'd function with the bug live -- non-perturbing of JS warmup (wasm-level).
+static const uint32_t kWJTraceN = 1u << 18;
+static uint32_t* gWJTraceBuf = nullptr;
+static uint64_t gWJTraceCount = 0;
+static void WJDumpTraceAtExit() {
+  if (!gWJTraceBuf || !gWJTraceCount) return;
+  uint64_t n = gWJTraceCount < kWJTraceN ? gWJTraceCount : kWJTraceN;
+  uint64_t start = gWJTraceCount < kWJTraceN ? 0 : (gWJTraceCount & (kWJTraceN - 1));
+  fprintf(stderr, "[wj-trace] %llu entries (showing last %llu, oldest->newest):\n",
+          (unsigned long long)gWJTraceCount, (unsigned long long)n);
+  for (uint64_t i = 0; i < n; i++) {
+    if (i % 24 == 0) fprintf(stderr, "[wj-trace] ");
+    fprintf(stderr, "%u ", gWJTraceBuf[(start + i) & (kWJTraceN - 1)]);
+    if (i % 24 == 23) fprintf(stderr, "\n");
+  }
+  fprintf(stderr, "\n");
+}
+
+// JS-callable (shell builtin `wjTraceDump()`): dump the JIT execution-trace ring now
+// (e.g. from a bench's catch block, right at the failure).
+extern "C" EMSCRIPTEN_KEEPALIVE void WJTraceDumpNow() {
+  WJDumpTraceAtExit();
+  // GECKO_WJ_DUMPADDR=a,b,...: dump the i64 at each (const-pool slot) address, decoded.
+  if (const char* da = getenv("GECKO_WJ_DUMPADDR")) {
+    char buf[256]; snprintf(buf, sizeof buf, "%s", da);
+    for (char* tok = strtok(buf, ","); tok; tok = strtok(nullptr, ",")) {
+      uintptr_t a = strtoull(tok, nullptr, 0);
+      uint64_t v = *reinterpret_cast<uint64_t*>(a);
+      uint32_t tag = uint32_t(v >> 32);
+      fprintf(stderr, "[wj-dumpaddr] @%lu = %016llx tag=%08x ptr=%08x\n",
+              (unsigned long)a, (unsigned long long)v, tag, uint32_t(v));
+    }
+  }
+}
+
 extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
+  int kind = int(kindF);
+  if (kind == 40) {  // WJH_TRACE: record siteF (a block pc / value) in the ring buffer
+    if (!gWJTraceBuf) { gWJTraceBuf = new uint32_t[kWJTraceN](); atexit(WJDumpTraceAtExit); }
+    gWJTraceBuf[gWJTraceCount++ & (kWJTraceN - 1)] = uint32_t(int64_t(siteF));
+    return 0.0;
+  }
   JSContext* cx = js::TlsContext.get();
   if (!cx) return 1.0;
-  int kind = int(kindF);
 
   static int helpHist = getenv("GECKO_WJ_HELPHIST") ? 1 : 0;
   if (helpHist) {
@@ -1209,6 +1322,82 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
       gWJResumeActive = true;
     }
     auto resumeGuard = mozilla::MakeScopeExit([] { gWJResumeActive = false; });
+    // OSR cheap-resume (GECKO_WJ_OSR): a single-frame deopt landing AT a compiled
+    // loop head re-enters the JIT there instead of interpreting the rest of the fn
+    // in PBL. The OSR prologue (WasmJitBackend) restores this/args/locals from the
+    // gWJResumeVals spill (frame 0, off 0 -- the only OSR-able layout) and jumps the
+    // dispatch loop to the loop-head block. Churn guard: gWJOsrDepth bounds nested
+    // re-entries so a head that immediately re-deopts falls to PBL instead of looping.
+    {
+      static int osrEnabled = getenv("GECKO_WJ_OSR") ? 1 : 0;
+      static uint32_t osrMaxDepth =
+          getenv("GECKO_WJ_OSRDEPTH") ? uint32_t(atoi(getenv("GECKO_WJ_OSRDEPTH"))) : 1;
+      static int osrDbg = getenv("GECKO_WJ_OSRDBG") ? 1 : 0;
+      if (osrDbg && nframes == 1) {
+        static uint64_t cc = 0;
+        if (++cc <= 30) {
+          JSScript* ds =
+              reinterpret_cast<JSScript*>(uintptr_t(gWJResumeScriptPtr[0]));
+          if (ds) {
+            WJEntry& de = EntryFor(ds);
+            fprintf(stderr,
+                    "[wj-osr-chk] %s:%u pc=%u off0=%u depth=%u state=%d dir=%d "
+                    "ntgt=%zu",
+                    ds->filename() ? ds->filename() : "?", unsigned(ds->lineno()),
+                    gWJResumePc[0], gWJResumeValsOff[0], gWJOsrDepth,
+                    int(de.state), de.directIdx, de.osrTargets.size());
+            for (size_t i = 0; i < de.osrTargets.size() && i < 6; i++)
+              fprintf(stderr, " t%zu=%u", i, de.osrTargets[i].first);
+            fprintf(stderr, "\n");
+          }
+        }
+      }
+      if (osrEnabled && nframes == 1 && gWJResumeValsOff[0] == 0 &&
+          gWJOsrDepth < osrMaxDepth) {
+        JSScript* dscript =
+            reinterpret_cast<JSScript*>(uintptr_t(gWJResumeScriptPtr[0]));
+        if (dscript) {
+          WJEntry& de = EntryFor(dscript);
+          if (de.state == WJEntry::State::Compiled && de.directIdx >= 0 &&
+              !de.osrTargets.empty()) {
+            uint32_t pc = gWJResumePc[0];
+            int blk = -1;
+            for (auto& t : de.osrTargets)
+              if (t.first == pc) { blk = int(t.second); break; }
+            if (blk >= 0) {
+              JSObject* envObj =
+                  reinterpret_cast<JSObject*>(uintptr_t(gWJResumeEnvPtr[0]));
+              if (!envObj && dscript->function())
+                envObj = dscript->function()->environment();
+              gWJCurrentEnv = uint32_t(uintptr_t(static_cast<void*>(envObj)));
+              gWJOsrActive = 1;
+              gWJOsrBlock = uint32_t(blk);
+              double ptr = double(uintptr_t(static_cast<void*>(gWJScratch)));
+              typedef double (*WJTrampFn)(double);
+              WJTrampFn fp = reinterpret_cast<WJTrampFn>(uintptr_t(de.directIdx));
+              gWJOsrDepth++;
+              gWJExecDepth++;
+              if (osrDbg) gWJOsrHits++;
+              double flag = fp(ptr);
+              gWJExecDepth--;
+              gWJOsrDepth--;
+              gWJOsrActive = 0;  // belt-and-suspenders (prologue clears it too)
+              if (osrDbg) {
+                static uint64_t oc = 0;
+                if ((++oc % 50000) == 0)
+                  fprintf(stderr, "[wj-osr] hits=%llu (last %s:%u pc=%u blk=%d)\n",
+                          (unsigned long long)gWJOsrHits,
+                          dscript->filename() ? dscript->filename() : "?",
+                          unsigned(dscript->lineno()), pc, blk);
+              }
+              // fp wrote the fn's return into gWJScratch[kWJResultSlot] on normal
+              // completion (flag 0.0) or signalled a pending exception (1.0).
+              return flag != 0.0 ? 1.0 : 0.0;
+            }
+          }
+        }
+      }
+    }
     static int rdbg =
         (getenv("GECKO_WJWARP_DUMP") || getenv("GECKO_WJ_RESUMEDBG")) ? 1 : 0;
     static int rn = 0;
@@ -1282,6 +1471,31 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
         }
       }
       uint64_t thisBits = vals[0].asRawBits();
+      // RESUMEPROBE=<lineno>: at this fn's deopt-resume, log this.* (by property NAME,
+      // engine-level/non-perturbing) BEFORE PBL runs the rest -> spot the state the JIT
+      // prologue left wrong. Compare the sequence across invocations to find the anomaly.
+      static int resumeProbe = getenv("GECKO_WJ_RESUMEPROBE") ? atoi(getenv("GECKO_WJ_RESUMEPROBE")) : -1;
+      if (resumeProbe > 0 && uint32_t(script->lineno()) == uint32_t(resumeProbe)) {
+        JS::Value tv = JS::Value::fromRawBits(thisBits);
+        static uint64_t pc = 0;
+        if (tv.isObject()) {
+          JS::RootedObject to(cx, &tv.toObject());
+          JS::RootedValue p(cx), s(cx), e(cx), lte(cx), ty(cx);
+          JS_GetProperty(cx, to, "pos", &p); JS_GetProperty(cx, to, "value", &s);
+          JS_GetProperty(cx, to, "exprAllowed", &e); JS_GetProperty(cx, to, "type", &ty);
+          const char* tl = "?"; void* typtr = nullptr; int binop = -999;
+          if (ty.isObject()) { JS::RootedObject tyo(cx, &ty.toObject()); typtr = (void*)&ty.toObject(); JS::RootedValue lab(cx), bo(cx);
+            if (JS_GetProperty(cx, tyo, "label", &lab) && lab.isString()) {
+              JS::RootedString ls(cx, lab.toString());
+              JS::UniqueChars c = JS_EncodeStringToUTF8(cx, ls); if (c) { static char buf[32]; snprintf(buf,sizeof buf,"%s",c.get()); tl=buf; } }
+            if (JS_GetProperty(cx, tyo, "binop", &bo)) binop = bo.isInt32()?bo.toInt32():(bo.isNullOrUndefined()?-1:-2); }
+          int posv = p.isInt32()?p.toInt32():-1;
+          if (posv >= 9685 && posv <= 9720)  // failing region only
+            fprintf(stderr, "[wj-resumeprobe] :%u pos=%d type=%s typtr=%p binop=%d exprAllowed=%d val=%s\n",
+                  unsigned(script->lineno()), posv, tl, typtr, binop,
+                  e.isBoolean()?e.toBoolean():-1, s.isString()?"str":(s.isUndefined()?"undef":"?"));
+        }
+      }
       const JS::Value* args = vals + 1;
       const uint64_t* locals =
           reinterpret_cast<const uint64_t*>(vals + 1 + nargs);
@@ -1316,8 +1530,17 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
           if (sv.isInt32()) fprintf(stderr, " S%u=i%d", i, sv.toInt32());
           else if (sv.isDouble()) fprintf(stderr, " S%u=d%g", i, sv.toDouble());
           else if (sv.isBoolean()) fprintf(stderr, " S%u=b%d", i, sv.toBoolean());
+          else if (sv.isString()) {
+            JSString* s = sv.toString();
+            size_t len = s->length();
+            char16_t c0 = 0;
+            JS::RootedString rs(cx, s);
+            if (len >= 1) JS_GetStringCharAt(cx, rs, 0, &c0);
+            fprintf(stderr, " S%u=str[len=%zu c0=%d '%c']", i, len, int(c0),
+                    (c0 >= 32 && c0 < 127) ? char(c0) : '?');
+          }
           else fprintf(stderr, " S%u=%s", i,
-                       sv.isUndefined() ? "undef" : sv.isObject()
+                       sv.isUndefined() ? "undef" : sv.isNull() ? "null" : sv.isObject()
                        ? (sv.toObject().is<JSFunction>() ? "fn" : "obj") : "prim");
         }
         // montReduce x_array sanity: S0=x_array(obj), S1=write index. Flag if the
@@ -1966,6 +2189,107 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
     return 0.0;
   }
 
+  if (kind == js::wasm::WJH_HASPROP) {
+    // MMegamorphicHasProp: scratch[0]=obj(Object), scratch[1]=idVal(Value).
+    // site != 0 -> hasOwn (own property only); site == 0 -> `in` (proto walk).
+    JS::RootedObject obj(cx, &JS::Value::fromRawBits(gWJScratch[0]).toObject());
+    RootedValue idVal(cx, JS::Value::fromRawBits(gWJScratch[1]));
+    RootedId id(cx);
+    if (!JS_ValueToId(cx, idVal, &id)) return 1.0;
+    bool out = false;
+    if (int(siteF)) {
+      if (!js::HasOwnProperty(cx, obj, id, &out)) return 1.0;
+    } else {
+      if (!js::HasProperty(cx, obj, id, &out)) return 1.0;
+    }
+    gWJScratch[js::wasm::kWJResultSlot] = JS::BooleanValue(out).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_PARSEINT) {
+    // MNumberParseInt: scratch[0]=string(Value), scratch[1]=radix(Int32 Value).
+    RootedString str(cx, JS::Value::fromRawBits(gWJScratch[0]).toString());
+    int32_t radix = JS::Value::fromRawBits(gWJScratch[1]).toInt32();
+    RootedValue result(cx);
+    if (!js::NumberParseInt(cx, str, radix, &result)) return 1.0;
+    gWJScratch[js::wasm::kWJResultSlot] = result.asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_OBJTOITER) {
+    // MObjectToIterator: scratch[0]=obj(Object) -> for-of iterator object.
+    RootedValue val(cx, JS::Value::fromRawBits(gWJScratch[0]));
+    JSObject* iter = js::ValueToIterator(cx, val);
+    if (!iter) return 1.0;
+    gWJScratch[js::wasm::kWJResultSlot] = JS::ObjectValue(*iter).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_ISCALLABLE) {
+    // MIsCallable: scratch[0]=value -> Boolean.
+    JS::Value v = JS::Value::fromRawBits(gWJScratch[0]);
+    bool out = v.isObject() && v.toObject().isCallable();
+    gWJScratch[js::wasm::kWJResultSlot] = JS::BooleanValue(out).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_STRTOINDEX) {
+    // MGuardStringToIndex: scratch[0]=string -> Int32 array index, or -1 if the
+    // string is not a canonical array index. Matches the Ion guard semantics.
+    JSString* str = JS::Value::fromRawBits(gWJScratch[0]).toString();
+    int32_t result = js::jit::GetIndexFromString(str);
+    gWJScratch[js::wasm::kWJResultSlot] = JS::Int32Value(result).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_STREQATOM) {
+    // MGuardSpecificAtom: scratch[0]=str, scratch[1]=atom(StringValue).
+    JSString* str = JS::Value::fromRawBits(gWJScratch[0]).toString();
+    JSString* atom = JS::Value::fromRawBits(gWJScratch[1]).toString();
+    bool eq = (str == atom);
+    if (!eq && !js::EqualStrings(cx, str, atom, &eq)) return 1.0;
+    gWJScratch[js::wasm::kWJResultSlot] = JS::BooleanValue(eq).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_HOMEPROTO) {
+    // MHomeObjectSuperBase: scratch[0]=home object -> its [[Prototype]].
+    JS::RootedObject obj(cx, &JS::Value::fromRawBits(gWJScratch[0]).toObject());
+    JS::RootedObject proto(cx);
+    if (!js::GetPrototype(cx, obj, &proto)) return 1.0;
+    gWJScratch[js::wasm::kWJResultSlot] =
+        proto ? JS::ObjectValue(*proto).asRawBits() : JS::NullValue().asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_SETARRLEN) {
+    // MCallSetArrayLength: arr.length = rhs. obj is guaranteed an ArrayObject.
+    JS::RootedObject obj(cx, &JS::Value::fromRawBits(gWJScratch[0]).toObject());
+    RootedValue val(cx, JS::Value::fromRawBits(gWJScratch[1]));
+    if (!js::jit::SetArrayLength(cx, obj, val, int(siteF) != 0)) return 1.0;
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_INSHAPELIST) {
+    // MGuardMultipleShapes: is obj->shape() one of the shapes in shapeList? The
+    // shapes are stored as PrivateGCThing values in shapeList's dense elements.
+    JSObject* obj = &JS::Value::fromRawBits(gWJScratch[0]).toObject();
+    js::NativeObject* list =
+        &JS::Value::fromRawBits(gWJScratch[1]).toObject().as<js::NativeObject>();
+    js::Shape* objShape = obj->shape();
+    bool found = false;
+    uint32_t len = list->getDenseInitializedLength();
+    for (uint32_t i = 0; i < len; i++) {
+      JS::Value v = list->getDenseElement(i);
+      if (v.toGCThing() == reinterpret_cast<js::gc::Cell*>(objShape)) {
+        found = true;
+        break;
+      }
+    }
+    gWJScratch[js::wasm::kWJResultSlot] = JS::BooleanValue(found).asRawBits();
+    return 0.0;
+  }
+
   if (kind == js::wasm::WJH_CLOSEITER) {
     // MCloseIterCache: for-of early-exit cleanup -- call iter's return() if present.
     // site = CompletionKind (0 Normal / 1 Throw / 2 Return).
@@ -2501,6 +2825,12 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
   }
 
   if (kind == js::wasm::WJH_CONSTRUCT) {
+    static int ctorCount = getenv("GECKO_WJ_CTORCOUNT") ? 1 : 0;
+    if (ctorCount) {
+      static uint64_t n = 0;
+      n++;
+      if (n > 89999) fprintf(stderr, "[ctorcount] WJH_CONSTRUCT #%llu\n", (unsigned long long)n);
+    }
     RootedValue fval(
         cx, JS::Value::fromRawBits(gWJScratch[js::wasm::kWJCalleeSlot]));
     RootedValue thisv(cx,

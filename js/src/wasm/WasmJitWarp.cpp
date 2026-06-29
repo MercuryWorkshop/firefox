@@ -225,8 +225,19 @@ static int AssembleAndInstall(MIRGenerator& mirGen, MIRGraph& graph,
   e.patchVarU32(trampOff, uint32_t(e.currentOffset() - trampStart));
   e.finishSection(s);
 
-  if (getenv("GECKO_WJWARP_DUMP") || getenv("GECKO_WJ_WASMDUMP") ||
-      (js::wasm::gWJForceMega && getenv("GECKO_WJ_MEGADUMP"))) {
+  // jitdis debugger: GECKO_WJ_WASMDUMP dumps emitted wasm to /tmp/wbjit_<lineno>.wasm
+  // (disassemble with `wasm-dis`). A numeric value >1 dumps ONLY that lineno (targeted);
+  // any other set value dumps all compiled functions.
+  bool wasmDump = getenv("GECKO_WJWARP_DUMP") || getenv("GECKO_WJ_WASMDUMP") ||
+                  (js::wasm::gWJForceMega && getenv("GECKO_WJ_MEGADUMP"));
+  if (wasmDump) {
+    if (const char* wd = getenv("GECKO_WJ_WASMDUMP")) {
+      int want = atoi(wd);
+      JSScript* ds = mirGen.outerInfo().script();
+      if (want > 1 && ds && int(ds->lineno()) != want) wasmDump = false;
+    }
+  }
+  if (wasmDump) {
     JSScript* dscript = mirGen.outerInfo().script();
     char path[128];
     // Megamorphic recompiles dump to a SEPARATE file so they're not overwritten
@@ -374,6 +385,13 @@ int WJWarpCompile(JSContext* cx, JSScript* script, uint32_t* nargsOut,
       jit::JitOptions.inliningEntryThreshold = 2;
       jit::JitOptions.smallFunctionMaxBytecodeLength = 2000;
     }
+    // GECKO_WJ_INLINEMONO: force BODY-inlining of monomorphic callees (override
+    // ShouldUseMonomorphicInlining, which otherwise picks the no-body-splice "Mono"
+    // strategy for already-monomorphic targets -- e.g. crypto-sha1's hot pure-int32
+    // leaves safe_add/rol/sha1_ft/kt all DECIDE=Mono, so their CALL overhead stays in
+    // the inner loop). Mono skips specialization-wins but ALSO skips removing the call.
+    if (getenv("GECKO_WJ_INLINEMONO"))
+      jit::JitOptions.monomorphicInlining = jit::UseMonomorphicInlining::Never;
     jit::ICScript* ic = scriptRoot->jitScript()->icScript();
     jit::TrialInliner inliner(cx, scriptRoot, ic);
     if (!inliner.tryInlining()) {

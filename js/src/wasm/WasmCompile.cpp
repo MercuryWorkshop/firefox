@@ -231,7 +231,7 @@ FeatureArgs FeatureArgs::build(JSContext* cx, const FeatureOptions& options) {
   features.sharedMemory =
       wasm::ThreadsAvailable(cx) ? Shareable::True : Shareable::False;
 
-  features.simd = jit::JitSupportsWasmSimd();
+  features.simd = wasm::SimdAvailable(cx);
   features.isBuiltinModule = options.isBuiltinModule;
   if (features.isBuiltinModule) {
     // Builtin modules can use stack switching if it's available. JS-PI needs

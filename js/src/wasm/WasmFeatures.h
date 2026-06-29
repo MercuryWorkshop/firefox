@@ -33,11 +33,15 @@ bool HasPlatformSupport();
 bool HasSupport(JSContext* cx);
 
 #if defined(__EMSCRIPTEN__)
-// wasm32-emscripten host-passthrough: there is no in-process wasm compiler
-// (the JIT is disabled), so guest WebAssembly is routed to the host browser's
-// WebAssembly engine. When true, the WebAssembly object is exposed and its
-// operations are bridged to the host instead of compiled in-process.
+// wasm32-emscripten legacy host-passthrough: there is no in-process wasm
+// compiler (the JIT is disabled), so guest WebAssembly is routed to the host
+// browser's WebAssembly engine. OPT-IN via the GECKO_WASM_PASSTHROUGH env var
+// (the in-process interpreter is the default). Checked once and cached.
 bool UseHostPassthrough();
+
+// The in-process bytecode interpreter (WasmInterp.h) is the DEFAULT for guest
+// WebAssembly; it runs unless GECKO_WASM_PASSTHROUGH selects the host passthrough.
+bool UseInterp();
 #endif
 
 // Predicates for compiler availability.

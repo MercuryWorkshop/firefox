@@ -114,6 +114,14 @@
 #include "vm/NativeObject-inl.h"
 #include "wasm/WasmInstance-inl.h"
 
+#if defined(__EMSCRIPTEN__)
+#  include "builtin/AtomicsObject.h"  // atomics_wait_impl/notify_impl (interp futex -> JS Atomics waiter list)
+#  include "js/SharedArrayBuffer.h"  // JS::GetSharedArrayBufferData (interp shared memory)
+#  include "js/StructuredClone.h"    // JS_WriteBytes/JS_ReadBytes (interp cross-thread clone)
+#  include "js/WasmInterpClone.h"    // InterpCloneWrite/Read decls (must match defs below)
+#  include "wasm/WasmInterp.h"  // in-process interpreter (GECKO_WASM_INTERP)
+#endif
+
 /*
  * [SMDOC] WebAssembly code rules (evolving)
  *
@@ -1981,6 +1989,14 @@ int wasmhost_guest_mem_objid();
 int wasmhost_guest_mem_shared();
 int wasmhost_jit_table();
 int wasmhost_jit_table_set(int handle, int idx);
+int wasmhost_export_register_obj(int handle, int index);
+int wasmhost_table_length(int objId);
+int wasmhost_table_grow(int objId, int delta);
+double wasmhost_table_call(int objId, int idx, const double* args, int argc);
+int wasmhost_table_set_null(int objId, int idx);
+int wasmhost_table_set_hostfn(int objId, int idx, int srcHandle, int srcIdx);
+double wasmhost_global_get(int objId);
+int wasmhost_global_set(int objId, double val);
 }
 
 // ===========================================================================
@@ -2003,6 +2019,26 @@ static JSObject* HostBuildInstanceObject(JSContext* cx, int handle);
 static int HostObjId(JSContext* cx, HandleObject obj);
 static JSObject* HostMakeMemoryWrapper(JSContext* cx, int objId, bool shared);
 static JSObject* HostMakeObjIdWrapper(JSContext* cx, int objId);
+static JSObject* HostMakeTableWrapper(JSContext* cx, int objId);
+static JSObject* HostMakeGlobalWrapper(JSContext* cx, int objId);
+
+// Extract a BufferSource arg and hand its bytes to the in-process interpreter's
+// compiler. Returns an interp module object or nullptr (+ reports).
+static JSObject* InterpCompileArg(JSContext* cx, HandleObject bytesObj) {
+  JSObject* unwrapped = CheckedUnwrapStatic(bytesObj);
+  SharedMem<uint8_t*> dataPointer;
+  size_t byteLength;
+  bool isShared;
+  if (!unwrapped ||
+      !IsBufferSource(cx, unwrapped, /*allowShared*/ true,
+                      /*allowResizable*/ true, &dataPointer, &byteLength,
+                      &isShared)) {
+    JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr,
+                             JSMSG_WASM_BAD_BUF_MOD_ARG);
+    return nullptr;
+  }
+  return wasm::interp::CompileBytes(cx, dataPointer.unwrap(), byteLength);
+}
 #endif
 
 /* static */
@@ -2016,6 +2052,23 @@ bool WasmModuleObject::construct(JSContext* cx, unsigned argc, Value* vp) {
   }
 
 #if defined(__EMSCRIPTEN__)
+  if (wasm::UseInterp()) {
+    if (!callArgs.requireAtLeast(cx, "WebAssembly.Module", 1)) {
+      return false;
+    }
+    if (!callArgs.get(0).isObject()) {
+      JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr,
+                               JSMSG_WASM_BAD_BUF_MOD_ARG);
+      return false;
+    }
+    RootedObject bytesObj(cx, &callArgs.get(0).toObject());
+    JSObject* moduleObj = InterpCompileArg(cx, bytesObj);
+    if (!moduleObj) {
+      return false;
+    }
+    callArgs.rval().setObject(*moduleObj);
+    return true;
+  }
   if (wasm::UseHostPassthrough()) {
     if (!callArgs.requireAtLeast(cx, "WebAssembly.Module", 1)) {
       return false;
@@ -2556,6 +2609,29 @@ bool WasmInstanceObject::construct(JSContext* cx, unsigned argc, Value* vp) {
   }
 
 #if defined(__EMSCRIPTEN__)
+  if (wasm::UseInterp()) {
+    if (!args.requireAtLeast(cx, "WebAssembly.Instance", 1)) {
+      return false;
+    }
+    if (!args.get(0).isObject() ||
+        !wasm::interp::IsModuleObject(&args.get(0).toObject())) {
+      JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr,
+                               JSMSG_WASM_BAD_MOD_ARG);
+      return false;
+    }
+    RootedObject modObj(cx, &args.get(0).toObject());
+    RootedObject importObj(cx);
+    if (!GetImportArg(cx, args.get(1), &importObj)) {
+      return false;
+    }
+    JSObject* instanceObj =
+        wasm::interp::InstantiateModuleObject(cx, modObj, importObj);
+    if (!instanceObj) {
+      return false;
+    }
+    args.rval().setObject(*instanceObj);
+    return true;
+  }
   if (wasm::UseHostPassthrough()) {
     if (!args.requireAtLeast(cx, "WebAssembly.Instance", 1)) {
       return false;
@@ -2800,6 +2876,39 @@ bool WasmMemoryObject::construct(JSContext* cx, unsigned argc, Value* vp) {
   }
 
 #if defined(__EMSCRIPTEN__)
+  if (wasm::UseInterp()) {
+    if (!args.requireAtLeast(cx, "WebAssembly.Memory", 1) ||
+        !args.get(0).isObject()) {
+      JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr,
+                               JSMSG_WASM_BAD_DESC_ARG, "memory");
+      return false;
+    }
+    RootedObject desc(cx, &args[0].toObject());
+    RootedValue v(cx);
+    int32_t initial = 0;
+    int32_t maximum = -1;
+    if (!JS_GetProperty(cx, desc, "initial", &v) || !ToInt32(cx, v, &initial)) {
+      return false;
+    }
+    if (!JS_GetProperty(cx, desc, "maximum", &v)) {
+      return false;
+    }
+    if (!v.isUndefined() && !ToInt32(cx, v, &maximum)) {
+      return false;
+    }
+    if (!JS_GetProperty(cx, desc, "shared", &v)) {
+      return false;
+    }
+    bool shared = ToBoolean(v);
+    JSObject* memObj = wasm::interp::NewMemoryObjectJS(
+        cx, uint32_t(initial), maximum < 0 ? UINT32_MAX : uint32_t(maximum),
+        shared);
+    if (!memObj) {
+      return false;
+    }
+    args.rval().setObject(*memObj);
+    return true;
+  }
   if (wasm::UseHostPassthrough()) {
     if (!args.requireAtLeast(cx, "WebAssembly.Memory", 1) ||
         !args.get(0).isObject()) {
@@ -3531,6 +3640,42 @@ bool WasmTableObject::construct(JSContext* cx, unsigned argc, Value* vp) {
   }
 
 #if defined(__EMSCRIPTEN__)
+  if (wasm::UseInterp()) {
+    if (!args.requireAtLeast(cx, "WebAssembly.Table", 1) ||
+        !args.get(0).isObject()) {
+      JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr,
+                               JSMSG_WASM_BAD_DESC_ARG, "table");
+      return false;
+    }
+    RootedObject desc(cx, &args[0].toObject());
+    RootedValue v(cx);
+    int32_t initial = 0;
+    int32_t maximum = -1;
+    if (!JS_GetProperty(cx, desc, "initial", &v) || !ToInt32(cx, v, &initial)) {
+      return false;
+    }
+    if (!JS_GetProperty(cx, desc, "maximum", &v)) {
+      return false;
+    }
+    if (!v.isUndefined() && !ToInt32(cx, v, &maximum)) {
+      return false;
+    }
+    bool externref = false;
+    if (JS_GetProperty(cx, desc, "element", &v) && v.isString()) {
+      bool m = false;
+      if (JS_StringEqualsLiteral(cx, v.toString(), "externref", &m)) {
+        externref = m;
+      }
+    }
+    JSObject* tableObj = wasm::interp::NewTableObjectJS(
+        cx, externref ? wasm::interp::VT::ExternRef : wasm::interp::VT::FuncRef,
+        uint32_t(initial), maximum < 0 ? UINT32_MAX : uint32_t(maximum));
+    if (!tableObj) {
+      return false;
+    }
+    args.rval().setObject(*tableObj);
+    return true;
+  }
   if (wasm::UseHostPassthrough()) {
     if (!args.requireAtLeast(cx, "WebAssembly.Table", 1) ||
         !args.get(0).isObject()) {
@@ -3993,6 +4138,77 @@ bool WasmGlobalObject::construct(JSContext* cx, unsigned argc, Value* vp) {
   }
 
 #if defined(__EMSCRIPTEN__)
+  if (wasm::UseInterp()) {
+    if (!args.requireAtLeast(cx, "WebAssembly.Global", 1) ||
+        !args.get(0).isObject()) {
+      JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr,
+                               JSMSG_WASM_BAD_DESC_ARG, "global");
+      return false;
+    }
+    RootedObject desc(cx, &args[0].toObject());
+    RootedValue v(cx);
+    wasm::interp::VT vt = wasm::interp::VT::F64;
+    if (JS_GetProperty(cx, desc, "value", &v) && v.isString()) {
+      RootedString s(cx, v.toString());
+      bool m = false;
+      if (JS_StringEqualsLiteral(cx, s, "i32", &m) && m) {
+        vt = wasm::interp::VT::I32;
+      } else if (JS_StringEqualsLiteral(cx, s, "i64", &m) && m) {
+        vt = wasm::interp::VT::I64;
+      } else if (JS_StringEqualsLiteral(cx, s, "f32", &m) && m) {
+        vt = wasm::interp::VT::F32;
+      } else if (JS_StringEqualsLiteral(cx, s, "externref", &m) && m) {
+        vt = wasm::interp::VT::ExternRef;
+      } else if (JS_StringEqualsLiteral(cx, s, "funcref", &m) && m) {
+        vt = wasm::interp::VT::FuncRef;
+      }
+    }
+    if (!JS_GetProperty(cx, desc, "mutable", &v)) {
+      return false;
+    }
+    bool mut = ToBoolean(v);
+    wasm::interp::Cell cell;
+    cell.u64 = 0;
+    RootedValue initRef(cx, args.get(1));
+    RootedValue initArg(cx, args.get(1));
+    switch (vt) {
+      case wasm::interp::VT::I32: {
+        int32_t i = 0;
+        if (args.length() >= 2 && !ToInt32(cx, initArg, &i)) return false;
+        cell.i32 = i;
+        break;
+      }
+      case wasm::interp::VT::I64: {
+        if (args.length() >= 2) {
+          JS::BigInt* bi = js::ToBigInt(cx, initArg);
+          if (!bi) return false;
+          cell.i64 = JS::BigInt::toInt64(bi);
+        }
+        break;
+      }
+      case wasm::interp::VT::F32: {
+        double d = 0;
+        if (args.length() >= 2 && !ToNumber(cx, initArg, &d)) return false;
+        cell.f32 = float(d);
+        break;
+      }
+      case wasm::interp::VT::F64: {
+        double d = 0;
+        if (args.length() >= 2 && !ToNumber(cx, initArg, &d)) return false;
+        cell.f64 = d;
+        break;
+      }
+      default:
+        break;  // ref types use initRef
+    }
+    JSObject* gObj =
+        wasm::interp::NewGlobalObjectJS(cx, vt, mut, &cell, initRef);
+    if (!gObj) {
+      return false;
+    }
+    args.rval().setObject(*gObj);
+    return true;
+  }
   if (wasm::UseHostPassthrough()) {
     if (!args.requireAtLeast(cx, "WebAssembly.Global", 1) ||
         !args.get(0).isObject()) {
@@ -5321,6 +5537,28 @@ static bool WebAssembly_compile(JSContext* cx, unsigned argc, Value* vp) {
   CallArgs callArgs = CallArgsFromVp(argc, vp);
 
 #if defined(__EMSCRIPTEN__)
+  if (wasm::UseInterp()) {
+    if (!callArgs.requireAtLeast(cx, "WebAssembly.compile", 1)) {
+      return RejectWithPendingException(cx, promise, callArgs);
+    }
+    RootedValue arg0(cx, callArgs.get(0));
+    if (!arg0.isObject()) {
+      JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr,
+                               JSMSG_WASM_BAD_BUF_MOD_ARG);
+      return RejectWithPendingException(cx, promise, callArgs);
+    }
+    RootedObject bytesObj(cx, &arg0.toObject());
+    RootedObject moduleObj(cx, InterpCompileArg(cx, bytesObj));
+    if (!moduleObj) {
+      return RejectWithPendingException(cx, promise, callArgs);
+    }
+    RootedValue result(cx, ObjectValue(*moduleObj));
+    if (!PromiseObject::resolve(cx, promise, result)) {
+      return RejectWithPendingException(cx, promise, callArgs);
+    }
+    callArgs.rval().setObject(*promise);
+    return true;
+  }
   if (wasm::UseHostPassthrough()) {
     if (!callArgs.requireAtLeast(cx, "WebAssembly.compile", 1)) {
       return RejectWithPendingException(cx, promise, callArgs);
@@ -5584,8 +5822,9 @@ static bool HostBindAndInstantiate(JSContext* cx, int handle,
   return true;
 }
 
-// Build an `{ exports }` instance object for an instantiated `handle`. Export
-// functions are bridged; other export kinds (memory/table/global) are null.
+// Build an `{ exports }` instance object for an instantiated `handle`. Function,
+// memory, table, and global exports are all bridged to guest-side wrappers; only
+// unrecognized kinds (e.g. tags) remain null.
 static JSObject* HostBuildInstanceObject(JSContext* cx, int handle) {
   RootedObject exportsObj(cx, JS_NewPlainObject(cx));
   if (!exportsObj) {
@@ -5621,6 +5860,28 @@ static JSObject* HostBuildInstanceObject(JSContext* cx, int handle) {
           return nullptr;
         }
         exportVal.setObject(*memWrap);
+      } else {
+        exportVal.setNull();
+      }
+    } else if (ekind == 1) {  // table: register + build a get/set/grow wrapper
+      int objId = wasmhost_export_register_obj(handle, i);
+      if (objId >= 0) {
+        RootedObject tableWrap(cx, HostMakeTableWrapper(cx, objId));
+        if (!tableWrap) {
+          return nullptr;
+        }
+        exportVal.setObject(*tableWrap);
+      } else {
+        exportVal.setNull();
+      }
+    } else if (ekind == 3) {  // global: register + build a value accessor wrapper
+      int objId = wasmhost_export_register_obj(handle, i);
+      if (objId >= 0) {
+        RootedObject globalWrap(cx, HostMakeGlobalWrapper(cx, objId));
+        if (!globalWrap) {
+          return nullptr;
+        }
+        exportVal.setObject(*globalWrap);
       } else {
         exportVal.setNull();
       }
@@ -5735,8 +5996,9 @@ static JSObject* HostMakeMemoryWrapper(JSContext* cx, int objId, bool shared) {
   return wrapper;
 }
 
-// Minimal guest wrapper carrying just the host obj id (table/global): enough to
-// bind them as imports; JS-side element/value access is not bridged yet.
+// Minimal guest wrapper carrying just the host obj id: enough to bind a host
+// table/global as an *import* (it just needs its obj id). For *exports* the guest
+// gets a functional wrapper instead (HostMakeTableWrapper / HostMakeGlobalWrapper).
 static JSObject* HostMakeObjIdWrapper(JSContext* cx, int objId) {
   RootedObject wrapper(cx, JS_NewPlainObject(cx));
   if (!wrapper) {
@@ -5744,6 +6006,244 @@ static JSObject* HostMakeObjIdWrapper(JSContext* cx, int objId) {
   }
   RootedValue idv(cx, Int32Value(objId));
   if (!JS_DefineProperty(cx, wrapper, kHostObjIdProp, idv, 0)) {
+    return nullptr;
+  }
+  return wrapper;
+}
+
+// Per-index cache of get() trampolines on a table wrapper, so repeated
+// `table.get(i)` returns the same function object (emscripten's getWasmTableEntry
+// asserts reference equality) and so `table.set(i, fn)` can make get() return the
+// guest fn that was set.
+static const char* const kHostTableCacheProp = "__wasmHostTblCache";
+
+// Native backing for a table slot returned by table.get(idx): extended slot 0 is
+// the host table's obj id, slot 1 the index. Calls route to wasmhost_table_call,
+// which invokes the host table entry. Numeric args/results round-trip through
+// double (i64/ref not handled), as with bridged export functions.
+static bool WasmHostTableCall(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  JSFunction& callee = args.callee().as<JSFunction>();
+  int objId = callee.getExtendedSlot(0).toInt32();
+  int idx = callee.getExtendedSlot(1).toInt32();
+  double buf[64];
+  unsigned n = args.length() > 64 ? 64 : args.length();
+  for (unsigned i = 0; i < n; i++) {
+    double d;
+    if (!ToNumber(cx, args[i], &d)) {
+      return false;
+    }
+    buf[i] = d;
+  }
+  double r = wasmhost_table_call(objId, idx, buf, int(n));
+  args.rval().setNumber(r);
+  return true;
+}
+
+static JSObject* HostTableCacheObject(JSContext* cx, HandleObject self) {
+  RootedValue cacheV(cx);
+  if (!JS_GetProperty(cx, self, kHostTableCacheProp, &cacheV)) {
+    return nullptr;
+  }
+  if (cacheV.isObject()) {
+    return &cacheV.toObject();
+  }
+  RootedObject cache(cx, JS_NewPlainObject(cx));
+  if (!cache) {
+    return nullptr;
+  }
+  RootedValue cv(cx, ObjectValue(*cache));
+  if (!JS_DefineProperty(cx, self, kHostTableCacheProp, cv, 0)) {
+    return nullptr;
+  }
+  return cache;
+}
+
+static bool WasmHostTableGet(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  if (!args.thisv().isObject()) {
+    args.rval().setNull();
+    return true;
+  }
+  RootedObject self(cx, &args.thisv().toObject());
+  int objId = HostObjId(cx, self);
+  double dv;
+  if (!ToNumber(cx, args.get(0), &dv)) {
+    return false;
+  }
+  int32_t idx = int32_t(dv);
+  RootedObject cache(cx, HostTableCacheObject(cx, self));
+  if (!cache) {
+    return false;
+  }
+  RootedValue cached(cx);
+  if (!JS_GetElement(cx, cache, uint32_t(idx), &cached)) {
+    return false;
+  }
+  if (cached.isObject()) {
+    args.rval().set(cached);
+    return true;
+  }
+  Rooted<JSAtom*> noName(cx, nullptr);
+  Rooted<JSFunction*> fn(
+      cx, NewNativeFunction(cx, WasmHostTableCall, 0, noName,
+                            gc::AllocKind::FUNCTION_EXTENDED));
+  if (!fn) {
+    return false;
+  }
+  fn->setExtendedSlot(0, Int32Value(objId));
+  fn->setExtendedSlot(1, Int32Value(idx));
+  RootedValue fnv(cx, ObjectValue(*fn));
+  if (!JS_SetElement(cx, cache, uint32_t(idx), fnv)) {
+    return false;
+  }
+  args.rval().set(fnv);
+  return true;
+}
+
+static bool WasmHostTableSet(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  if (!args.thisv().isObject()) {
+    args.rval().setUndefined();
+    return true;
+  }
+  RootedObject self(cx, &args.thisv().toObject());
+  int objId = HostObjId(cx, self);
+  double dv;
+  if (!ToNumber(cx, args.get(0), &dv)) {
+    return false;
+  }
+  int32_t idx = int32_t(dv);
+  RootedValue fnVal(cx, args.get(1));
+  // A bridged host export (our WasmHostExportCall native) IS a real host wasm
+  // function with a concrete type -- put it straight into the host table so
+  // call_indirect type-checks. (emscripten addFunction / wasm-bindgen closures set
+  // exactly these typed wrappers; an untyped JS shim would trap call_indirect with
+  // "function signature mismatch".)
+  if (fnVal.isObject() && fnVal.toObject().is<JSFunction>() &&
+      fnVal.toObject().as<JSFunction>().maybeNative() == WasmHostExportCall) {
+    JSFunction& srcFn = fnVal.toObject().as<JSFunction>();
+    int srcHandle = srcFn.getExtendedSlot(0).toInt32();
+    int srcIdx = srcFn.getExtendedSlot(1).toInt32();
+    if (wasmhost_table_set_hostfn(objId, idx, srcHandle, srcIdx) == 0) {
+      RootedObject cache(cx, HostTableCacheObject(cx, self));
+      if (!cache || !JS_SetElement(cx, cache, uint32_t(idx), fnVal)) {
+        return false;
+      }
+      args.rval().setUndefined();
+      return true;
+    }
+  }
+  if (fnVal.isNull()) {
+    wasmhost_table_set_null(objId, idx);
+    args.rval().setUndefined();
+    return true;
+  }
+  // A funcref table can only hold a wasm function or null. A plain JS function is
+  // rejected (TypeError) exactly as the real WebAssembly.Table.set does -- it has no
+  // concrete wasm type, so an untyped wrapper would trap call_indirect ("function
+  // signature mismatch"). Throwing here is what makes emscripten's addFunction catch
+  // the TypeError and fall back to convertJsFunctionToWasm (a typed wrapper module,
+  // instantiated through this passthrough -> a bridged export handled above).
+  JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr, JSMSG_NOT_FUNCTION,
+                            "WebAssembly.Table.set value");
+  return false;
+}
+
+static bool WasmHostTableGrow(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  if (!args.thisv().isObject()) {
+    args.rval().setInt32(-1);
+    return true;
+  }
+  RootedObject self(cx, &args.thisv().toObject());
+  int objId = HostObjId(cx, self);
+  double dv;
+  if (!ToNumber(cx, args.get(0), &dv)) {
+    return false;
+  }
+  args.rval().setInt32(wasmhost_table_grow(objId, int(dv)));
+  return true;
+}
+
+static bool WasmHostTableLengthGetter(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  if (!args.thisv().isObject()) {
+    args.rval().setInt32(0);
+    return true;
+  }
+  RootedObject self(cx, &args.thisv().toObject());
+  args.rval().setInt32(wasmhost_table_length(HostObjId(cx, self)));
+  return true;
+}
+
+static bool WasmHostGlobalValueGetter(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  if (!args.thisv().isObject()) {
+    args.rval().setUndefined();
+    return true;
+  }
+  RootedObject self(cx, &args.thisv().toObject());
+  args.rval().setNumber(wasmhost_global_get(HostObjId(cx, self)));
+  return true;
+}
+
+static bool WasmHostGlobalValueSetter(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  if (!args.thisv().isObject()) {
+    args.rval().setUndefined();
+    return true;
+  }
+  RootedObject self(cx, &args.thisv().toObject());
+  double d;
+  if (!ToNumber(cx, args.get(0), &d)) {
+    return false;
+  }
+  wasmhost_global_set(HostObjId(cx, self), d);
+  args.rval().setUndefined();
+  return true;
+}
+
+// Guest WebAssembly.Table-like wrapper for an existing host table `objId`:
+// get/set/grow methods + a length getter route to the host table via the bridge.
+// Backs emscripten's getWasmTableEntry / addFunction on a passthrough module.
+static JSObject* HostMakeTableWrapper(JSContext* cx, int objId) {
+  RootedObject wrapper(cx, JS_NewPlainObject(cx));
+  if (!wrapper) {
+    return nullptr;
+  }
+  RootedValue idv(cx, Int32Value(objId));
+  if (!JS_DefineProperty(cx, wrapper, kHostObjIdProp, idv, 0)) {
+    return nullptr;
+  }
+  if (!JS_DefineFunction(cx, wrapper, "get", WasmHostTableGet, 1,
+                         JSPROP_ENUMERATE) ||
+      !JS_DefineFunction(cx, wrapper, "set", WasmHostTableSet, 2,
+                         JSPROP_ENUMERATE) ||
+      !JS_DefineFunction(cx, wrapper, "grow", WasmHostTableGrow, 1,
+                         JSPROP_ENUMERATE)) {
+    return nullptr;
+  }
+  if (!JS_DefineProperty(cx, wrapper, "length", WasmHostTableLengthGetter,
+                         nullptr, JSPROP_ENUMERATE)) {
+    return nullptr;
+  }
+  return wrapper;
+}
+
+// Guest WebAssembly.Global-like wrapper for an existing host global `objId`: a
+// `value` accessor routes to the host global (i64 is lossy; see the js-library).
+static JSObject* HostMakeGlobalWrapper(JSContext* cx, int objId) {
+  RootedObject wrapper(cx, JS_NewPlainObject(cx));
+  if (!wrapper) {
+    return nullptr;
+  }
+  RootedValue idv(cx, Int32Value(objId));
+  if (!JS_DefineProperty(cx, wrapper, kHostObjIdProp, idv, 0)) {
+    return nullptr;
+  }
+  if (!JS_DefineProperty(cx, wrapper, "value", WasmHostGlobalValueGetter,
+                         WasmHostGlobalValueSetter, JSPROP_ENUMERATE)) {
     return nullptr;
   }
   return wrapper;
@@ -5913,9 +6413,33 @@ static bool HostStream_OnBytes(JSContext* cx, unsigned argc, Value* vp) {
 
   RootedValue result(cx);
   bool ok;
-  if (instVal.toBoolean()) {
-    RootedObject importObj(
-        cx, importVal.isObject() ? &importVal.toObject() : nullptr);
+  RootedObject importObj(
+      cx, importVal.isObject() ? &importVal.toObject() : nullptr);
+  if (wasm::UseInterp()) {
+    RootedObject imod(cx, InterpCompileArg(cx, bytesObj));
+    ok = imod != nullptr;
+    if (ok && instVal.toBoolean()) {
+      RootedObject inst(
+          cx, wasm::interp::InstantiateModuleObject(cx, imod, importObj));
+      ok = inst != nullptr;
+      if (ok) {
+        RootedObject resultObj(cx, JS_NewPlainObject(cx));
+        ok = resultObj != nullptr;
+        if (ok) {
+          RootedValue v(cx, ObjectValue(*imod));
+          ok = JS_DefineProperty(cx, resultObj, "module", v, JSPROP_ENUMERATE);
+          if (ok) {
+            v.setObject(*inst);
+            ok = JS_DefineProperty(cx, resultObj, "instance", v,
+                                   JSPROP_ENUMERATE);
+          }
+          if (ok) result.setObject(*resultObj);
+        }
+      }
+    } else if (ok) {
+      result.setObject(*imod);
+    }
+  } else if (instVal.toBoolean()) {
     ok = HostPassthroughInstantiate(cx, bytesObj, importObj, &result);
   } else {
     int handle = HostCompileBytes(cx, bytesObj);
@@ -6005,6 +6529,46 @@ static bool WebAssembly_instantiate(JSContext* cx, unsigned argc, Value* vp) {
   }
 
 #if defined(__EMSCRIPTEN__)
+  if (wasm::UseInterp()) {
+    RootedObject imod(cx);
+    bool wasModule = wasm::interp::IsModuleObject(firstArg);
+    if (wasModule) {
+      imod = firstArg;
+    } else {
+      imod = InterpCompileArg(cx, firstArg);
+      if (!imod) {
+        return RejectWithPendingException(cx, promise, callArgs);
+      }
+    }
+    RootedObject instanceObj(
+        cx, wasm::interp::InstantiateModuleObject(cx, imod, importObj));
+    if (!instanceObj) {
+      return RejectWithPendingException(cx, promise, callArgs);
+    }
+    RootedValue result(cx);
+    if (wasModule) {
+      result.setObject(*instanceObj);
+    } else {
+      RootedObject resultObj(cx, JS_NewPlainObject(cx));
+      if (!resultObj) {
+        return RejectWithPendingException(cx, promise, callArgs);
+      }
+      RootedValue v(cx, ObjectValue(*imod));
+      if (!JS_DefineProperty(cx, resultObj, "module", v, JSPROP_ENUMERATE)) {
+        return RejectWithPendingException(cx, promise, callArgs);
+      }
+      v.setObject(*instanceObj);
+      if (!JS_DefineProperty(cx, resultObj, "instance", v, JSPROP_ENUMERATE)) {
+        return RejectWithPendingException(cx, promise, callArgs);
+      }
+      result.setObject(*resultObj);
+    }
+    if (!PromiseObject::resolve(cx, promise, result)) {
+      return RejectWithPendingException(cx, promise, callArgs);
+    }
+    callArgs.rval().setObject(*promise);
+    return true;
+  }
   if (wasm::UseHostPassthrough()) {
     RootedValue result(cx);
     if (!HostPassthroughInstantiate(cx, firstArg, importObj, &result)) {
@@ -6688,7 +7252,7 @@ static bool WebAssembly_compileStreaming(JSContext* cx, unsigned argc,
   Rooted<Value> responsePromise(cx, callArgs.get(0));
   Rooted<Value> featureOptions(cx, callArgs.get(1));
 #if defined(__EMSCRIPTEN__)
-  if (wasm::UseHostPassthrough()) {
+  if (wasm::UseHostPassthrough() || wasm::UseInterp()) {
     if (!HostStreamingInstantiate(cx, responsePromise, nullptr,
                                   /*instantiate*/ false, resultPromise)) {
       return RejectWithPendingException(cx, resultPromise, callArgs);
@@ -6747,7 +7311,7 @@ static bool WebAssembly_instantiateStreaming(JSContext* cx, unsigned argc,
   Rooted<Value> responsePromise(cx, ObjectValue(*firstArg.get()));
 
 #if defined(__EMSCRIPTEN__)
-  if (wasm::UseHostPassthrough()) {
+  if (wasm::UseHostPassthrough() || wasm::UseInterp()) {
     if (!HostStreamingInstantiate(cx, responsePromise, importObj,
                                   /*instantiate*/ true, resultPromise)) {
       return RejectWithPendingException(cx, resultPromise, callArgs);
@@ -6943,6 +7507,28 @@ static bool WebAssemblyDefineConstructor(JSContext* cx,
   return DefineDataProperty(cx, wasm, id, ctorValue, 0);
 }
 
+#if defined(__EMSCRIPTEN__)
+// Non-suspending JSPI stubs for the in-process interpreter. Real JSPI needs a
+// compiler for stack switching (absent here), but content such as a nested
+// gecko.js constructs `new WebAssembly.Suspending(fn)` and calls
+// `WebAssembly.promising(fn)` at load time. Both stubs just return their
+// argument: a Suspending wraps to the raw import (called normally), and a
+// promising export is awaited -- `await` on a synchronous (non-promise) result
+// is a no-op. This lets nested glue load + instantiate; true suspension (e.g.
+// yielding the engine main loop) is a separate, larger task.
+static bool InterpJspiIdentity(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  if (args.length() < 1 || !IsCallable(args.get(0))) {
+    JS_ReportErrorASCII(cx,
+                        "WebAssembly.Suspending/promising: argument must be a "
+                        "function");
+    return false;
+  }
+  args.rval().set(args.get(0));
+  return true;
+}
+#endif
+
 static bool WebAssemblyClassFinish(JSContext* cx, HandleObject object,
                                    HandleObject proto) {
   Handle<WasmNamespaceObject*> wasm = object.as<WasmNamespaceObject>();
@@ -6963,6 +7549,15 @@ static bool WebAssemblyClassFinish(JSContext* cx, HandleObject object,
   RootedValue ctorValue(cx);
   RootedId id(cx);
   for (const auto& entry : entries) {
+#if defined(__EMSCRIPTEN__)
+    // WebAssembly.Function (type reflection) needs a JIT backend to build its
+    // call trampoline; under the in-process interpreter it has none and throws
+    // OOM on construction. Omit it so emscripten's addFunction falls back to
+    // the module-build path (which the interpreter handles).
+    if (entry.key == JSProto_WasmFunction && wasm::UseInterp()) {
+      continue;
+    }
+#endif
     if (!WebAssemblyDefineConstructor(cx, wasm, entry, &ctorValue, &id)) {
       return false;
     }
@@ -7042,6 +7637,27 @@ static bool WebAssemblyClassFinish(JSContext* cx, HandleObject object,
   if (MozIntGemmAvailable(cx) &&
       !JS_DefineFunctions(cx, wasm, WebAssembly_mozIntGemm_methods)) {
     return false;
+  }
+#endif
+
+#if defined(__EMSCRIPTEN__)
+  // Install non-suspending JSPI stubs when real JSPI is unavailable (the
+  // interpreter has no compiler for stack switching) so nested gecko.js content
+  // that uses WebAssembly.Suspending/promising can load + instantiate.
+  if (wasm::UseInterp() && !JSPromiseIntegrationAvailable(cx)) {
+    JSFunction* suspCtor =
+        JS_NewFunction(cx, InterpJspiIdentity, 1, JSFUN_CONSTRUCTOR, "Suspending");
+    if (!suspCtor) {
+      return false;
+    }
+    RootedValue suspVal(cx, ObjectValue(*JS_GetFunctionObject(suspCtor)));
+    if (!JS_DefineProperty(cx, wasm, "Suspending", suspVal, JSPROP_ENUMERATE)) {
+      return false;
+    }
+    if (!JS_DefineFunction(cx, wasm, "promising", InterpJspiIdentity, 1,
+                           JSPROP_ENUMERATE)) {
+      return false;
+    }
   }
 #endif
 

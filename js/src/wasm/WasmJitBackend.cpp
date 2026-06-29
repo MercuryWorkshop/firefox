@@ -9984,6 +9984,33 @@ static void WJElideUnboxForPropCache(MIRGenerator& mir, MIRGraph& graph) {
             dead.size());
 }
 
+// Replace MSpectreMaskIndex with its index input. WarpCacheIRTranspiler inserts it
+// after every element bounds check as a Spectre-v1 mitigation, but it's dead weight
+// here: MBoundsCheck already guarantees the index is in range, and the JIT'd code
+// runs inside the host's wasm engine (its own speculation sandbox) -- there is no
+// native mispredict to exploit. The backend can't lower it (-> [wb-be] bail), so
+// elide it: the masked index equals the index.
+static void WJElideSpectreMaskIndex(MIRGenerator& mir, MIRGraph& graph) {
+  using jit::MDefinition;
+  using Op_ = MDefinition::Opcode;
+  std::vector<jit::MInstruction*> dead;
+  for (auto bIt = graph.rpoBegin(); bIt != graph.rpoEnd(); bIt++) {
+    for (auto it = bIt->begin(); it != bIt->end(); it++) {
+      MDefinition* s = *it;
+      if (s->op() != Op_::SpectreMaskIndex) continue;
+      s->replaceAllUsesWith(s->toSpectreMaskIndex()->index());
+      dead.push_back(s->toInstruction());
+    }
+  }
+  for (jit::MInstruction* d : dead) d->block()->discard(d);
+  if (!dead.empty() && getenv("GECKO_WJ_SPECTREDBG"))
+    fprintf(stderr, "[wj-spectre] %s:%u elided %zu SpectreMaskIndex\n",
+            mir.outerInfo().script() ? mir.outerInfo().script()->filename() : "?",
+            mir.outerInfo().script() ? unsigned(mir.outerInfo().script()->lineno())
+                                     : 0,
+            dead.size());
+}
+
 }  // namespace
 
 void js::wasm::WJDumpDeoptSiteHist() { WJDumpSiteHist(); }
@@ -10248,6 +10275,9 @@ bool js::wasm::WJEmitBody(MIRGenerator& mir, MIRGraph& graph, uint32_t nargs,
   // Elide deopt-prone Unbox:Object feeding generic property-cache helpers (gbemu
   // chained property access). See WJElideUnboxForPropCache.
   WJElideUnboxForPropCache(mir, graph);
+  // Drop MSpectreMaskIndex (native-CPU mitigation, dead weight here; the backend
+  // can't lower it). See WJElideSpectreMaskIndex.
+  WJElideSpectreMaskIndex(mir, graph);
 
   // Bisection knobs: bail (stay PBL) any function containing a disabled op kind.
   static int noCall = getenv("GECKO_WJ_NOCALL") ? 1 : 0;

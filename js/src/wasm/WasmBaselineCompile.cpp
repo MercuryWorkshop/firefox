@@ -139,6 +139,15 @@
  *      to the Ion version of the function.  Hence lazy tier-up is achieved.
  */
 
+// SIMD codegen requires a real assembler backend. In a JS_CODEGEN_NONE build
+// (--disable-jit) there is none, and content wasm runs via the in-process
+// interpreter (which handles SIMD itself), so this codegen path is dead. Drop
+// ENABLE_WASM_SIMD here so the dead SIMD emitters don't reference backend-only
+// macro-assembler ops that the none-backend lacks.
+#if defined(JS_CODEGEN_NONE) && defined(ENABLE_WASM_SIMD)
+#  undef ENABLE_WASM_SIMD
+#endif
+
 #include "wasm/WasmBaselineCompile.h"
 
 #include "wasm/WasmAnyRef.h"
@@ -155,6 +164,15 @@
 #include "wasm/WasmBCRegDefs-inl.h"
 #include "wasm/WasmBCRegMgmt-inl.h"
 #include "wasm/WasmBCStkMgmt-inl.h"
+
+// The includes above re-pull js-config.h, which re-#defines ENABLE_WASM_SIMD
+// even though we dropped it at the top of this file. Drop it again here, after
+// all includes, so the dead SIMD codegen below (this is a JS_CODEGEN_NONE
+// build) doesn't reference backend-only macro-assembler ops. This TU is
+// non-unified (see js/src/wasm/moz.build) so the undef cannot leak.
+#if defined(JS_CODEGEN_NONE) && defined(ENABLE_WASM_SIMD)
+#  undef ENABLE_WASM_SIMD
+#endif
 
 namespace js {
 namespace wasm {

@@ -23,7 +23,7 @@
 #elif defined(__ggp__)
 #    define ANGLE_PLATFORM_GGP 1
 #    define ANGLE_PLATFORM_POSIX 1
-#elif defined(__linux__) || defined(EMSCRIPTEN)
+#elif defined(__linux__) || defined(__EMSCRIPTEN__)
 #    define ANGLE_PLATFORM_LINUX 1
 #    define ANGLE_PLATFORM_POSIX 1
 #elif defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) ||              \

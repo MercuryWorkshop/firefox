@@ -14,9 +14,6 @@ include("../js-cxxflags.mozbuild")
 UNIFIED_SOURCES += [
     "AsmJS.cpp",
     "WasmAnyRef.cpp",
-    "WasmBaselineCompile.cpp",
-    "WasmBCFrame.cpp",
-    "WasmBCMemory.cpp",
     "WasmBinary.cpp",
     "WasmBuiltinModule.cpp",
     "WasmBuiltins.cpp",
@@ -51,7 +48,6 @@ UNIFIED_SOURCES += [
     "WasmStacks.cpp",
     "WasmStaticTypeDefs.cpp",
     "WasmStructLayout.cpp",
-    "WasmStubs.cpp",
     "WasmSummarizeInsn.cpp",
     "WasmTable.cpp",
     "WasmTypeDef.cpp",
@@ -59,6 +55,47 @@ UNIFIED_SOURCES += [
     "WasmValType.cpp",
     "WasmValue.cpp",
 ]
+
+# Re-architected JS->wasm JIT: separate TUs (not unified) -- file-static globals
+# and anonymous-namespace helpers would collide if merged with each other/WasmJS.cpp.
+SOURCES += [
+    "WasmJitBackend.cpp",
+    "WasmJitRuntime.cpp",
+    "WasmJitWarp.cpp",
+]
+
+# Scalar v128 helpers for the interpreter, compiled WITHOUT -msimd128 so clang
+# (v23) cannot emit the SIMD instructions it miscompiles for the composite
+# extmul/avgr intrinsics (separate non-unified TU => not inlined into the
+# -msimd128 interpreter loop, where the scalar code gets idiom-recognized back
+# into the buggy instruction). See WasmInterpSimdScalar.h.
+SOURCES += ["WasmInterpSimdScalar.cpp"]
+SOURCES["WasmInterpSimdScalar.cpp"].flags += ["-mno-simd128"]
+
+# In a JS_CODEGEN_NONE build (--disable-jit) the rabaldr baseline compiler is
+# dead, but with ENABLE_WASM_SIMD enabled (for the in-process interpreter's
+# front-end validation) its SIMD emitters reference backend-only macro-assembler
+# ops the none-backend lacks. These TUs locally `#undef ENABLE_WASM_SIMD`; build
+# them non-unified so that undef cannot leak into the SIMD-aware front-end TUs
+# (e.g. WasmBinary.cpp) that share a unified compilation unit.
+#
+# WasmStubs.cpp is moved here too: it has the same dead-SIMD-codegen problem and
+# needs a post-include `#undef ENABLE_WASM_SIMD`, which would leak into the
+# front-end SIMD TUs if it stayed in a unified compilation unit.
+if CONFIG["JS_CODEGEN_NONE"]:
+    SOURCES += [
+        "WasmBaselineCompile.cpp",
+        "WasmBCFrame.cpp",
+        "WasmBCMemory.cpp",
+        "WasmStubs.cpp",
+    ]
+else:
+    UNIFIED_SOURCES += [
+        "WasmBaselineCompile.cpp",
+        "WasmBCFrame.cpp",
+        "WasmBCMemory.cpp",
+        "WasmStubs.cpp",
+    ]
 
 # Generate wasm/WasmBuiltinModuleGenerated.h from wasm/WasmBuiltinModule.yaml
 GeneratedFile(

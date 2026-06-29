@@ -100,6 +100,13 @@ if CONFIG['MOZ_OPENSL']:
     SOURCES += ['cubeb_opensl.cpp']
     DEFINES['USE_OPENSL'] = True
 
+# wasm build: no native audio device. cubeb_wasmaudio.c pulls PCM on a fill thread
+# into a shared-heap ring that a host AudioWorklet (build/audio-out.js) drains into
+# a Web Audio AudioContext. Output only.
+if CONFIG['OS_TARGET'] == 'EMSCRIPTEN':
+    SOURCES += ['cubeb_wasmaudio.c']
+    DEFINES['USE_WASMAUDIO'] = True
+
 FINAL_LIBRARY = 'xul'
 
 if CONFIG['MOZ_ALSA']:

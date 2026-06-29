@@ -15,9 +15,13 @@
 #include "mozilla/TextComposition.h"
 #include "mozilla/TextEventDispatcher.h"
 #include "mozilla/TextEvents.h"
+#include "mozilla/WritingModes.h"
 #include "PuppetWidget.h"
 #include "nsContentUtils.h"
 #include "imgIContainer.h"
+#if defined(__EMSCRIPTEN__)
+#  include "HeadlessKeyBindings.h"
+#endif
 
 using namespace mozilla;
 using namespace mozilla::dom;
@@ -500,11 +504,29 @@ bool PuppetWidget::GetEditCommands(NativeKeyBindingsType aType,
   if (NS_WARN_IF(!nsIWidget::GetEditCommands(aType, aEvent, aCommands))) {
     return false;
   }
+#if defined(__EMSCRIPTEN__)
+  // Single-process wasm build: there is no separate parent process to service
+  // SendRequestNativeKeyBindings, and the loopback "parent" widget carries no
+  // native key bindings. Resolve edit commands locally via the portable
+  // headless bindings (the same source HeadlessWidget uses) so editor
+  // shortcuts -- Ctrl+A (SelectAll), Ctrl+C/X/V, Ctrl+Z -- work in content
+  // text controls instead of dead-ending in an IPC round trip.
+  Maybe<WritingMode> writingMode;
+  if (aEvent.NeedsToRemapNavigationKey()) {
+    if (RefPtr<TextEventDispatcher> dispatcher = GetTextEventDispatcher()) {
+      writingMode = dispatcher->MaybeQueryWritingModeAtSelection();
+    }
+  }
+  HeadlessKeyBindings& bindings = HeadlessKeyBindings::GetInstance();
+  bindings.GetEditCommands(aType, aEvent, writingMode, aCommands);
+  return true;
+#else
   if (NS_WARN_IF(!mBrowserChild)) {
     return false;
   }
   mBrowserChild->RequestEditCommands(aType, aEvent, aCommands);
   return true;
+#endif
 }
 
 WindowRenderer* PuppetWidget::GetWindowRenderer() {

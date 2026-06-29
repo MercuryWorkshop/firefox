@@ -208,6 +208,26 @@
 #    define MOZILLA_PRESUME_SSE2
 #  endif
 
+#elif defined(__wasm_simd128__)
+
+// Emscripten/WebAssembly: SSE intrinsics are provided by emscripten's shim headers
+// (emmintrin.h, tmmintrin.h, ...) and lowered to wasm 128-bit SIMD. The engine is
+// compiled with -msimd128, and the per-file SSE sources additionally get -msseN, so
+// these 128-bit instruction sets are ALWAYS available -- presume them (there is no
+// runtime CPU detection on wasm). Note these are presumed unconditionally on the
+// wasm target (not gated on per-TU __SSE2__), so the dispatch TUs -- which are NOT
+// compiled with -msseN -- still see supports_sseN() == true and call into the SSE
+// fast paths. AVX/AVX2/FMA are intentionally left unset (emscripten emulates 256-bit
+// over 128-bit SIMD, slower + larger), so those dispatchers fall back to SSE.
+// Only SSE2 + SSSE3 are presumed: these are the levels with dedicated source files
+// that we build on wasm (gfx/2d, gfx/thebes, gfx/ycbcr, dom/base, dom/media). Plain
+// SSE / SSE3 / SSE4* are deliberately NOT presumed -- some consumers (e.g. ycbcr
+// yuv_row_*) use inline SSE in TUs that are NOT compiled with -msseN, so presuming
+// those levels would turn on intrinsics the TU can't compile. AVX/AVX2/FMA likewise
+// stay unset (256-bit emulated over 128-bit wasm SIMD), so those dispatchers fall back.
+#  define MOZILLA_PRESUME_SSE2 1
+#  define MOZILLA_PRESUME_SSSE3 1
+
 #endif
 
 namespace mozilla {

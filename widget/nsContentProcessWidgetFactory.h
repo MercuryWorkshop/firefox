@@ -21,7 +21,18 @@
     return inst.forget();                                              \
   }
 
-#ifdef MOZ_WIDGET_COCOA
+#if defined(__EMSCRIPTEN__)
+// The cairo-headless toolkit registers no platform clipboard component, so
+// @mozilla.org/widget/parent/clipboard;1 is absent. Build the headless clipboard
+// directly (single process => always the parent path). Defined in
+// widget/headless/HeadlessClipboard.cpp.
+namespace mozilla::widget {
+already_AddRefed<nsISupports> CreateHeadlessClipboardSupports();
+}
+static already_AddRefed<nsISupports> nsClipboardSelector() {
+  return mozilla::widget::CreateHeadlessClipboardSupports();
+}
+#elif defined(MOZ_WIDGET_COCOA)
 // This should be `do_GetService`, but test_bug466599.xhtml erroneously uses
 // `createInstance` rather than `getService`, and passes only because doing so
 // bypasses the clipboard contents cache, which does not have the expected

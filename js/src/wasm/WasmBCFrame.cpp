@@ -14,6 +14,15 @@
  * limitations under the License.
  */
 
+// SIMD codegen requires a real assembler backend. In a JS_CODEGEN_NONE build
+// (--disable-jit) there is none, and content wasm runs via the in-process
+// interpreter, so this baseline-compiler path is dead. Drop ENABLE_WASM_SIMD
+// here so the dead SIMD code doesn't reference backend-only ops. (This TU is
+// built non-unified in that configuration so the undef cannot leak.)
+#if defined(JS_CODEGEN_NONE) && defined(ENABLE_WASM_SIMD)
+#  undef ENABLE_WASM_SIMD
+#endif
+
 #include "wasm/WasmBCFrame.h"
 
 #include "mozilla/Likely.h"

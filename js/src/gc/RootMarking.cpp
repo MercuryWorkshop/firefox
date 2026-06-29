@@ -19,6 +19,7 @@
 #include "vm/Compartment.h"
 #include "vm/HelperThreadState.h"
 #include "vm/JSContext.h"
+#include "wasm/WasmFeatures.h"
 
 using namespace js;
 using namespace js::gc;
@@ -392,6 +393,19 @@ void js::gc::GCRuntime::traceRuntimeCommon(JSTracer* trc,
       traceEmbeddingGrayRoots(trc);
     }
   }
+#if defined(__EMSCRIPTEN__)
+  else if (js::wasm::UseInterp()) {
+    // The in-process wasm interpreter (GECKO_WASM_INTERP) holds JS GC pointers
+    // (import functions, instance/table/global objects, ref cells) in plain
+    // C++ storage WITHOUT post-write barriers, so they are not in the store
+    // buffer. When it is active, also trace the embedding black roots during a
+    // minor GC so those pointers are tenured/updated; otherwise a nursery
+    // collection moves the referents and leaves the interpreter's pointers
+    // dangling (observed as "function signature mismatch"/UAF traps mid-call).
+    // Gated on UseInterp() so default (passthrough) builds are unaffected.
+    traceEmbeddingBlackRoots(trc);
+  }
+#endif
 
   traceKeptObjects(trc);
 }

@@ -12,6 +12,10 @@
 
 #ifdef SIMD_COMPILE_SSE2
 #  include <xmmintrin.h>
+// SSE2 integer intrinsics (_mm_load_si128 etc.) live in emmintrin.h. On x86 toolchains
+// xmmintrin.h transitively pulls it in, but emscripten's SSE shim does not, so include
+// it explicitly (needed for the wasm SSE->wasm-SIMD build).
+#  include <emmintrin.h>
 #endif
 
 namespace mozilla {

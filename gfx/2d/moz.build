@@ -116,8 +116,11 @@ EXPORTS.mozilla.gfx += [
     "HelpersSkia.h",
 ]
 
-# Are we targeting x86 or x64?  If so, build SSE2 files.
-if CONFIG["INTEL_ARCHITECTURE"]:
+# x86/x64 natively, or wasm via emscripten's SSE/AVX -> wasm-SIMD shim headers (engine
+# built with -msimd128; SSEn_FLAGS add -msseN). AVX2 files are built too (they compile
+# under the shim and Swizzle.cpp's AVX2 dispatch is under USE_SSE2, so the symbols must
+# exist) but stay dead at runtime since supports_avx2() is false on wasm.
+if CONFIG["INTEL_ARCHITECTURE"] or CONFIG["OS_TARGET"] == "EMSCRIPTEN":
     SOURCES += [
         "ConvolutionFilterAVX2.cpp",
         "ConvolutionFilterSSE2.cpp",

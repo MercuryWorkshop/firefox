@@ -14,6 +14,14 @@
  * limitations under the License.
  */
 
+// SIMD codegen requires a real assembler backend. In a JS_CODEGEN_NONE build
+// (--disable-jit) there is none, and content wasm runs via the in-process
+// interpreter, so this stub-generation path is dead. Drop ENABLE_WASM_SIMD here
+// so the dead SIMD code doesn't reference backend-only ops.
+#if defined(JS_CODEGEN_NONE) && defined(ENABLE_WASM_SIMD)
+#  undef ENABLE_WASM_SIMD
+#endif
+
 #include "wasm/WasmStubs.h"
 
 #include <algorithm>
@@ -33,6 +41,16 @@
 
 #include "jit/MacroAssembler-inl.h"
 #include "wasm/WasmInstance-inl.h"
+
+// The includes above re-pull js-config.h, which re-#defines ENABLE_WASM_SIMD
+// even though we dropped it at the top of this file. Drop it again here, after
+// all includes, so the dead SIMD stub-generation below (this is a
+// JS_CODEGEN_NONE build) doesn't reference backend-only ops. This TU is built
+// non-unified (see js/src/wasm/moz.build) so the undef cannot leak into the
+// SIMD-aware front-end TUs.
+#if defined(JS_CODEGEN_NONE) && defined(ENABLE_WASM_SIMD)
+#  undef ENABLE_WASM_SIMD
+#endif
 
 using namespace js;
 using namespace js::jit;

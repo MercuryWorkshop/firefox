@@ -87,6 +87,10 @@ audiotrack_init(cubeb ** context, char const * context_name);
 int
 kai_init(cubeb ** context, char const * context_name);
 #endif
+#if defined(USE_WASMAUDIO)
+int
+wasmaudio_init(cubeb ** context, char const * context_name);
+#endif
 
 static int
 validate_stream_params(cubeb_stream_params * input_stream_params,
@@ -263,6 +267,9 @@ cubeb_init(cubeb ** context, char const * context_name,
 #endif
 #if defined(USE_KAI)
     kai_init,
+#endif
+#if defined(USE_WASMAUDIO)
+    wasmaudio_init,
 #endif
   };
   int i;

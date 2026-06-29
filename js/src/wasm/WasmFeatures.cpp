@@ -236,10 +236,28 @@ bool wasm::IsPrivilegedContext(JSContext* cx) {
 }
 
 bool wasm::SimdAvailable(JSContext* cx) {
+#if defined(__EMSCRIPTEN__) && defined(__wasm_simd128__)
+  // The in-process interpreter implements SIMD (v128) itself, executing the 0xFD
+  // opcodes via the host's native wasm SIMD (the engine is compiled -msimd128),
+  // so it needs no JIT backend (JitSupportsWasmSimd is false under --disable-jit).
+  // Report SIMD available so validation accepts v128 + the SIMD opcodes. Gated on
+  // __wasm_simd128__ so a non-SIMD interp build still rejects SIMD at validation
+  // (consistent with the exec loop, which has no SIMD cases without the header).
+  if (UseInterp()) return true;
+#endif
   return js::jit::JitSupportsWasmSimd();
 }
 
 bool wasm::ThreadsAvailable(JSContext* cx) {
+#if defined(__EMSCRIPTEN__)
+  // The in-process interpreter implements atomics + shared memory itself, so it
+  // does not need a JIT compiler to be available (AnyCompilerAvailable is false
+  // in this --disable-jit build). Report threads as available so validation
+  // accepts shared memory and the 0xFE atomic opcodes instead of rejecting them.
+  if (UseInterp()) {
+    return true;
+  }
+#endif
   return WasmThreadsFlag(cx) && AnyCompilerAvailable(cx);
 }
 
@@ -275,14 +293,27 @@ bool wasm::HasPlatformSupport() {
 }
 
 #if defined(__EMSCRIPTEN__)
-bool wasm::UseHostPassthrough() { return true; }
+// The in-process interpreter is the DEFAULT for content wasm (it is correct and
+// self-contained: real linear memory, i64/bulk-mem/atomics/threads, no host
+// engine dependency). The legacy host passthrough is opt-in via
+// GECKO_WASM_PASSTHROUGH for the rare case where its raw speed is wanted and its
+// warts (full-heap mirror per call, lossy i64, broken grow/shared-memory) are
+// acceptable. GECKO_WASM_INTERP is still accepted as a no-op (interp is default)
+// for back-compat with existing callers that set it.
+bool wasm::UseHostPassthrough() {
+  static int sEnabled = -1;
+  if (sEnabled < 0) sEnabled = getenv("GECKO_WASM_PASSTHROUGH") ? 1 : 0;
+  return sEnabled != 0;
+}
+bool wasm::UseInterp() { return !UseHostPassthrough(); }
 #endif
 
 bool wasm::HasSupport(JSContext* cx) {
 #if defined(__EMSCRIPTEN__)
-  // No in-process wasm compiler on wasm32-emscripten; WebAssembly is routed to
-  // the host engine, so it is available regardless of platform/compiler support.
-  if (UseHostPassthrough()) {
+  // No in-process wasm compiler on wasm32-emscripten; WebAssembly is either run
+  // by the in-process interpreter (GECKO_WASM_INTERP) or routed to the host
+  // engine, so it is available regardless of platform/compiler support.
+  if (UseInterp() || UseHostPassthrough()) {
     return true;
   }
 #endif

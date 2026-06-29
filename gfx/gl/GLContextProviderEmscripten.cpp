@@ -51,6 +51,21 @@ static bool ContentPassthroughEnabled() {
   return gecko_gl_passthrough_enabled && gecko_gl_passthrough_enabled() != 0;
 }
 
+// JSPI yield (gecko.js/build/gl-present.js, marked __async): suspends the calling
+// Renderer thread for one macrotask so its worker event loop runs, which is when the
+// browser implicit-presents the OffscreenCanvas to its #screen placeholder. Requires
+// the final link's -sJSPI.
+extern "C" void gl_present_yield(void);
+
+// emscripten_webgl_get_proc_address is provided by emscripten's GL JS library at the
+// final link, so it is undefined in this relocatable libxul.so. Taking its address
+// directly emits a table-index relocation against an undefined symbol, which newer
+// wasm-ld (emscripten 6.0.1) rejects; a CALL to it is a deferred relocation that is
+// fine. So route the loader through this locally-defined shim.
+static void* EmscriptenGLGetProcAddress(const char* name) {
+  return emscripten_webgl_get_proc_address(name);
+}
+
 class GLContextEmscripten final : public GLContext {
  public:
   MOZ_DECLARE_REFCOUNTED_VIRTUAL_TYPENAME(GLContextEmscripten, override)
@@ -197,73 +212,21 @@ class GLContextEmscripten final : public GLContext {
     // emscripten resolves GL entry points by name (requires
     // -sGL_ENABLE_GET_PROC_ADDRESS). Matches SymbolLoader's void*(const char*)
     // ctor; the base GLContext::InitImpl loads the whole symbol table through it.
-    return Some(SymbolLoader(emscripten_webgl_get_proc_address));
+    return Some(SymbolLoader(EmscriptenGLGetProcAddress));
   }
 
   bool IsDoubleBuffered() const override { return true; }
 
   bool SwapBuffers() override {
     if (!mPresent) return true;
-    // The compositor context is LOCAL on this (Renderer) worker (its canvas is the
-    // OffscreenCanvas transferred from #screen), so WebRender's GL ran without the
-    // per-call proxy. But the WebGL "implicit swap" that would push the OffscreenCanvas
-    // to the visible placeholder never fires here: an emscripten pthread runs a blocking
-    // event loop and never yields to its JS event loop, and gl.commit() was removed from
-    // browsers. So we present EXPLICITLY: grab the frame as an ImageBitmap and post it to
-    // the main thread, where a bitmaprenderer canvas (#glout, overlaid on #screen)
-    // displays it. One zero-copy transfer per frame, no per-GL-call proxy, no readback.
-    if (!mPresentSetup) {
-      mPresentSetup = true;
-      MAIN_THREAD_EM_ASM(
-          {
-            var w = PThread.pthreads[$0];
-            if (!w) return;
-            var screen = document.querySelector('#screen');
-            var o = document.getElementById('glout');
-            if (!o) {
-              o = document.createElement('canvas');
-              o.id = 'glout';
-              o.width = screen.width;
-              o.height = screen.height;
-              // Overlay exactly on #screen (inside the position:relative #screenwrap)
-              // but transparent to input, so the harness's mouse/keyboard handlers on
-              // #screen still fire. #screen stays in the DOM (covered by #glout's
-              // opaque rendered content).
-              o.style.position = 'absolute';
-              o.style.border = 'none';
-              // Fill the viewport like #screen (CSS 100vw/100vh) rather than fixing
-              // a pixel size: on window resize the compositor resizes the offscreen
-              // #screen canvas (RenderCompositorOGL::BeginFrame) so the presented
-              // ImageBitmap is the new window size, and transferFromImageBitmap
-              // updates this canvas's backing to match -- so a viewport-filling CSS
-              // box keeps the displayed frame 1:1 at any size. A fixed px size would
-              // leave the chrome clipped/mispositioned after a resize.
-              o.style.left = '0';
-              o.style.top = '0';
-              o.style.width = '100vw';
-              o.style.height = '100vh';
-              o.style.pointerEvents = 'none';
-              (screen.parentNode || document.body).appendChild(o);
-            }
-            var bctx = o.getContext('bitmaprenderer');
-            w.addEventListener('message', function(e) {
-              if (e.data && e.data.__glpresent && e.data.bmp) {
-                try { bctx.transferFromImageBitmap(e.data.bmp); } catch (err) {}
-              }
-            });
-          },
-          (int)(uintptr_t)pthread_self());
-    }
-    EM_ASM({
-      var gl = GL.currentContext && GL.currentContext.GLctx;
-      if (gl && gl.canvas && gl.canvas.transferToImageBitmap) {
-        var bmp = gl.canvas.transferToImageBitmap();
-        var m = {};
-        m.__glpresent = 1;
-        m.bmp = bmp;
-        self.postMessage(m, [bmp]);
-      }
-    });
+    // This (Renderer) thread owns #screen's transferred OffscreenCanvas, and the
+    // context has explicitSwapControl + no offscreen back buffer, so the browser
+    // implicit-presents it to the #screen placeholder when this thread yields to its
+    // worker event loop. A Gecko thread otherwise runs a blocking loop and never
+    // yields, so yield here via JSPI: gl_present_yield suspends the wasm stack for one
+    // macrotask (the present fires during it), then we resume. No
+    // transferToImageBitmap / postMessage / #glout overlay -- #screen shows the frame.
+    gl_present_yield();
     return true;
   }
 
@@ -285,7 +248,6 @@ class GLContextEmscripten final : public GLContext {
 
   EMSCRIPTEN_WEBGL_CONTEXT_HANDLE mContext;
   bool mPresent;
-  bool mPresentSetup = false;  // one-time #glout bitmaprenderer + worker listener setup
 };
 
 // -- Provider statics --------------------------------------------------------

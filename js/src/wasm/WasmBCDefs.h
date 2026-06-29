@@ -57,6 +57,20 @@
 #include "wasm/WasmStubs.h"
 #include "wasm/WasmValidate.h"
 
+// In a JS_CODEGEN_NONE build (--disable-jit) the rabaldr baseline compiler is
+// dead -- content wasm runs via the in-process interpreter -- but ENABLE_WASM_SIMD
+// stays defined for the interpreter's front-end (decode/validate). The includes
+// above pull in js-config.h, which re-#defines ENABLE_WASM_SIMD, so the dead SIMD
+// codegen in the baseline headers/sources that include this file (e.g.
+// WasmBCRegDefs.h's ScratchV128 -> ScratchSimd128Scope) would reference
+// backend-only ops the none-backend lacks. Drop ENABLE_WASM_SIMD here, after all
+// includes (so the js-config.h include guard keeps it dropped), for every
+// baseline TU. All includers of this header are baseline-codegen-only, so this
+// cannot leak into the SIMD-aware front-end TUs.
+#if defined(JS_CODEGEN_NONE) && defined(ENABLE_WASM_SIMD)
+#  undef ENABLE_WASM_SIMD
+#endif
+
 namespace js {
 namespace wasm {
 

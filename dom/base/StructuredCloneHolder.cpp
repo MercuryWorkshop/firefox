@@ -10,6 +10,7 @@
 #include "MainThreadUtils.h"
 #include "js/CallArgs.h"
 #include "js/Value.h"
+#include "js/WasmInterpClone.h"
 #include "js/WasmModule.h"
 #include "js/Wrapper.h"
 #include "jsapi.h"
@@ -1097,6 +1098,15 @@ JSObject* StructuredCloneHolder::CustomReadHandler(
 
   nsIGlobalObject* nativeGlobal = xpc::NativeGlobal(global);
 
+#if defined(__EMSCRIPTEN__)
+  // In-process wasm interpreter Module/Memory clone (see CustomWriteHandler).
+  // Returns null for tags that are not ours; then dispatch continues below.
+  if (JSObject* interpObj =
+          js::wasm::interp::InterpCloneRead(aCx, aReader, aTag, aIndex)) {
+    return interpObj;
+  }
+#endif
+
   if (aTag == SCTAG_DOM_BLOB) {
     if (!CheckExposedGlobals(aCx, global, sWindowOrWorker)) {
       return nullptr;
@@ -1236,11 +1246,31 @@ JSObject* StructuredCloneHolder::CustomReadHandler(
 bool StructuredCloneHolder::CustomWriteHandler(
     JSContext* aCx, JSStructuredCloneWriter* aWriter,
     JS::Handle<JSObject*> aObj, bool* aSameProcessScopeRequired) {
+#if defined(__EMSCRIPTEN__)
+  if (getenv("GECKO_INTERP_DEBUG")) {
+    fprintf(stderr, "[interp] CustomWrite called supports=%d\n", mSupportsCloning);
+  }
+#endif
   if (!mSupportsCloning) {
     return false;
   }
 
   JS::Rooted<JSObject*> obj(aCx, aObj);
+
+#if defined(__EMSCRIPTEN__)
+  // In-process wasm interpreter Module/Memory (GECKO_WASM_INTERP): serialize the
+  // shared-heap C++ pointer so the inner engine can post wasmModule/wasmMemory to
+  // its pthread workers.
+  {
+    bool handled = false;
+    if (!js::wasm::interp::InterpCloneWrite(aCx, aWriter, obj, &handled)) {
+      return false;
+    }
+    if (handled) {
+      return true;
+    }
+  }
+#endif
 
   // See if this is a File/Blob object.
   {

@@ -594,6 +594,15 @@ void WebSocketImpl::FailConnection(const RefPtr<WebSocketImpl>& aProofOfRef,
     return;
   }
 
+  if (getenv("GECKO_WS_DEBUG")) {
+    fprintf(stderr,
+            "[ws] FAIL uri=%s code=%u reason=%s readyState=%d mainThread=%d\n",
+            mURI.get(), unsigned(aReasonCode),
+            nsCString(aReasonString).get(),
+            mWebSocket ? int(mWebSocket->ReadyState()) : -1,
+            int(NS_IsMainThread()));
+  }
+
   ConsoleError();
   mFailed = true;
   CloseConnection(aProofOfRef, aReasonCode, aReasonString);
@@ -821,6 +830,11 @@ WebSocketImpl::OnStart(nsISupports* aContext) {
   rv = mChannel->GetExtensions(mWebSocket->mEstablishedExtensions);
   MOZ_ASSERT(NS_SUCCEEDED(rv));
   UpdateURI();
+
+  if (getenv("GECKO_WS_DEBUG")) {
+    fprintf(stderr, "[ws] OPEN uri=%s mainThread=%d\n", mURI.get(),
+            int(NS_IsMainThread()));
+  }
 
   mWebSocket->SetReadyState(WebSocket::OPEN);
 

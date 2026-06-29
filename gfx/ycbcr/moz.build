@@ -15,9 +15,10 @@ UNIFIED_SOURCES += [
     'yuv_row_table.cpp',
 ]
 
-if CONFIG['INTEL_ARCHITECTURE']:
+if CONFIG['INTEL_ARCHITECTURE'] or CONFIG['OS_TARGET'] == 'EMSCRIPTEN':
     # These files use MMX and SSE2 intrinsics, so they need special compile flags
-    # on some compilers.
+    # on some compilers. On wasm, -msse2 is mapped to wasm SIMD by emscripten's shim;
+    # MMX has no usable wasm-SIMD mapping, so the MMX file stays x86-only below.
     SOURCES += ['yuv_convert_sse2.cpp']
     SOURCES['yuv_convert_sse2.cpp'].flags += CONFIG['SSE2_FLAGS']
 
@@ -27,7 +28,7 @@ if CONFIG['INTEL_ARCHITECTURE']:
             SOURCES += [
                 'yuv_convert_mmx.cpp',
             ]
-    else:
+    elif CONFIG['OS_TARGET'] != 'EMSCRIPTEN':
         SOURCES += ['yuv_convert_mmx.cpp']
         SOURCES['yuv_convert_mmx.cpp'].flags += CONFIG['MMX_FLAGS']
 

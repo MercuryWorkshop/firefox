@@ -2,6 +2,13 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+// SIMD codegen requires a real assembler backend (x86/x64/arm64). A
+// JS_CODEGEN_NONE build (--disable-jit) has none, and this JS JIT codegen path
+// is dead, so drop ENABLE_WASM_SIMD here to avoid the SIMD-alignment #error.
+#if defined(JS_CODEGEN_NONE) && defined(ENABLE_WASM_SIMD)
+#  undef ENABLE_WASM_SIMD
+#endif
+
 #include "jit/shared/CodeGenerator-shared-inl.h"
 
 #include "mozilla/DebugOnly.h"

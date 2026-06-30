@@ -32,6 +32,7 @@
 #include "vm/JSFunction.h"
 #include "jit/JitScript.h"
 #include "jit/VMFunctions.h"  // CreateThisFromIon
+#include "js/experimental/JitInfo.h"  // JSJitGetterOp, JSJitGetterCallArgs (WJH_GETDOMPROP)
 #include "vm/JSScript.h"
 #include "vm/JSAtomUtils.h"  // js::Atomize
 #include "vm/BytecodeUtil.h"  // js::CodeName
@@ -57,7 +58,10 @@
 #include "builtin/Math.h"     // js::GetUnaryMathFunctionPtr (MMathFunction)
 #include "vm/StringType.h"    // js::ToString, js::EqualStrings
 #include "vm/ObjectOperations.h"  // js::HasProperty, js::HasOwnProperty
-#include "vm/Iteration.h"     // js::ValueToIterator
+#include "vm/Iteration.h"     // js::ValueToIterator, NativeIterator, PropertyIteratorObject
+#include "util/Unicode.h"     // js::unicode::ToLowerCase/ToUpperCase (CharCodeConvertCase)
+#include "vm/Interpreter-inl.h"  // js::CheckPrivateFieldOperation (CheckPrivateFieldCache)
+#include "vm/BoundFunctionObject.h"  // js::BoundFunctionObject::createWithTemplate (NewBoundFunction)
 
 #include "vm/NativeObject-inl.h"
 #include "vm/PlainObject-inl.h"  // createWithShape
@@ -668,8 +672,19 @@ int js::wasm::WasmJitRunCall(JSScript* script, uint64_t thisBits,
     return 0;  // underflow: let the interpreter pad
   }
 
-  for (uint32_t i = 0; i < e.nargs; i++) {
+  // Stage ALL actual args (not just the formal nargs) so the callee's GetFrameArgument
+  // can read args beyond its formal count (e.g. self-hosted IteratorReduce reads
+  // GetArgument(1)=initialValue while its only formal is `reducer`). Staging only
+  // e.nargs left those slots stale -> reduce-with-init double-counted during warmup
+  // (before the caller is JIT'd and uses the all-8-args fast path). Pad the rest with
+  // undefined. Capped at kWJMaxArgs (GetFrameArgument bails for i>=kWJMaxArgs).
+  uint32_t nstage = argc < uint32_t(js::wasm::kWJMaxArgs) ? argc
+                                                          : uint32_t(js::wasm::kWJMaxArgs);
+  for (uint32_t i = 0; i < nstage; i++) {
     gWJScratch[i] = argv[i].asRawBits();
+  }
+  for (uint32_t i = nstage; i < uint32_t(js::wasm::kWJMaxArgs); i++) {
+    gWJScratch[i] = JS::UndefinedValue().asRawBits();
   }
   gWJScratch[js::wasm::kWJThisSlot] = thisBits;
 
@@ -733,6 +748,11 @@ int js::wasm::WasmJitRunCall(JSScript* script, uint64_t thisBits,
   // The function's runtime environment (for MFunctionEnvironment): stash it so the
   // JIT'd code reads the correct closure env at entry (no GC before it reads it).
   gWJCurrentEnv = uint32_t(uintptr_t(static_cast<void*>(envChain)));
+  // Actual arg count for this invocation: the JIT'd code snapshots it at entry for
+  // ArgumentsLength. Set here (the C++ entry trampoline) just like gWJCurrentEnv, so a
+  // top-level / PBL->JIT entry communicates the real argc (the JIT->JIT paths set it
+  // themselves before transferring control).
+  gWJCallArgc = argc;
   if (js::wasm::kWJEHABI) {
     // EHABI trampoline reads the boxed callee from gWJScratch[kWJCalleeSlot] (ABI slot 1).
     // The param is currently unused (Callee/HomeObject still bake the canonical fn); stage
@@ -858,6 +878,27 @@ int js::wasm::WasmJitRunCall(JSScript* script, uint64_t thisBits,
                                   : 0;
         if (tinyBail > 0 && e.recompiles == 0 &&
             script->length() < uint32_t(tinyBail)) {
+          e.state = WJEntry::State::Failed;
+          return valveReturn();
+        }
+      }
+      // Self-hosted builtins that storm: route to PBL instead of force-mega
+      // recompiling. The forceMega recompile of a shape-deopt-dominated self-hosted
+      // builtin (e.g. ObjectOrReflectDefineProperty, called polymorphically across
+      // many object shapes) MISCOMPILES -> wrong result (ubo: defineProperty stops
+      // setting hntrieContainer once IsCallable lets it compile). Self-hosted builtins
+      // are NOT the crypto bignum loops (those are user JS), so PBL-routing them does
+      // not regress crypto; they run correctly + fast enough in PBL. This un-blocks
+      // enabling IsCallable. GECKO_WJ_SHPBL gates it (test); off = old forceMega.
+      {
+        // DEFAULT-ON 2026-06-30 (GECKO_WJ_NOSHPBL reverts): the forceMega recompile of a
+        // shape-deopt-dominated self-hosted builtin miscompiles (ObjectOrReflectDefineProperty
+        // -> ubo hntrieContainer undefined once IsCallable lets it compile). Routing self-hosted
+        // storming fns to PBL is sound (PBL is the reference; can only affect perf) and does NOT
+        // regress crypto (its bignum loops are user JS, still force-mega). Un-blocks IsCallable.
+        static int shPbl = getenv("GECKO_WJ_NOSHPBL") ? 0 : 1;
+        if (shPbl && script->function() &&
+            script->function()->isSelfHostedOrIntrinsic()) {
           e.state = WJEntry::State::Failed;
           return valveReturn();
         }
@@ -2476,6 +2517,227 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
     int32_t base = JS::Value::fromRawBits(gWJScratch[1]).toInt32();
     bool lower = int(siteF) != 0;
     JSLinearString* s = js::Int32ToStringWithBase<js::CanGC>(cx, n, base, lower);
+    if (!s) return 1.0;
+    gWJScratch[js::wasm::kWJResultSlot] = JS::StringValue(s).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_ITEREND) {
+    // MIteratorEnd: for-in loop cleanup -- unlink the NativeIterator. Non-throwing
+    // (no user return() for property iterators). scratch[0] = iterator object.
+    js::CloseIterator(&JS::Value::fromRawBits(gWJScratch[0]).toObject());
+    gWJScratch[js::wasm::kWJResultSlot] = JS::UndefinedValue().asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_NEWBOUNDFN) {
+    // MNewBoundFunction: allocate a bound function from the template. scratch[0]=template.
+    JS::Rooted<js::BoundFunctionObject*> tmpl(
+        cx, &JS::Value::fromRawBits(gWJScratch[0]).toObject().as<js::BoundFunctionObject>());
+    JSObject* bf = js::BoundFunctionObject::createWithTemplate(cx, tmpl);
+    if (!bf) return 1.0;
+    gWJScratch[js::wasm::kWJResultSlot] = JS::ObjectValue(*bf).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_BINDFUNCTION) {
+    // MBindFunction: Function.prototype.bind. scratch[0]=target, scratch[1..argc]=bound
+    // args (args[0]=boundThis), site=argc. Copy the args into a rooted vector (functionBindImpl
+    // allocs -> can GC; gWJScratch is not traced) and call with maybeBound=null (C++ allocs).
+    uint32_t argc = (uint32_t)siteF;
+    JS::RootedObject target(cx, &JS::Value::fromRawBits(gWJScratch[0]).toObject());
+    JS::RootedValueVector av(cx);
+    if (!av.reserve(argc)) return 1.0;
+    for (uint32_t i = 0; i < argc; i++) {
+      av.infallibleAppend(JS::Value::fromRawBits(gWJScratch[1 + i]));
+    }
+    JS::Rooted<js::BoundFunctionObject*> maybeBound(cx, nullptr);
+    js::BoundFunctionObject* bf =
+        js::BoundFunctionObject::functionBindImpl(cx, target, av.begin(), argc, maybeBound);
+    if (!bf) return 1.0;
+    gWJScratch[js::wasm::kWJResultSlot] = JS::ObjectValue(*bf).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_LOADITERELEM) {
+    // MLoadIteratorElement: the index-th iterated key string from the NativeIterator's
+    // property array (Object.keys(o)[i]). scratch[0]=iterator, scratch[1]=index(Int32).
+    // Pure read; index in-bounds by the ObjectKeysReplacer invariant. .asString() strips
+    // the DeletedBit. No GC/throw.
+    js::NativeIterator* ni = JS::Value::fromRawBits(gWJScratch[0])
+                                 .toObject()
+                                 .as<js::PropertyIteratorObject>()
+                                 .getNativeIterator();
+    int32_t index = JS::Value::fromRawBits(gWJScratch[1]).toInt32();
+    JSLinearString* str = ni->propertiesBegin()[index].asString();
+    gWJScratch[js::wasm::kWJResultSlot] = JS::StringValue(str).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_GETDOMPROP) {
+    // MGetDOMProperty: invoke the DOM getter (replicates js::jit::CallDOMGetter). scratch[0]=
+    // the (guarded) DOM object, scratch[1]=baked JSJitGetterOp (fn-table index). Load
+    // DOM_OBJECT_SLOT (reserved slot 0, the native this as a PrivateValue) and call the getter.
+    // May GC/throw.
+    JS::RootedObject obj(cx, &JS::Value::fromRawBits(gWJScratch[0]).toObject());
+    JSJitGetterOp getter =
+        reinterpret_cast<JSJitGetterOp>(uintptr_t(gWJScratch[1]));
+    JS::Value slotVal = obj->as<js::NativeObject>().getReservedSlot(0);
+    JS::RootedValue result(cx);
+    if (!getter(cx, obj, slotVal.toPrivate(), JSJitGetterCallArgs(&result))) return 1.0;
+    gWJScratch[js::wasm::kWJResultSlot] = result.get().asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_CHECKPRIVFIELD) {
+    // MCheckPrivateFieldCache: `#x in obj` / `obj.#x` brand check. scratch[0]=value,
+    // [1]=idval(private-name Symbol), [2]=bytecode pc (the ThrowCondition source).
+    jsbytecode* pc = reinterpret_cast<jsbytecode*>(uintptr_t(uint32_t(gWJScratch[2])));
+    JS::RootedValue val(cx, JS::Value::fromRawBits(gWJScratch[0]));
+    JS::RootedValue idval(cx, JS::Value::fromRawBits(gWJScratch[1]));
+    if (getenv("GECKO_WJ_CPFCDBG")) {
+      fprintf(stderr, "[cpfcdbg] val.isObj=%d idval.isSym=%d idval.isPrivName=%d op=%d\n",
+              val.isObject(), idval.isSymbol(),
+              idval.isSymbol() && idval.toSymbol()->isPrivateName(), int(*pc));
+    }
+    bool result = false;
+    if (!js::CheckPrivateFieldOperation(cx, pc, val, idval, &result)) return 1.0;
+    gWJScratch[js::wasm::kWJResultSlot] = JS::BooleanValue(result).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_APPLYARRAY) {
+    // MApplyArray: fn.apply(thisArg, argsArray) -- spread the array's dense elements.
+    // scratch[0]=callee, [1]=thisArg, [2]=argsArray(Object). Copy the elements into a
+    // rooted vector (before JS::Call can GC), then JS::Call.
+    JS::RootedValue callee(cx, JS::Value::fromRawBits(gWJScratch[0]));
+    JS::RootedValue thisv(cx, JS::Value::fromRawBits(gWJScratch[1]));
+    JS::RootedObject arrObj(cx, &JS::Value::fromRawBits(gWJScratch[2]).toObject());
+    uint32_t len = arrObj->as<js::NativeObject>().getDenseInitializedLength();
+    JS::RootedValueVector av(cx);
+    if (!av.reserve(len)) return 1.0;  // may GC; arrObj is rooted (re-deref below)
+    {
+      js::NativeObject& arr = arrObj->as<js::NativeObject>();
+      for (uint32_t i = 0; i < len; i++) av.infallibleAppend(arr.getDenseElement(i));
+    }
+    JS::RootedValue rv(cx);
+    if (!JS::Call(cx, thisv, callee, JS::HandleValueArray(av), &rv)) return 1.0;
+    gWJScratch[js::wasm::kWJResultSlot] = rv.get().asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_GFADBG) {
+    uint64_t v = gWJScratch[0];  // the param[i] value the JIT read
+    JS::Value val = JS::Value::fromRawBits(v);
+    // also peek the caller-staged slots: gWJScratch[10..] are free scratch we don't clobber;
+    // print gWJCallArgc + the boxed callee to see argc and which entry path. (gWJScratch[0]
+    // was just overwritten with the param value, so read argc/callee globals instead.)
+    JS::Value cal = JS::Value::fromRawBits(gWJCallCallee);
+    fprintf(stderr, "[gfadbg] i=%d param.int=%d (bits=%llx isInt=%d isObj=%d) gWJCallArgc=%u calleeIsFn=%d\n",
+            int(siteF), val.isInt32() ? val.toInt32() : -99999, (unsigned long long)v,
+            val.isInt32(), val.isObject(), gWJCallArgc,
+            cal.isObject() && cal.toObject().is<JSFunction>());
+    gWJScratch[js::wasm::kWJResultSlot] = v;
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_LOADSLOTBYITER) {
+    // MLoadSlotByIteratorIndex: load object's slot/element at the iterator's CURRENT
+    // PropertyIndex. The cursor was pre-incremented by nextIteratedValueAndAdvance, so
+    // the current property is at cursor-1. indicesBegin() = the PropertyIndex array.
+    js::NativeObject* nobj =
+        &JS::Value::fromRawBits(gWJScratch[0]).toObject().as<js::NativeObject>();
+    js::NativeIterator* ni = JS::Value::fromRawBits(gWJScratch[1])
+                                 .toObject()
+                                 .as<js::PropertyIteratorObject>()
+                                 .getNativeIterator();
+    uint32_t cursor = *reinterpret_cast<const uint32_t*>(
+        reinterpret_cast<const char*>(ni) +
+        js::NativeIterator::offsetOfPropertyCursor());
+    js::PropertyIndex pi = ni->indicesBegin()[cursor - 1];
+    JS::Value result;
+    switch (pi.kind()) {
+      case js::PropertyIndex::Kind::FixedSlot:
+        result = nobj->getFixedSlot(pi.index());
+        break;
+      case js::PropertyIndex::Kind::DynamicSlot:
+        result = nobj->getSlot(nobj->numFixedSlots() + pi.index());
+        break;
+      case js::PropertyIndex::Kind::Element:
+        result = nobj->getDenseElement(pi.index());
+        break;
+      default:
+        result = JS::UndefinedValue();
+        break;
+    }
+    gWJScratch[js::wasm::kWJResultSlot] = result.asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_ITERHASINDICES) {
+    // MIteratorHasIndices: indices available + object shape matches iterator's stored shape.
+    JSObject* obj = &JS::Value::fromRawBits(gWJScratch[0]).toObject();
+    js::NativeIterator* ni = JS::Value::fromRawBits(gWJScratch[1])
+                                 .toObject()
+                                 .as<js::PropertyIteratorObject>()
+                                 .getNativeIterator();
+    uint8_t flags = *(reinterpret_cast<const uint8_t*>(ni) +
+                      js::NativeIterator::offsetOfFlags());
+    bool r = (flags & js::NativeIterator::Flags::IndicesAvailable) &&
+             (obj->shape() == ni->objShape());
+    gWJScratch[js::wasm::kWJResultSlot] = JS::BooleanValue(r).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_ITERLENGTH) {
+    // MIteratorLength: NativeIterator ownPropertyCount (the count of own enumerable keys).
+    js::NativeIterator* ni = JS::Value::fromRawBits(gWJScratch[0])
+                                 .toObject()
+                                 .as<js::PropertyIteratorObject>()
+                                 .getNativeIterator();
+    uint32_t len = *reinterpret_cast<const uint32_t*>(
+        reinterpret_cast<const char*>(ni) +
+        js::NativeIterator::offsetOfOwnPropertyCount());
+    gWJScratch[js::wasm::kWJResultSlot] = JS::Int32Value(int32_t(len)).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_GETITER) {
+    // MGetIteratorCache: for-in iterator setup (JSOp::Iter). scratch[0] = value.
+    JS::RootedValue v(cx, JS::Value::fromRawBits(gWJScratch[0]));
+    JSObject* iter = js::ValueToIterator(cx, v);
+    if (!iter) return 1.0;
+    gWJScratch[js::wasm::kWJResultSlot] = JS::ObjectValue(*iter).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_ITERMORE) {
+    // MIteratorMore: next for-in key (String) or MagicValue(JS_NO_ITER_VALUE) when
+    // exhausted. NativeIterator cursor walk; no GC/throw.
+    js::NativeIterator* ni = JS::Value::fromRawBits(gWJScratch[0])
+                                 .toObject()
+                                 .as<js::PropertyIteratorObject>()
+                                 .getNativeIterator();
+    gWJScratch[js::wasm::kWJResultSlot] =
+        ni->nextIteratedValueAndAdvance().asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_OBJKEYSITER) {
+    // MObjectKeysFromIterator: Object.keys fast path from an already-built iterator.
+    JS::RootedObject it(cx, &JS::Value::fromRawBits(gWJScratch[0]).toObject());
+    JSObject* keys = js::jit::ObjectKeysFromIterator(cx, it);
+    if (!keys) return 1.0;
+    gWJScratch[js::wasm::kWJResultSlot] = JS::ObjectValue(*keys).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_CHARCASE) {
+    // MCharCodeConvertCase: single-char unicode case fold (1:1). site=0 lower/1 upper.
+    int32_t code = JS::Value::fromRawBits(gWJScratch[0]).toInt32();
+    char16_t ch = char16_t(uint16_t(code));
+    char16_t out = int(siteF) ? js::unicode::ToUpperCase(ch) : js::unicode::ToLowerCase(ch);
+    JSString* s = js::StringFromCharCode(cx, int32_t(out));
     if (!s) return 1.0;
     gWJScratch[js::wasm::kWJResultSlot] = JS::StringValue(s).asRawBits();
     return 0.0;

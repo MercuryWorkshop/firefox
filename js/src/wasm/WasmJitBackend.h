@@ -134,6 +134,21 @@ enum WJHelpKind : int {
   WJH_OVERRECURSED = 71,     // (no operands) sets the pending too-much-recursion exception (js::ReportOverRecursed); the JIT recursion guard calls this then propagates via EmitExceptionExit (CATCHABLE, like PBL)
   WJH_TYPEDARRELEMSIZE = 72, // scratch[0]=typedArray(Object Value) -> Int32 bytesPerElement (1/2/4/8); MTypedArrayElementSize (cold)
   WJH_TONUMBERINT32 = 73,    // scratch[0]=input(boxed Value) -> Int32 (JS::ToInt32 = ToNumber->ToInt32); MToNumberInt32; return 1.0 on throw
+  WJH_ITEREND = 74,          // scratch[0]=iterator(Object Value), effect -> js::CloseIterator (for-in NativeIterator unlink); MIteratorEnd
+  WJH_GETITER = 75,          // scratch[0]=value(boxed) -> js::ValueToIterator -> PropertyIteratorObject (Object); MGetIteratorCache (for-in setup, JSOp::Iter); GC+throw
+  WJH_ITERMORE = 76,         // scratch[0]=iterator(Object) -> NativeIterator::nextIteratedValueAndAdvance -> next key (String) or MagicValue(JS_NO_ITER_VALUE); MIteratorMore; no GC/throw
+  WJH_OBJKEYSITER = 77,      // scratch[0]=iterator(Object) -> js::ObjectKeysFromIterator -> array of own keys (Object); MObjectKeysFromIterator; GC+throw
+  WJH_CHARCASE = 78,         // scratch[0]=code(boxed Int32), site=case(0 lower/1 upper) -> 1-char String (unicode case-fold); MCharCodeConvertCase; GC(alloc)
+  WJH_APPLYARRAY = 79,       // scratch[0]=callee(Value),[1]=thisArg(Value),[2]=argsArray(Object) -> JS::Call spreading the array's dense elements -> result Value; MApplyArray (fn.apply); GC+throw
+  WJH_CHECKPRIVFIELD = 80,   // scratch[0]=value(Value),[1]=idval(private-name Symbol),[2]=bytecode pc(i32) -> js::CheckPrivateFieldOperation -> Boolean; MCheckPrivateFieldCache (#x in obj / obj.#x brand check); GC+throw
+  WJH_NEWBOUNDFN = 81,       // scratch[0]=template(BoundFunctionObject) -> js::BoundFunctionObject::createWithTemplate -> Object; MNewBoundFunction (fn.bind fast path); GC(alloc)
+  WJH_ITERLENGTH = 82,       // scratch[0]=iterator(PropertyIteratorObject) -> NativeIterator ownPropertyCount (Int32); MIteratorLength; no GC/throw
+  WJH_GFADBG = 83,           // DEBUG (GECKO_WJ_GFADBG): scratch[0]=param[i] value, site=i -> prints the decoded value, returns it; diagnoses the GetFrameArgument-beyond-formals stale-param bug
+  WJH_ITERHASINDICES = 84,   // scratch[0]=object,[1]=iterator -> Boolean (NativeIterator IndicesAvailable flag && object shape matches iter's stored objShape); MIteratorHasIndices; no GC/throw
+  WJH_LOADSLOTBYITER = 85,   // scratch[0]=object(NativeObject),[1]=iterator -> Value at the iterator's current PropertyIndex (for-in obj[key] fast read); MLoadSlotByIteratorIndex; no GC/throw
+  WJH_BINDFUNCTION = 86,     // scratch[0]=target(Object),[1..argc]=bound args (args[0]=boundThis), site=argc -> BoundFunctionObject::functionBindImpl -> Object; MBindFunction (fn.bind); GC(alloc)+throw
+  WJH_LOADITERELEM = 87,     // scratch[0]=iterator(PropertyIteratorObject),[1]=index(Int32) -> NativeIterator propertiesBegin()[index].asString() (String); MLoadIteratorElement (Object.keys(o)[i] ScalarReplacement); no GC/throw
+  WJH_GETDOMPROP = 88,       // scratch[0]=DOM object(guarded),[1]=JSJitInfo*(baked i32 ptr) -> js::jit::CallDOMGetter -> Value; MGetDOMProperty (DOM getter JSJitGetterOp ABI); GC+throw
 };
 // MNewLexicalEnvironmentObject: the LexicalScope* baked from the template object.
 extern uint32_t gWJLexScope;

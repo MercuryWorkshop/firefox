@@ -407,6 +407,11 @@ class WebRenderBridgeParent final : public PWebRenderBridgeParent,
                        wr::TransactionBuilder& aUpdates);
   bool AddSharedExternalImage(wr::ExternalImageId aExtId, wr::ImageKey aKey,
                               wr::TransactionBuilder& aResources);
+#ifdef __EMSCRIPTEN__
+  bool AddHostGpuExternalImage(wr::ExternalImageId aExtId, wr::ImageKey aKey,
+                               const wr::ImageDescriptor& aDescriptor,
+                               wr::TransactionBuilder& aResources);
+#endif
   bool UpdateSharedExternalImage(
       wr::ExternalImageId aExtId, wr::ImageKey aKey,
       const ImageIntRect& aDirtyRect, wr::TransactionBuilder& aResources,

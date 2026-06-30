@@ -54,6 +54,9 @@
 #include "mozilla/TimeStamp.h"
 #include "mozilla/webrender/RenderTextureHostSWGL.h"
 #include "mozilla/webrender/RenderThread.h"
+#ifdef __EMSCRIPTEN__
+#  include "mozilla/webrender/RenderHostGpuTextureHost.h"
+#endif
 #include "mozilla/widget/CompositorWidget.h"
 
 #ifdef XP_WIN
@@ -912,6 +915,16 @@ bool WebRenderBridgeParent::UpdateResources(
         }
         break;
       }
+#ifdef __EMSCRIPTEN__
+      case OpUpdateResource::TOpAddHostGpuExternalImage: {
+        const auto& op = cmd.get_OpAddHostGpuExternalImage();
+        if (!AddHostGpuExternalImage(op.externalImageId(), op.key(),
+                                     op.descriptor(), aUpdates)) {
+          success = false;
+        }
+        break;
+      }
+#endif
       case OpUpdateResource::TOpPushExternalImageForTexture: {
         const auto& op = cmd.get_OpPushExternalImageForTexture();
         CompositableTextureHostRef texture;
@@ -1035,6 +1048,27 @@ bool WebRenderBridgeParent::UpdateResources(
   MOZ_ASSERT(success);
   return success;
 }
+
+#ifdef __EMSCRIPTEN__
+bool WebRenderBridgeParent::AddHostGpuExternalImage(
+    wr::ExternalImageId aExtId, wr::ImageKey aKey,
+    const wr::ImageDescriptor& aDescriptor, wr::TransactionBuilder& aResources) {
+  if (!MatchesNamespace(aKey)) {
+    MOZ_ASSERT_UNREACHABLE("Stale host-gpu external image key!");
+    return true;
+  }
+  gfx::IntSize size(aDescriptor.width, aDescriptor.height);
+  // The texture is uploaded + owned host-side (RenderHostGpuTextureHost::Lock
+  // fetches it from the Renderer-thread GL.textures table by external id).
+  wr::RenderThread::Get()->RegisterExternalImage(
+      aExtId,
+      MakeAndAddRef<wr::RenderHostGpuTextureHost>(wr::AsUint64(aExtId), size));
+  auto imageType =
+      wr::ExternalImageType::TextureHandle(wr::ImageBufferKind::Texture2D);
+  aResources.AddExternalImage(aKey, aDescriptor, aExtId, imageType, 0);
+  return true;
+}
+#endif
 
 bool WebRenderBridgeParent::AddSharedExternalImage(
     wr::ExternalImageId aExtId, wr::ImageKey aKey,

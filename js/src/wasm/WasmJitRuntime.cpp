@@ -50,7 +50,11 @@
 #include "builtin/Array.h"    // js::SetLengthProperty, IsArrayFromJit
 #include "vm/RegExpObject.h"  // js::CloneRegExpObject (MRegExp)
 #include "builtin/String.h"   // js::StringFromCharCode
+#include "builtin/RegExp.h"   // js::RegExpHasCaptureGroups
+#include "vm/TypedArrayObject.h"  // js::NewTypedArrayWithTemplateAndLength
+#include "js/Conversions.h"    // JS::ToInt32
 #include "builtin/Number.h"   // js::NumberParseInt
+#include "builtin/Math.h"     // js::GetUnaryMathFunctionPtr (MMathFunction)
 #include "vm/StringType.h"    // js::ToString, js::EqualStrings
 #include "vm/ObjectOperations.h"  // js::HasProperty, js::HasOwnProperty
 #include "vm/Iteration.h"     // js::ValueToIterator
@@ -2291,6 +2295,192 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
     return 0.0;
   }
 
+  if (kind == js::wasm::WJH_MATHFN) {
+    // MMathFunction: x = scratch[0] (numeric), site = UnaryMathFunction id. Calls the
+    // exact fdlibm/native fn Ion uses (sin/cos/tan/log/exp/acos/.../floor/ceil/round).
+    double x = JS::Value::fromRawBits(gWJScratch[0]).toNumber();
+    js::UnaryMathFunctionType fp =
+        js::GetUnaryMathFunctionPtr(js::UnaryMathFunction(int(siteF)));
+    gWJScratch[js::wasm::kWJResultSlot] = JS::DoubleValue(fp(x)).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_NEWARRDYN) {
+    // MNewArrayDynamicLength: new Array(length) with the baked template's shape.
+    // ArrayConstructorOneArg throws RangeError on a negative/too-large length, which
+    // matches the op's negative-length guard. scratch[0]=length, scratch[1]=template.
+    int32_t len = JS::Value::fromRawBits(gWJScratch[0]).toInt32();
+    JS::Rooted<js::ArrayObject*> tmpl(
+        cx, &JS::Value::fromRawBits(gWJScratch[1]).toObject().as<js::ArrayObject>());
+    js::ArrayObject* arr = js::ArrayConstructorOneArg(cx, tmpl, len, nullptr);
+    if (!arr) return 1.0;
+    gWJScratch[js::wasm::kWJResultSlot] = JS::ObjectValue(*arr).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_OVERRECURSED) {
+    // JIT recursion guard tripped: set the SAME catchable over-recursion exception
+    // PBL throws via its native-stack quota. The emitted code follows this with an
+    // exception-exit so it propagates (catchable) instead of overflowing V8 uncatchably.
+    js::ReportOverRecursed(cx);
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_TONUMBERINT32) {
+    // MToNumberInt32: ToInt32(ToNumber(input)). Full semantics via JS::ToInt32.
+    JS::RootedValue v(cx, JS::Value::fromRawBits(gWJScratch[0]));
+    int32_t i;
+    if (!JS::ToInt32(cx, v, &i)) return 1.0;  // threw (e.g. valueOf) -> propagate
+    gWJScratch[js::wasm::kWJResultSlot] = JS::Int32Value(i).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_TYPEDARRELEMSIZE) {
+    // MTypedArrayElementSize: bytesPerElement (1/2/4/8) of the typed array.
+    js::TypedArrayObject& ta =
+        JS::Value::fromRawBits(gWJScratch[0]).toObject().as<js::TypedArrayObject>();
+    gWJScratch[js::wasm::kWJResultSlot] =
+        JS::Int32Value(int32_t(ta.bytesPerElement())).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_NEWTYPEDARRDYN) {
+    // MNewTypedArrayDynamicLength: new TypedArray(length) with the baked template.
+    int32_t len = JS::Value::fromRawBits(gWJScratch[0]).toInt32();
+    JS::RootedObject tmpl(cx, &JS::Value::fromRawBits(gWJScratch[1]).toObject());
+    js::TypedArrayObject* ta =
+        js::NewTypedArrayWithTemplateAndLength(cx, tmpl, len);
+    if (!ta) return 1.0;
+    gWJScratch[js::wasm::kWJResultSlot] = JS::ObjectValue(*ta).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_REGEXPHASCAPS) {
+    // MRegExpHasCaptureGroups: re.hasCaptureGroups for `input`.
+    JS::Rooted<js::RegExpObject*> re(
+        cx, &JS::Value::fromRawBits(gWJScratch[0]).toObject().as<js::RegExpObject>());
+    JS::RootedString input(cx, JS::Value::fromRawBits(gWJScratch[1]).toString());
+    bool res;
+    if (!js::RegExpHasCaptureGroups(cx, re, input, &res)) return 1.0;
+    gWJScratch[js::wasm::kWJResultSlot] = JS::BooleanValue(res).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_DELPROP) {
+    // MDeleteProperty: delete obj.name. site = strict. name baked as StringValue (atom).
+    JS::RootedValue val(cx, JS::Value::fromRawBits(gWJScratch[0]));
+    JSString* s = JS::Value::fromRawBits(gWJScratch[1]).toString();
+    JS::Rooted<js::PropertyName*> name(cx, s->asAtom().asPropertyName());
+    bool res;
+    bool ok = int(siteF) ? js::DelPropOperation<true>(cx, val, name, &res)
+                         : js::DelPropOperation<false>(cx, val, name, &res);
+    if (!ok) return 1.0;
+    gWJScratch[js::wasm::kWJResultSlot] = JS::BooleanValue(res).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_RANDOM) {
+    // MRandom: Math.random() -> [0,1) from the realm's XorShift128+ RNG.
+    double d = cx->realm()->getOrCreateRandomNumberGenerator().nextDouble();
+    gWJScratch[js::wasm::kWJResultSlot] = JS::DoubleValue(d).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_ISCONSTRUCTOR) {
+    // MIsConstructor: is obj a constructor? Leaf (no GC).
+    JSObject* o = &JS::Value::fromRawBits(gWJScratch[0]).toObject();
+    gWJScratch[js::wasm::kWJResultSlot] =
+        JS::BooleanValue(js::jit::ObjectIsConstructor(o)).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_OBJECTKEYS) {
+    // MObjectKeys: Object.keys(obj) -> fresh array of own enumerable string keys.
+    JS::RootedObject obj(cx, &JS::Value::fromRawBits(gWJScratch[0]).toObject());
+    JSObject* keys = js::jit::ObjectKeys(cx, obj);
+    if (!keys) return 1.0;
+    gWJScratch[js::wasm::kWJResultSlot] = JS::ObjectValue(*keys).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_DELELEM) {
+    // MDeleteElement: delete obj[index]. site = strict.
+    JS::RootedValue val(cx, JS::Value::fromRawBits(gWJScratch[0]));
+    JS::RootedValue idx(cx, JS::Value::fromRawBits(gWJScratch[1]));
+    bool res;
+    bool ok = int(siteF) ? js::DelElemOperation<true>(cx, val, idx, &res)
+                         : js::DelElemOperation<false>(cx, val, idx, &res);
+    if (!ok) return 1.0;
+    gWJScratch[js::wasm::kWJResultSlot] = JS::BooleanValue(res).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_STRINGREPLACE) {
+    // MStringReplace: str.replace(pattern, repl). site = isFlatReplacement.
+    JS::RootedString s(cx, JS::Value::fromRawBits(gWJScratch[0]).toString());
+    JS::RootedString pat(cx, JS::Value::fromRawBits(gWJScratch[1]).toString());
+    JS::RootedString rep(cx, JS::Value::fromRawBits(gWJScratch[2]).toString());
+    JSString* out = int(siteF) ? js::StringFlatReplaceString(cx, s, pat, rep)
+                               : js::jit::StringReplace(cx, s, pat, rep);
+    if (!out) return 1.0;
+    gWJScratch[js::wasm::kWJResultSlot] = JS::StringValue(out).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_STRINGSPLIT) {
+    // MStringSplit: str.split(sep). Fresh array, limit = INT32_MAX.
+    JS::RootedString s(cx, JS::Value::fromRawBits(gWJScratch[0]).toString());
+    JS::RootedString sep(cx, JS::Value::fromRawBits(gWJScratch[1]).toString());
+    js::ArrayObject* arr = js::StringSplitString(cx, s, sep, INT32_MAX);
+    if (!arr) return 1.0;
+    gWJScratch[js::wasm::kWJResultSlot] = JS::ObjectValue(*arr).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_STRINGTONUMBER) {
+    // MGuardStringTo{Int32,Double}: speculation guard string -> number. site 0 =
+    // exact int32 (jit::GetInt32FromStringPure); site 1 = double (StringToNumberPure).
+    // Both pure (no GC). Parse-fail => return 1.0 (deopt to PBL), matching the guard.
+    JSString* str = JS::Value::fromRawBits(gWJScratch[0]).toString();
+    if (int(siteF) == 0) {
+      int32_t i;
+      if (!js::jit::GetInt32FromStringPure(cx, str, &i)) return 1.0;
+      gWJScratch[js::wasm::kWJResultSlot] = JS::Int32Value(i).asRawBits();
+    } else {
+      double d;
+      if (!js::StringToNumberPure(cx, str, &d)) return 1.0;
+      gWJScratch[js::wasm::kWJResultSlot] = JS::DoubleValue(d).asRawBits();
+    }
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_STRINGTRIMINDEX) {
+    // MStringTrim{Start,End}Index: trim() boundary scan. Leaf (AutoUnsafeCallWithABI,
+    // no GC/cx). site 0 = start; site 1 = end (scratch[1]=start offset).
+    JSString* str = JS::Value::fromRawBits(gWJScratch[0]).toString();
+    int32_t idx;
+    if (int(siteF) == 0) {
+      idx = js::jit::StringTrimStartIndex(str);
+    } else {
+      int32_t start = JS::Value::fromRawBits(gWJScratch[1]).toInt32();
+      idx = js::jit::StringTrimEndIndex(str, start);
+    }
+    gWJScratch[js::wasm::kWJResultSlot] = JS::Int32Value(idx).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_INT32TOSTRINGBASE) {
+    // MInt32ToStringWithBase: n.toString(base). scratch[0]=n (Int32 Value),
+    // scratch[1]=base (Int32 Value), site=lowerCase. Cold/uninlinable.
+    int32_t n = JS::Value::fromRawBits(gWJScratch[0]).toInt32();
+    int32_t base = JS::Value::fromRawBits(gWJScratch[1]).toInt32();
+    bool lower = int(siteF) != 0;
+    JSLinearString* s = js::Int32ToStringWithBase<js::CanGC>(cx, n, base, lower);
+    if (!s) return 1.0;
+    gWJScratch[js::wasm::kWJResultSlot] = JS::StringValue(s).asRawBits();
+    return 0.0;
+  }
+
   if (kind == js::wasm::WJH_CLOSEITER) {
     // MCloseIterCache: for-of early-exit cleanup -- call iter's return() if present.
     // site = CompletionKind (0 Normal / 1 Throw / 2 Return).
@@ -2694,18 +2884,33 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
     uint32_t len = arr->as<js::ArrayObject>().length();
     RootedValue res(cx, JS::UndefinedValue());
     if (len != 0) {
-      uint32_t removeIdx = (int(siteF) == 0) ? (len - 1) : 0;
-      RootedValue idxv(cx, JS::NumberValue(double(removeIdx)));
-      if (!js::GetObjectElementOperation(cx, JSOp::GetElem, arr, objv, idxv,
-                                         &res)) {
-        return 1.0;
-      }
-      // pop: just truncate length. shift: delegate to the generic path below by
-      // bailing (rare in the hot path) -- pop is the common dense case.
-      if (int(siteF) == 0) {
-        if (!js::SetLengthProperty(cx, arr, len - 1)) return 1.0;
+      if (int(siteF) == 1) {
+        // shift: remove element 0. Fast path for PACKED dense arrays (the common
+        // case -- marked's inlineQueue, etc.) via the exported element-move helper.
+        // This previously ALWAYS deopted to PBL (return 1.0); but a JIT'd fn with a
+        // hot shift then deopts on EVERY call, and repeatedly resuming the
+        // ArrayPopShift op TRAPS (marked.parse: uncatchable crash after warmup --
+        // a single `queue.shift()` reproduces it). Doing the shift here keeps it in
+        // JIT and avoids the resume entirely. ArrayShiftMoveElements moves the dense
+        // elements down and setLengthToInitializedLength() (= len-1 for a packed
+        // array); a packed array's element 0 is never a hole.
+        js::ArrayObject* aobj = &arr->as<js::ArrayObject>();
+        if (js::IsPackedArray(aobj) && aobj->isExtensible() &&
+            aobj->lengthIsWritable() &&
+            !aobj->denseElementsHaveMaybeInIterationFlag()) {
+          res = aobj->getDenseElement(0);
+          js::ArrayShiftMoveElements(aobj);
+        } else {
+          return 1.0;  // non-packed/sparse/frozen shift: deopt to PBL (rare)
+        }
       } else {
-        return 1.0;  // shift: element-move not inlined; deopt to PBL
+        // pop: read last element, truncate length.
+        RootedValue idxv(cx, JS::NumberValue(double(len - 1)));
+        if (!js::GetObjectElementOperation(cx, JSOp::GetElem, arr, objv, idxv,
+                                           &res)) {
+          return 1.0;
+        }
+        if (!js::SetLengthProperty(cx, arr, len - 1)) return 1.0;
       }
     }
     gWJScratch[js::wasm::kWJResultSlot] = res.asRawBits();
@@ -3179,6 +3384,13 @@ namespace js {
 namespace wasm {
 alignas(8) uint64_t gWJCallRoots[kWJCallRootsSize];
 uint32_t gWJRootSP = 0;
+// JIT call-recursion depth. JIT'd wasm frames don't move the shadow stack that
+// SpiderMonkey's native-stack quota watches, so deep JIT->JIT recursion silently
+// overflows V8's wasm execution stack (uncatchable RangeError) instead of throwing.
+// Each JIT fn bumps this at entry and, past the limit, deopts to PBL (whose deep C++
+// frames DO trip the real quota -> catchable "too much recursion"). Self-correcting:
+// each frame RESTORES it to the entry value at exit, so cold/leaked paths re-balance.
+int32_t gWJJitDepth = 0;
 }  // namespace wasm
 }  // namespace js
 

@@ -117,6 +117,23 @@ enum WJHelpKind : int {
   WJH_HOMEPROTO = 54,        // scratch[0]=homeObject(Object) -> its [[Prototype]] (Object); MHomeObjectSuperBase
   WJH_SETARRLEN = 55,        // scratch[0]=array(Object),[1]=rhs(Value), site=strict -> SetArrayLength; MCallSetArrayLength
   WJH_INSHAPELIST = 56,      // scratch[0]=obj(Object),[1]=shapeList(Object) -> Boolean (obj->shape() in the list); MGuardMultipleShapes
+  WJH_MATHFN = 57,           // scratch[0]=x(Value/number), site=UnaryMathFunction -> Double; MMathFunction (sin/cos/tan/log/exp/...)
+  WJH_NEWARRDYN = 58,        // scratch[0]=length(Int32),[1]=templateObject(ArrayObject Value) -> Array; MNewArrayDynamicLength
+  WJH_INT32TOSTRINGBASE = 59,// scratch[0]=input(Int32 Value),[1]=base(Int32 Value), site=lowerCase -> String; MInt32ToStringWithBase (n.toString(base); cold/uninlinable: digit conv + string alloc)
+  WJH_STRINGTRIMINDEX = 60,  // scratch[0]=str(String Value), site 0=start: jit::StringTrimStartIndex; site 1=end: scratch[1]=start(Int32), jit::StringTrimEndIndex -> Int32 (leaf, no GC); MStringTrim{Start,End}Index
+  WJH_STRINGTONUMBER = 61,   // scratch[0]=str(String Value); site 0: GetInt32FromStringPure -> Int32; site 1: StringToNumberPure -> Double; return 1.0 (deopt) on parse-fail; MGuardStringTo{Int32,Double} (pure, no GC)
+  WJH_STRINGREPLACE = 62,    // scratch[0]=string,[1]=pattern,[2]=replacement (all String Values), site=isFlatReplacement -> String; MStringReplace (jit::StringReplace / StringFlatReplaceString)
+  WJH_STRINGSPLIT = 63,      // scratch[0]=string,[1]=separator (String Values) -> Array (Object); MStringSplit (js::StringSplitString, limit=INT32_MAX)
+  WJH_OBJECTKEYS = 64,       // scratch[0]=obj(Object Value) -> Object.keys array (Object); MObjectKeys (jit::ObjectKeys); cold/uninlinable (enumerate + alloc)
+  WJH_DELELEM = 65,          // scratch[0]=obj(Value),[1]=index(Value), site=strict -> Boolean; MDeleteElement (js::DelElemOperation<strict>)
+  WJH_ISCONSTRUCTOR = 66,    // scratch[0]=obj(Object Value) -> Boolean; MIsConstructor (jit::ObjectIsConstructor, leaf)
+  WJH_RANDOM = 67,           // (no operands) -> Double in [0,1); MRandom (realm XorShift128PlusRNG.nextDouble())
+  WJH_REGEXPHASCAPS = 68,    // scratch[0]=regexp(Object),[1]=input(String) -> Boolean; MRegExpHasCaptureGroups (js::RegExpHasCaptureGroups)
+  WJH_DELPROP = 69,          // scratch[0]=value(Value),[1]=name(PropertyName as StringValue), site=strict -> Boolean; MDeleteProperty (js::DelPropOperation<strict>)
+  WJH_NEWTYPEDARRDYN = 70,   // scratch[0]=length(Int32),[1]=templateObject(Value) -> TypedArray (Object); MNewTypedArrayDynamicLength (js::NewTypedArrayWithTemplateAndLength)
+  WJH_OVERRECURSED = 71,     // (no operands) sets the pending too-much-recursion exception (js::ReportOverRecursed); the JIT recursion guard calls this then propagates via EmitExceptionExit (CATCHABLE, like PBL)
+  WJH_TYPEDARRELEMSIZE = 72, // scratch[0]=typedArray(Object Value) -> Int32 bytesPerElement (1/2/4/8); MTypedArrayElementSize (cold)
+  WJH_TONUMBERINT32 = 73,    // scratch[0]=input(boxed Value) -> Int32 (JS::ToInt32 = ToNumber->ToInt32); MToNumberInt32; return 1.0 on throw
 };
 // MNewLexicalEnvironmentObject: the LexicalScope* baked from the template object.
 extern uint32_t gWJLexScope;
@@ -334,6 +351,7 @@ uint32_t WJAllocNameSite();
 static constexpr uint32_t kWJCallRootsSize = 1048576;
 extern uint64_t gWJCallRoots[];
 extern uint32_t gWJRootSP;
+extern int32_t gWJJitDepth;  // JIT recursion depth (deopt-to-PBL past the limit)
 
 // Scratch-buffer layout (shared with WasmJitRuntime.cpp's gWJScratch + the host
 // call marshalling). Sized for nargs<=64 with slack.

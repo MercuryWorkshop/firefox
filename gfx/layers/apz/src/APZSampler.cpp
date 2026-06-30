@@ -64,7 +64,15 @@ void APZSampler::SetSamplerThread(const wr::WrWindowId& aWindowId) {
 void APZSampler::SampleForWebRender(const wr::WrWindowId& aWindowId,
                                     const uint64_t* aGeneratedFrameId,
                                     wr::Transaction* aTransaction) {
-  if (RefPtr<APZSampler> sampler = GetSampler(aWindowId)) {
+  RefPtr<APZSampler> sampler = GetSampler(aWindowId);
+  static int s_smpLog = 0;
+  if (s_smpLog < 3) {
+    s_smpLog++;
+    printf("APZ-DIAG SampleForWebRender called, sampler=%p\n",
+           (void*)sampler.get());
+    fflush(stdout);
+  }
+  if (sampler) {
     wr::TransactionWrapper txn(aTransaction);
     Maybe<VsyncId> vsyncId =
         aGeneratedFrameId ? Some(VsyncId{*aGeneratedFrameId}) : Nothing();

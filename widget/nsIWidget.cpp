@@ -1108,6 +1108,20 @@ nsEventStatus nsIWidget::ProcessUntransformedAPZEvent(
   UniquePtr<WidgetEvent> original(aEvent->Duplicate());
   nsEventStatus status = DispatchEvent(aEvent);
 
+  if (aEvent->AsWheelEvent()) {
+    static int s_tgt = 0;
+    if (s_tgt < 20) {
+      s_tgt++;
+      printf(
+          "APZ-TGT: mAPZC=%d routed=%d dropped=%d inputBlockId=%llu "
+          "apzEventState=%d\n",
+          (int)!!mAPZC, (int)InputAPZContext::WasRoutedToChildProcess(),
+          (int)InputAPZContext::WasDropped(),
+          (unsigned long long)inputBlockId, (int)!!mAPZEventState);
+      fflush(stdout);
+    }
+  }
+
   if (mAPZC && !InputAPZContext::WasRoutedToChildProcess() &&
       !InputAPZContext::WasDropped() && inputBlockId) {
     // EventStateManager did not route the event into the child process and
@@ -1417,6 +1431,18 @@ Document* nsIWidget::GetDocument() const {
       return presShell->GetDocument();
     }
   }
+#if defined(__EMSCRIPTEN__)
+  // Windowless content (PuppetWidget) attaches its PresShell via the ATTACHED
+  // widget listener, not mWidgetListener, so the base lookup returns null. Fall
+  // back to it -- otherwise APZ's SetTargetAPZC subframe-activation no-ops (no
+  // document), nested overflow:scroll containers never get an APZC, and APZ
+  // mis-targets the root. See gfxPlatform::AsyncPanZoomEnabled / embed-input.
+  if (mAttachedWidgetListener) {
+    if (PresShell* presShell = mAttachedWidgetListener->GetPresShell()) {
+      return presShell->GetDocument();
+    }
+  }
+#endif
   return nullptr;
 }
 
